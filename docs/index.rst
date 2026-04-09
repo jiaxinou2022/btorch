@@ -10,6 +10,7 @@ Btorch Documentation
    quickstart
    analysis
    connection_conversion
+   hex_grids
    visualisation
    api/index
 
