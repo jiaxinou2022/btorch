@@ -54,6 +54,7 @@ import torch
 
 Backend = Literal["auto", "torch_stub", "cuda_persistent"]
 ReturnMode = Literal["dense", "events", "both"]
+_FANOUT_BINNING_THRESHOLD = 256
 
 
 @dataclass(frozen=True)
@@ -285,12 +286,28 @@ def _has_cuda_op() -> bool:
     )
 
 
-def _ensure_cuda_op() -> None:
-    if _has_cuda_op():
+def _has_cuda_binned_op() -> bool:
+    return hasattr(torch.ops, "btorch_cuda") and hasattr(
+        torch.ops.btorch_cuda, "persistent_snn_forward_binned"
+    )
+
+
+def _ensure_cuda_op(*, fanout_binning: bool = False) -> None:
+    has_required_op = _has_cuda_binned_op() if fanout_binning else _has_cuda_op()
+    if has_required_op:
         return
     from .persistent import plain_version
 
     plain_version.load()
+
+
+def _make_high_fanout_mask(graph: EventCSRGraph) -> torch.Tensor:
+    """Create int32 high-fanout metadata for the binned CUDA kernel."""
+
+    high_fanout = (
+        (graph.indptr[1:] - graph.indptr[:-1]) >= _FANOUT_BINNING_THRESHOLD
+    ).to(torch.int32)
+    return high_fanout.contiguous()
 
 
 # Delay tensors already confirmed all-zero, keyed by id(). `graph.delay` is part
@@ -332,6 +349,7 @@ def _cuda_persistent_snn_forward(
     params: PersistentSNNParams,
     *,
     return_mode: ReturnMode,
+    fanout_binning: bool,
 ) -> PersistentSNNOutput:
     t_steps, batch_size, n_pre = _validate_events(events)
     n_post = _validate_graph(graph, n_pre)
@@ -364,7 +382,7 @@ def _cuda_persistent_snn_forward(
     if events.values is not None and events.values.dtype != torch.float32:
         raise TypeError("cuda_persistent v1 requires float32 event values.")
 
-    _ensure_cuda_op()
+    _ensure_cuda_op(fanout_binning=fanout_binning)
     event_values = (
         events.values
         if events.values is not None
@@ -376,14 +394,7 @@ def _cuda_persistent_snn_forward(
         else torch.empty((0,), device=graph.indices.device, dtype=graph.indices.dtype)
     )
     return_events = return_mode in ("events", "both")
-    (
-        dense_spikes,
-        event_offsets,
-        event_indices,
-        v_out,
-        psc_out,
-        _overflow,
-    ) = torch.ops.btorch_cuda.persistent_snn_forward(
+    op_args = (
         events.offsets,
         events.indices,
         event_values,
@@ -391,6 +402,8 @@ def _cuda_persistent_snn_forward(
         graph.indptr,
         graph.indices,
         graph.weight,
+    )
+    op_tail = (
         graph_delay,
         graph.delay is not None,
         delay_validated,
@@ -405,6 +418,29 @@ def _cuda_persistent_snn_forward(
         bool(params.hard_reset),
         return_events,
     )
+    if fanout_binning:
+        graph_high_fanout = _make_high_fanout_mask(graph)
+        (
+            dense_spikes,
+            event_offsets,
+            event_indices,
+            v_out,
+            psc_out,
+            _overflow,
+        ) = torch.ops.btorch_cuda.persistent_snn_forward_binned(
+            *op_args,
+            graph_high_fanout,
+            *op_tail,
+        )
+    else:
+        (
+            dense_spikes,
+            event_offsets,
+            event_indices,
+            v_out,
+            psc_out,
+            _overflow,
+        ) = torch.ops.btorch_cuda.persistent_snn_forward(*op_args, *op_tail)
 
     spikes = dense_spikes if return_mode in ("dense", "both") else None
     spike_events = None
@@ -430,6 +466,7 @@ def persistent_snn_forward(
     *,
     backend: Backend = "auto",
     return_mode: ReturnMode = "dense",
+    fanout_binning: bool = False,
 ) -> PersistentSNNOutput:
     """Dispatch the persistent SNN operator.
 
@@ -442,6 +479,8 @@ def persistent_snn_forward(
             for the future compiled operator, or ``"auto"`` to use CUDA when
             registered and fall back to the stub otherwise.
         return_mode: Select dense spikes, event spikes, or both.
+        fanout_binning: Use the experimental CUDA kernel that buckets fired
+            cells into high- and low-fanout queues before recurrent fanout.
 
     Returns:
         Operator output with spikes/events and final state.
@@ -451,7 +490,10 @@ def persistent_snn_forward(
     if backend not in ("auto", "torch_stub", "cuda_persistent"):
         raise ValueError(f"Unknown backend: {backend}.")
 
-    use_cuda = backend == "cuda_persistent" or (backend == "auto" and _has_cuda_op())
+    has_selected_cuda_op = _has_cuda_binned_op() if fanout_binning else _has_cuda_op()
+    use_cuda = backend == "cuda_persistent" or (
+        backend == "auto" and has_selected_cuda_op
+    )
     if use_cuda:
         return _cuda_persistent_snn_forward(
             events,
@@ -459,6 +501,7 @@ def persistent_snn_forward(
             state,
             params,
             return_mode=return_mode,
+            fanout_binning=fanout_binning,
         )
 
     return torch_stub_persistent_snn_forward(

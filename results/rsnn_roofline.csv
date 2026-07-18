@@ -1,0 +1,2 @@
+dataset,total_time_ms,timestep_count,time_per_timestep_us,n_neuron,batch_size,graph_synapses,average_fanout,active_neurons,unique_active_neurons,active_synapses,active_synapses_per_second,warmup,repeat,correctness,spike_mismatches,spike_mismatch_rate,v_max_abs_diff,psc_max_abs_diff
+uniform,2.1956160068511963,128,17.15325005352497,8192,1,262144,32.0,511880,8192,16380160,7460393779.644244,10,30,passed,162,0.0001544952392578125,0.029962539672851562,0.00011375546455383301

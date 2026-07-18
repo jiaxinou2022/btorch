@@ -1,0 +1,6 @@
+outs:
+- md5: 8aa46916bb4cb2f4f62cada29f8b028b.dir
+  size: 8877327
+  nfiles: 3
+  hash: md5
+  path: mice_column_v1
