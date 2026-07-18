@@ -57,6 +57,33 @@ ReturnMode = Literal["dense", "events", "both"]
 _FANOUT_BINNING_THRESHOLD = 256
 
 
+# Cache the two scalar boundary checks for immutable/reused event layouts.
+# Tensor._version changes after in-place mutation, so cached validation cannot
+# silently accept modified offsets.
+_event_offsets_cache: dict[
+    int, tuple["weakref.ref[torch.Tensor]", int, int]
+] = {}
+
+
+def _event_offsets_validated(offsets: torch.Tensor, nnz: int) -> bool:
+    cached = _event_offsets_cache.get(id(offsets))
+    return (
+        cached is not None
+        and cached[0]() is offsets
+        and cached[1] == nnz
+        and cached[2] == offsets._version
+    )
+
+
+def _remember_event_offsets(offsets: torch.Tensor, nnz: int) -> None:
+    key = id(offsets)
+
+    def _evict(_: object, key: int = key) -> None:
+        _event_offsets_cache.pop(key, None)
+
+    _event_offsets_cache[key] = (weakref.ref(offsets, _evict), nnz, offsets._version)
+
+
 @dataclass(frozen=True)
 class WindowedSpikeEvents:
     """Time-batch bucketed spike-event input.
@@ -153,12 +180,14 @@ def _validate_events(events: WindowedSpikeEvents) -> tuple[int, int, int]:
             "events.offsets must have shape (T * B + 1,), got "
             f"{tuple(offsets.shape)} for shape={events.shape}."
         )
-    # One D2H sync for both boundary values instead of two separate `.item()` calls.
-    offsets_first, offsets_last = offsets[[0, -1]].tolist()
-    if offsets_first != 0:
-        raise ValueError("events.offsets[0] must be zero.")
-    if offsets_last != indices.numel():
-        raise ValueError("events.offsets[-1] must equal events.indices.numel().")
+    if not _event_offsets_validated(offsets, indices.numel()):
+        # Pay one D2H sync only when a new or in-place-modified layout appears.
+        offsets_first, offsets_last = offsets[[0, -1]].tolist()
+        if offsets_first != 0:
+            raise ValueError("events.offsets[0] must be zero.")
+        if offsets_last != indices.numel():
+            raise ValueError("events.offsets[-1] must equal events.indices.numel().")
+        _remember_event_offsets(offsets, indices.numel())
     if events.values is not None:
         if events.values.shape != indices.shape:
             raise ValueError("events.values must have the same shape as indices.")
@@ -394,6 +423,7 @@ def _cuda_persistent_snn_forward(
         else torch.empty((0,), device=graph.indices.device, dtype=graph.indices.dtype)
     )
     return_events = return_mode in ("events", "both")
+    return_dense = return_mode in ("dense", "both")
     op_args = (
         events.offsets,
         events.indices,
@@ -416,6 +446,7 @@ def _cuda_persistent_snn_forward(
         float(params.v_reset),
         float(params.c_m),
         bool(params.hard_reset),
+        return_dense,
         return_events,
     )
     if fanout_binning:

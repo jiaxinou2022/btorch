@@ -9,7 +9,9 @@ namespace {
 
 constexpr int kLowTasksPerWarp = 4;
 constexpr int kLowSubwarpSize = 8;
+constexpr int kEdgesPerTask = 1024;
 
+template <bool ReturnDense>
 __global__ void persistent_snn_kernel(
     const int* __restrict__ event_offsets,
     const int* __restrict__ event_indices,
@@ -23,15 +25,18 @@ __global__ void persistent_snn_kernel(
     float* __restrict__ dense_spikes,
     float* __restrict__ input_current,
     int* __restrict__ spike_queue_batch,
-    int* __restrict__ spike_queue_pre,
+    int* __restrict__ spike_queue_edge_start,
+    int* __restrict__ spike_queue_edge_end,
     int* __restrict__ spike_count,
     int* __restrict__ work_counter,
     int* __restrict__ event_counts,
     int* __restrict__ event_indices_full,
+    bool return_events,
     int* __restrict__ overflow,
     int t_steps,
     int batch_size,
     int n_neuron,
+    int queue_capacity,
     float dt,
     float tau_mem,
     float tau_syn,
@@ -42,7 +47,6 @@ __global__ void persistent_snn_kernel(
     const int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int stride = blockDim.x * gridDim.x;
     const int n_cells = batch_size * n_neuron;
-    const int queue_capacity = n_cells;
     const float decay = expf(-dt / tau_syn);
     const float reset_delta = v_threshold - v_reset;
 
@@ -51,11 +55,6 @@ __global__ void persistent_snn_kernel(
             *spike_count = 0;
             *work_counter = 0;
         }
-        for (int i = global_tid; i < n_cells; i += stride) {
-            input_current[i] = 0.0f;
-        }
-        grid.sync();
-
         for (int b = 0; b < batch_size; ++b) {
             const int bucket = t * batch_size + b;
             const int start = event_offsets[bucket];
@@ -74,12 +73,15 @@ __global__ void persistent_snn_kernel(
             const int b = cell / n_neuron;
             const int n = cell - b * n_neuron;
             const float current = psc[cell] + input_current[cell];
+            input_current[cell] = 0.0f;
             const float v_pre =
                 v[cell] + dt * (-(v[cell] - v_reset) / tau_mem + current / c_m);
             const bool fired = v_pre >= v_threshold;
             const float spike = fired ? 1.0f : 0.0f;
             v[cell] = v_pre - reset_delta * spike;
-            dense_spikes[(t * batch_size + b) * n_neuron + n] = spike;
+            if constexpr (ReturnDense) {
+                dense_spikes[(t * batch_size + b) * n_neuron + n] = spike;
+            }
             // Fold the PSC decay into this loop. Each thread owns psc[cell]
             // (grid-stride, no cross-thread aliasing), and the reference order
             // is: current uses the *old* psc; then psc = psc*decay + recurrent.
@@ -90,20 +92,32 @@ __global__ void persistent_snn_kernel(
             psc[cell] *= decay;
 
             if (fired) {
-                const int task = atomicAdd(spike_count, 1);
-                if (task < queue_capacity) {
-                    spike_queue_batch[task] = b;
-                    spike_queue_pre[task] = n;
+                const int edge_start = graph_indptr[n];
+                const int edge_end = graph_indptr[n + 1];
+                const int task_count =
+                    (edge_end - edge_start + kEdgesPerTask - 1) / kEdgesPerTask;
+                const int first_task = atomicAdd(spike_count, task_count);
+                if (first_task + task_count <= queue_capacity) {
+                    for (int slice = 0; slice < task_count; ++slice) {
+                        const int task = first_task + slice;
+                        const int slice_start = edge_start + slice * kEdgesPerTask;
+                        spike_queue_batch[task] = b;
+                        spike_queue_edge_start[task] = slice_start;
+                        spike_queue_edge_end[task] =
+                            min(slice_start + kEdgesPerTask, edge_end);
+                    }
                 } else {
                     atomicExch(overflow, 1);
                 }
 
-                const int bucket = t * batch_size + b;
-                const int rank = atomicAdd(event_counts + bucket, 1);
-                if (rank < n_neuron) {
-                    event_indices_full[bucket * n_neuron + rank] = n;
-                } else {
-                    atomicExch(overflow, 1);
+                if (return_events) {
+                    const int bucket = t * batch_size + b;
+                    const int rank = atomicAdd(event_counts + bucket, 1);
+                    if (rank < n_neuron) {
+                        event_indices_full[bucket * n_neuron + rank] = n;
+                    } else {
+                        atomicExch(overflow, 1);
+                    }
                 }
             }
         }
@@ -142,9 +156,8 @@ __global__ void persistent_snn_kernel(
                 break;
             }
             const int b = spike_queue_batch[task];
-            const int pre = spike_queue_pre[task];
-            const int start = graph_indptr[pre];
-            const int end = graph_indptr[pre + 1];
+            const int start = spike_queue_edge_start[task];
+            const int end = spike_queue_edge_end[task];
             for (int edge = start + lane; edge < end; edge += 32) {
                 const int post = graph_indices[edge];
                 if (post >= 0 && post < n_neuron) {
@@ -156,6 +169,7 @@ __global__ void persistent_snn_kernel(
     }
 }
 
+template <bool ReturnDense>
 __global__ void persistent_snn_binned_kernel(
     const int* __restrict__ event_offsets,
     const int* __restrict__ event_indices,
@@ -179,6 +193,7 @@ __global__ void persistent_snn_binned_kernel(
     int* __restrict__ low_work_counter,
     int* __restrict__ event_counts,
     int* __restrict__ event_indices_full,
+    bool return_events,
     int* __restrict__ overflow,
     int t_steps,
     int batch_size,
@@ -204,11 +219,6 @@ __global__ void persistent_snn_binned_kernel(
             *high_work_counter = 0;
             *low_work_counter = 0;
         }
-        for (int i = global_tid; i < n_cells; i += stride) {
-            input_current[i] = 0.0f;
-        }
-        grid.sync();
-
         for (int b = 0; b < batch_size; ++b) {
             const int bucket = t * batch_size + b;
             const int start = event_offsets[bucket];
@@ -227,12 +237,15 @@ __global__ void persistent_snn_binned_kernel(
             const int b = cell / n_neuron;
             const int n = cell - b * n_neuron;
             const float current = psc[cell] + input_current[cell];
+            input_current[cell] = 0.0f;
             const float v_pre =
                 v[cell] + dt * (-(v[cell] - v_reset) / tau_mem + current / c_m);
             const bool fired = v_pre >= v_threshold;
             const float spike = fired ? 1.0f : 0.0f;
             v[cell] = v_pre - reset_delta * spike;
-            dense_spikes[(t * batch_size + b) * n_neuron + n] = spike;
+            if constexpr (ReturnDense) {
+                dense_spikes[(t * batch_size + b) * n_neuron + n] = spike;
+            }
             psc[cell] *= decay;
 
             if (fired) {
@@ -254,12 +267,14 @@ __global__ void persistent_snn_binned_kernel(
                     }
                 }
 
-                const int bucket = t * batch_size + b;
-                const int rank = atomicAdd(event_counts + bucket, 1);
-                if (rank < n_neuron) {
-                    event_indices_full[bucket * n_neuron + rank] = n;
-                } else {
-                    atomicExch(overflow, 1);
+                if (return_events) {
+                    const int bucket = t * batch_size + b;
+                    const int rank = atomicAdd(event_counts + bucket, 1);
+                    if (rank < n_neuron) {
+                        event_indices_full[bucket * n_neuron + rank] = n;
+                    } else {
+                        atomicExch(overflow, 1);
+                    }
                 }
             }
         }
@@ -354,15 +369,19 @@ void launch_persistent_snn_kernel(
     float* dense_spikes,
     float* input_current,
     int* spike_queue_batch,
-    int* spike_queue_pre,
+    int* spike_queue_edge_start,
+    int* spike_queue_edge_end,
     int* spike_count,
     int* work_counter,
     int* event_counts,
     int* event_indices_full,
+    bool return_dense,
+    bool return_events,
     int* overflow,
     int t_steps,
     int batch_size,
     int n_neuron,
+    int queue_capacity,
     float dt,
     float tau_mem,
     float tau_syn,
@@ -385,15 +404,18 @@ void launch_persistent_snn_kernel(
         &dense_spikes,
         &input_current,
         &spike_queue_batch,
-        &spike_queue_pre,
+        &spike_queue_edge_start,
+        &spike_queue_edge_end,
         &spike_count,
         &work_counter,
         &event_counts,
         &event_indices_full,
+        &return_events,
         &overflow,
         &t_steps,
         &batch_size,
         &n_neuron,
+        &queue_capacity,
         &dt,
         &tau_mem,
         &tau_syn,
@@ -401,8 +423,11 @@ void launch_persistent_snn_kernel(
         &v_reset,
         &c_m,
     };
+    const void* kernel = return_dense
+        ? reinterpret_cast<void*>(persistent_snn_kernel<true>)
+        : reinterpret_cast<void*>(persistent_snn_kernel<false>);
     cudaLaunchCooperativeKernel(
-        reinterpret_cast<void*>(persistent_snn_kernel),
+        kernel,
         grid_dim,
         block_dim,
         args,
@@ -433,6 +458,8 @@ void launch_persistent_snn_binned_kernel(
     int* low_work_counter,
     int* event_counts,
     int* event_indices_full,
+    bool return_dense,
+    bool return_events,
     int* overflow,
     int t_steps,
     int batch_size,
@@ -469,6 +496,7 @@ void launch_persistent_snn_binned_kernel(
         &low_work_counter,
         &event_counts,
         &event_indices_full,
+        &return_events,
         &overflow,
         &t_steps,
         &batch_size,
@@ -480,8 +508,11 @@ void launch_persistent_snn_binned_kernel(
         &v_reset,
         &c_m,
     };
+    const void* kernel = return_dense
+        ? reinterpret_cast<void*>(persistent_snn_binned_kernel<true>)
+        : reinterpret_cast<void*>(persistent_snn_binned_kernel<false>);
     cudaLaunchCooperativeKernel(
-        reinterpret_cast<void*>(persistent_snn_binned_kernel),
+        kernel,
         grid_dim,
         block_dim,
         args,
@@ -489,11 +520,15 @@ void launch_persistent_snn_binned_kernel(
         stream);
 }
 
-int persistent_snn_max_active_blocks_per_sm(int block_dim) {
+int persistent_snn_max_active_blocks_per_sm(
+    int block_dim, bool return_dense, bool return_events) {
     int active_blocks = 0;
+    const void* kernel = return_dense
+        ? reinterpret_cast<void*>(persistent_snn_kernel<true>)
+        : reinterpret_cast<void*>(persistent_snn_kernel<false>);
     const cudaError_t error = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &active_blocks,
-        persistent_snn_kernel,
+        kernel,
         block_dim,
         0);
     if (error != cudaSuccess) {
@@ -502,11 +537,15 @@ int persistent_snn_max_active_blocks_per_sm(int block_dim) {
     return active_blocks;
 }
 
-int persistent_snn_binned_max_active_blocks_per_sm(int block_dim) {
+int persistent_snn_binned_max_active_blocks_per_sm(
+    int block_dim, bool return_dense, bool return_events) {
     int active_blocks = 0;
+    const void* kernel = return_dense
+        ? reinterpret_cast<void*>(persistent_snn_binned_kernel<true>)
+        : reinterpret_cast<void*>(persistent_snn_binned_kernel<false>);
     const cudaError_t error = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &active_blocks,
-        persistent_snn_binned_kernel,
+        kernel,
         block_dim,
         0);
     if (error != cudaSuccess) {

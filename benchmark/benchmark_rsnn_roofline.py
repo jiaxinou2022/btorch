@@ -376,6 +376,7 @@ def run_prepared_operator(
         float(case.v_reset),
         float(case.c_m),
         False,
+        True,
         False,
     )
     if fanout_binning:

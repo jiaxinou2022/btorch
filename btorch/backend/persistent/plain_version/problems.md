@@ -1,85 +1,7 @@
-我对 `persistent_snn_kernel.cu`、`persistent_snn.cpp`、Python 调度层和 benchmark 调用路径做了静态核查。结论是：
 
-> **突触矩阵没有因为 max fanout 而退化成 dense。真正严重的架构问题，是输出与临时缓冲区在稀疏发放场景下被 dense 化，以及 persistent kernel 每个时间步存在过多全网格阶段和同步。**
+>真正严重的架构问题，是输出与临时缓冲区在稀疏发放场景下被 dense 化，以及 persistent kernel 每个时间步存在过多全网格阶段和同步。**
 
 下面按严重程度展开。
-
----
-
-# 一、你担心的 max fanout 问题：当前没有发生
-
-当前连接存储是标准 presynaptic-row CSR：
-
-```cpp
-graph_indptr[pre]
-graph_indptr[pre + 1]
-graph_indices[edge]
-graph_weight[edge]
-```
-
-对应位置：
-
-* `persistent_snn_kernel.cu:146-152`
-* binned 版本 `persistent_snn_kernel.cu:281-287`
-* Python 数据结构 `persistent_snn.py:78-93`
-
-空间复杂度是：
-
-[
-O(N+\mathrm{nnz})
-]
-
-而不是：
-
-[
-O(N\cdot \mathrm{max_fanout})
-]
-
-因此，即使：
-
-```text
-max_fanout = N
-```
-
-也只是这一行拥有 `N` 条真实边，不会要求其他行补到 `N`。
-
-以计划中的图为例：
-
-```text
-N = 4166
-nnz = 726404
-max fanout = 4165
-```
-
-连接主体大约是：
-
-```text
-indices: 726404 × 4 B
-weights: 726404 × 4 B
-indptr:  4167 × 4 B
-总计约 5.8 MB
-```
-
-并不是 `4166 × 4166` 的 dense 矩阵。
-
-所以不需要为了这个问题改 CSR。将来做 bucket/block 化时，反而要小心不要改成类似 ELLPACK 的：
-
-```text
-[N, max_fanout]
-```
-
-或：
-
-```text
-[num_blocks, rows_per_block, max_fanout_in_block]
-```
-
-否则长尾行确实会引入大量 padding。比较稳妥的方向仍然是：
-
-* 全局连接保持 CSR；
-* bucket 只保存行号或任务描述符；
-* 极长行保存分段描述符；
-* 不复制、不补齐边数据。
 
 ---
 
@@ -267,29 +189,6 @@ spike_queue_pre
 
 # 四、persistent 的核心架构缺陷：每个时间步有太多 grid-wide barrier
 
-普通版本每个时间步大致是：
-
-1. 清空 `input_current`
-2. `grid.sync()`
-3. 应用 external input
-4. `grid.sync()`
-5. LIF update + queue
-6. `grid.sync()`
-7. recurrent fanout
-8. `grid.sync()`
-
-即每个时间步至少 **4 次 cooperative grid barrier**。
-
-binned 版本还把 high 和 low 分成两个阶段：
-
-```cpp
-high fanout
-grid.sync()
-low fanout
-grid.sync()
-```
-
-因此每个时间步大约 **5 次 grid-wide barrier**。
 
 位置：
 
@@ -298,40 +197,15 @@ grid.sync()
 
 这可能是当前最高层次的性能问题。
 
-## 为什么严重
-
-persistent kernel 消除了时间步之间的 launch，但现在用全 GPU barrier 替代了 launch：
-
-```text
-launch overhead ↓
-全网格阶段切换与等待 ↑
-```
-
-当 `B×N` 较小、发放率较低或每步工作很短时：
-
-* 很多 block 很快完成；
-* 少量 block 被长 fanout 或原子冲突拖住；
-* 其他所有 block 在 `grid.sync()` 等待；
-* profiler 中就会看到较高的 SM idle 或 warp 不活跃。
-
-因此你之前观察到的“高 SM 空转”不一定只意味着普通意义上的负载不均，它也可能是：
-
-> **cooperative bulk-synchronous persistent 架构本身粒度过细。**
-
-尤其 `N≈4166` 并不算大。一张几十个 SM 的 GPU 上，驻留线程数很容易超过实际 cell 数量。LIF 阶段只需要处理几千个 cell，却启动整个 cooperative grid，完成后又等待全局同步。
-
 ## 如何改而不大幅重构
 
 优先考虑减少阶段，而不是立刻做复杂的异步流水。
 
 ### 可以直接合并的阶段
 
-当前已经把 PSC decay 合进 LIF update，这一点是正确的。
-
 下一步可以处理 external input：
 
-* 若外部事件保证同一 `(b,n)` 不重复，直接在 LIF update 时查询或 merge；
-* 或者将 external event 预先转换成适合 cell update 消费的结构；
+* 可以保证外部事件保证同一 `(b,n)` 不重复，直接在 LIF update 时查询或 merge；
 * 避免每步清空整个 `input_current[B,N]`。
 
 这样可能去掉：
@@ -820,24 +694,3 @@ grid.sync
 ---
 
 # 最终判断
-
-关于最初的问题：
-
-> “max fanout 等于 neuron 数时，prespan persistent 是否等于存 dense 矩阵？”
-
-**不会。当前连接矩阵使用真正的 CSR，只存真实边。**
-
-但代码确实存在两个类似 dense 存储的重大问题：
-
-```text
-dense_spikes       = T × B × N float
-event_indices_full = T × B × N int
-```
-
-并且二者目前无论返回模式是否需要，都可能被分配和写入。这比连接矩阵 max fanout 更值得优先修改。
-
-从底层架构上看，当前版本最核心的风险不是“CSR 选错了”，而是：
-
-> **这是一个 bulk-synchronous persistent kernel：每个时间步让整个 cooperative grid 依次完成多个短阶段，并频繁全局同步。**
-
-它在大窗口下消除了 kernel launch，却可能同时引入大量全网格等待。因此，输出路径去 dense 化、极长行切片，以及减少 `grid.sync()`，应当优先于继续增加更多传统 fanout 桶。

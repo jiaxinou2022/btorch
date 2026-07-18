@@ -189,8 +189,13 @@ def test_cuda_persistent_matches_dense_reference():
     torch.testing.assert_close(out.state.psc, ref_psc, atol=1e-5, rtol=1e-5)
 
 
-def test_cuda_persistent_event_output_matches_dense_spikes():
-    """Returned event buckets should contain exactly the fired neuron indices."""
+@pytest.mark.parametrize("return_mode", ["events", "both"])
+def test_cuda_persistent_event_output_matches_dense_spikes(return_mode):
+    """Event-only and combined modes should return the same fired indices.
+
+    Testing event-only separately is important because its CUDA specialization
+    does not allocate or write the dense ``T * B * N`` spike history.
+    """
 
     device = _require_cuda()
     x_seq = torch.tensor(
@@ -198,7 +203,7 @@ def test_cuda_persistent_event_output_matches_dense_spikes():
         device=device,
         dtype=torch.float32,
     )
-    graph, _dense = _graph(device)
+    graph, dense = _graph(device)
     state = PersistentSNNState(
         v=torch.zeros(1, 4, device=device),
         psc=torch.zeros(1, 4, device=device),
@@ -208,14 +213,24 @@ def test_cuda_persistent_event_output_matches_dense_spikes():
         graph,
         state,
         PersistentSNNParams(window_size=2),
-        return_mode="both",
+        return_mode=return_mode,
     )
 
-    assert out.spikes is not None
+    expected_spikes, _expected_v, _expected_psc = _reference(
+        x_seq,
+        dense,
+        state,
+        PersistentSNNParams(window_size=2),
+    )
+    if return_mode == "events":
+        assert out.spikes is None
+    else:
+        assert out.spikes is not None
+        torch.testing.assert_close(out.spikes, expected_spikes, atol=0, rtol=0)
     assert out.spike_events is not None
     offsets = out.spike_events.offsets.detach().cpu()
     indices = out.spike_events.indices.detach().cpu()
-    dense_spikes = out.spikes.detach().cpu()
+    dense_spikes = expected_spikes.detach().cpu()
     for bucket in range(offsets.numel() - 1):
         start = int(offsets[bucket].item())
         end = int(offsets[bucket + 1].item())

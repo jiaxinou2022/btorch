@@ -6,9 +6,11 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <tuple>
 
 constexpr int kThreadsPerBlock = 256;
+constexpr int kEdgesPerTask = 1024;
 
 void launch_persistent_snn_kernel(
     const int* event_offsets,
@@ -23,15 +25,19 @@ void launch_persistent_snn_kernel(
     float* dense_spikes,
     float* input_current,
     int* spike_queue_batch,
-    int* spike_queue_pre,
+    int* spike_queue_edge_start,
+    int* spike_queue_edge_end,
     int* spike_count,
     int* work_counter,
     int* event_counts,
     int* event_indices_full,
+    bool return_dense,
+    bool return_events,
     int* overflow,
     int t_steps,
     int batch_size,
     int n_neuron,
+    int queue_capacity,
     float dt,
     float tau_mem,
     float tau_syn,
@@ -65,6 +71,8 @@ void launch_persistent_snn_binned_kernel(
     int* low_work_counter,
     int* event_counts,
     int* event_indices_full,
+    bool return_dense,
+    bool return_events,
     int* overflow,
     int t_steps,
     int batch_size,
@@ -90,8 +98,10 @@ void launch_compact_event_indices_kernel(
     int block_dim,
     cudaStream_t stream);
 
-int persistent_snn_max_active_blocks_per_sm(int block_dim);
-int persistent_snn_binned_max_active_blocks_per_sm(int block_dim);
+int persistent_snn_max_active_blocks_per_sm(
+    int block_dim, bool return_dense, bool return_events);
+int persistent_snn_binned_max_active_blocks_per_sm(
+    int block_dim, bool return_dense, bool return_events);
 
 void check_cuda(cudaError_t error, const char* message) {
     TORCH_CHECK(error == cudaSuccess, message, ": ", cudaGetErrorString(error));
@@ -116,7 +126,8 @@ void check_same_device(
         " must be on the same CUDA device as v.");
 }
 
-int cooperative_grid_dim_uncached(int block_dim) {
+int cooperative_grid_dim_uncached(
+    int block_dim, bool return_dense, bool return_events) {
     int device = -1;
     check_cuda(cudaGetDevice(&device), "cudaGetDevice failed");
 
@@ -126,7 +137,8 @@ int cooperative_grid_dim_uncached(int block_dim) {
         prop.cooperativeLaunch,
         "persistent SNN requires CUDA cooperative launch support.");
 
-    const int active_blocks = persistent_snn_max_active_blocks_per_sm(block_dim);
+    const int active_blocks = persistent_snn_max_active_blocks_per_sm(
+        block_dim, return_dense, return_events);
     TORCH_CHECK(active_blocks > 0, "persistent SNN kernel has zero occupancy.");
     return active_blocks * prop.multiProcessorCount;
 }
@@ -141,20 +153,25 @@ int cooperative_grid_dim_uncached(int block_dim) {
 // cache. (Not safe across a device change mid-process, but this op is always
 // invoked with the tensors' own device via CUDAGuard, and does not support
 // multi-device dispatch within one call.)
-int cooperative_grid_dim(int block_dim) {
-    static int cached = -1;
-    static int cached_block_dim = -1;
-    if (cached < 0 || cached_block_dim != block_dim) {
-        cached = cooperative_grid_dim_uncached(block_dim);
-        cached_block_dim = block_dim;
+int cooperative_grid_dim(
+    int block_dim, bool return_dense, bool return_events) {
+    static int cached[3] = {-1, -1, -1};
+    static int cached_block_dim[3] = {-1, -1, -1};
+    const int mode = return_events ? (return_dense ? 2 : 1) : 0;
+    if (cached[mode] < 0 || cached_block_dim[mode] != block_dim) {
+        cached[mode] = cooperative_grid_dim_uncached(
+            block_dim, return_dense, return_events);
+        cached_block_dim[mode] = block_dim;
     }
-    return cached;
+    return cached[mode];
 }
 
-int cooperative_grid_dim_binned(int block_dim) {
-    static int cached = -1;
-    static int cached_block_dim = -1;
-    if (cached < 0 || cached_block_dim != block_dim) {
+int cooperative_grid_dim_binned(
+    int block_dim, bool return_dense, bool return_events) {
+    static int cached[3] = {-1, -1, -1};
+    static int cached_block_dim[3] = {-1, -1, -1};
+    const int mode = return_events ? (return_dense ? 2 : 1) : 0;
+    if (cached[mode] < 0 || cached_block_dim[mode] != block_dim) {
         int device = -1;
         check_cuda(cudaGetDevice(&device), "cudaGetDevice failed");
 
@@ -167,14 +184,15 @@ int cooperative_grid_dim_binned(int block_dim) {
             "persistent SNN requires CUDA cooperative launch support.");
 
         const int active_blocks =
-            persistent_snn_binned_max_active_blocks_per_sm(block_dim);
+            persistent_snn_binned_max_active_blocks_per_sm(
+                block_dim, return_dense, return_events);
         TORCH_CHECK(
             active_blocks > 0,
             "persistent SNN binned kernel has zero occupancy.");
-        cached = active_blocks * prop.multiProcessorCount;
-        cached_block_dim = block_dim;
+        cached[mode] = active_blocks * prop.multiProcessorCount;
+        cached_block_dim[mode] = block_dim;
     }
-    return cached;
+    return cached[mode];
 }
 
 std::tuple<
@@ -204,6 +222,7 @@ persistent_snn_forward_cuda(
     double v_reset,
     double c_m,
     bool hard_reset,
+    bool return_dense,
     bool return_events) {
     TORCH_CHECK(!hard_reset, "persistent SNN v1 only supports soft reset.");
     check_cuda_tensor(event_offsets, "event_offsets", torch::kInt32);
@@ -282,18 +301,32 @@ persistent_snn_forward_cuda(
     const auto options_i = event_offsets.options();
     auto v_out = v.clone();
     auto psc_out = psc.clone();
-    auto dense_spikes = torch::empty({t_steps, batch_size, n_neuron}, options_f);
-    auto input_current = torch::empty({batch_size, n_neuron}, options_f);
-    auto spike_queue_batch = torch::empty({batch_size * n_neuron}, options_i);
-    auto spike_queue_pre = torch::empty({batch_size * n_neuron}, options_i);
+    auto dense_spikes = return_dense
+        ? torch::empty({t_steps, batch_size, n_neuron}, options_f)
+        : torch::empty({0}, options_f);
+    auto input_current = torch::zeros({batch_size, n_neuron}, options_f);
+    const int64_t edge_count = graph_indices.numel();
+    const int64_t queue_capacity_64 = static_cast<int64_t>(batch_size) *
+        (n_neuron + (edge_count + kEdgesPerTask - 1) / kEdgesPerTask);
+    TORCH_CHECK(
+        queue_capacity_64 <= std::numeric_limits<int>::max(),
+        "persistent SNN work queue is too large for int32 indexing.");
+    const auto queue_capacity = static_cast<int>(queue_capacity_64);
+    auto spike_queue_batch = torch::empty({queue_capacity}, options_i);
+    auto spike_queue_edge_start = torch::empty({queue_capacity}, options_i);
+    auto spike_queue_edge_end = torch::empty({queue_capacity}, options_i);
     auto spike_count = torch::zeros({1}, options_i);
     auto work_counter = torch::zeros({1}, options_i);
-    auto event_counts = torch::zeros({t_steps * batch_size}, options_i);
-    auto event_indices_full =
-        torch::empty({t_steps * batch_size * n_neuron}, options_i);
+    auto event_counts = return_events
+        ? torch::zeros({t_steps * batch_size}, options_i)
+        : torch::empty({0}, options_i);
+    auto event_indices_full = return_events
+        ? torch::empty({t_steps * batch_size * n_neuron}, options_i)
+        : torch::empty({0}, options_i);
     auto overflow = torch::zeros({1}, options_i);
 
-    const int grid_dim = cooperative_grid_dim(kThreadsPerBlock);
+    const int grid_dim = cooperative_grid_dim(
+        kThreadsPerBlock, return_dense, return_events);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     launch_persistent_snn_kernel(
@@ -306,18 +339,22 @@ persistent_snn_forward_cuda(
         graph_weight.data_ptr<float>(),
         v_out.data_ptr<float>(),
         psc_out.data_ptr<float>(),
-        dense_spikes.data_ptr<float>(),
+        return_dense ? dense_spikes.data_ptr<float>() : nullptr,
         input_current.data_ptr<float>(),
         spike_queue_batch.data_ptr<int>(),
-        spike_queue_pre.data_ptr<int>(),
+        spike_queue_edge_start.data_ptr<int>(),
+        spike_queue_edge_end.data_ptr<int>(),
         spike_count.data_ptr<int>(),
         work_counter.data_ptr<int>(),
-        event_counts.data_ptr<int>(),
-        event_indices_full.data_ptr<int>(),
+        return_events ? event_counts.data_ptr<int>() : nullptr,
+        return_events ? event_indices_full.data_ptr<int>() : nullptr,
+        return_dense,
+        return_events,
         overflow.data_ptr<int>(),
         t_steps,
         batch_size,
         n_neuron,
+        queue_capacity,
         static_cast<float>(dt),
         static_cast<float>(tau_mem),
         static_cast<float>(tau_syn),
@@ -362,9 +399,6 @@ persistent_snn_forward_cuda(
         event_indices_out = torch::empty({0}, options_i);
     }
 
-    if (overflow.item<int>() != 0) {
-        TORCH_CHECK(false, "persistent SNN spike queue overflow.");
-    }
     return {
         dense_spikes,
         event_offsets_out,
@@ -403,6 +437,7 @@ persistent_snn_forward_binned_cuda(
     double v_reset,
     double c_m,
     bool hard_reset,
+    bool return_dense,
     bool return_events) {
     TORCH_CHECK(!hard_reset, "persistent SNN v1 only supports soft reset.");
     check_cuda_tensor(event_offsets, "event_offsets", torch::kInt32);
@@ -420,158 +455,38 @@ persistent_snn_forward_binned_cuda(
     check_same_device(graph_weight, v, "graph_weight");
     check_same_device(graph_high_fanout, v, "graph_high_fanout");
     check_same_device(psc, v, "psc");
-    if (has_event_values) {
-        check_cuda_tensor(event_values, "event_values", torch::kFloat32);
-        check_same_device(event_values, v, "event_values");
-        TORCH_CHECK(
-            event_values.sizes() == event_indices.sizes(),
-            "event_values must match event_indices shape.");
-    }
-    if (has_delay) {
-        check_cuda_tensor(graph_delay, "graph_delay", torch::kInt32);
-        check_same_device(graph_delay, v, "graph_delay");
-        TORCH_CHECK(
-            graph_delay.numel() == graph_indices.numel(),
-            "graph_delay must match graph_indices shape.");
-    }
-
-    c10::cuda::CUDAGuard guard(v.device());
-    if (has_delay && !delay_validated) {
-        TORCH_CHECK(
-            graph_delay.eq(0).all().item<bool>(),
-            "persistent SNN v1 does not support nonzero delay.");
-    }
-
     TORCH_CHECK(v.dim() == 2, "v must have shape (B, N).");
-    TORCH_CHECK(psc.sizes() == v.sizes(), "psc must match v shape.");
-    const auto batch_size = static_cast<int>(v.size(0));
-    const auto n_neuron = static_cast<int>(v.size(1));
-    TORCH_CHECK(batch_size > 0 && n_neuron > 0, "B and N must be positive.");
     TORCH_CHECK(
-        graph_indptr.numel() == n_neuron + 1,
-        "graph_indptr must have shape (N + 1,).");
-    TORCH_CHECK(
-        graph_high_fanout.dim() == 1 && graph_high_fanout.numel() == n_neuron,
+        graph_high_fanout.dim() == 1 &&
+            graph_high_fanout.numel() == v.size(1),
         "graph_high_fanout must have shape (N,).");
-    TORCH_CHECK(
-        graph_indices.numel() == graph_weight.numel(),
-        "graph_indices and graph_weight must match.");
-    TORCH_CHECK(event_offsets.dim() == 1, "event_offsets must be 1D.");
-    TORCH_CHECK(event_indices.dim() == 1, "event_indices must be 1D.");
-    TORCH_CHECK(
-        event_offsets.numel() >= 2,
-        "event_offsets must contain at least one bucket.");
-    TORCH_CHECK(
-        (event_offsets.numel() - 1) % batch_size == 0,
-        "event_offsets bucket count must be divisible by batch size.");
-    const auto t_steps =
-        static_cast<int>((event_offsets.numel() - 1) / batch_size);
-    TORCH_CHECK(t_steps > 0, "T must be positive.");
-    TORCH_CHECK(
-        tau_mem > 0.0 && tau_syn > 0.0 && c_m > 0.0,
-        "tau_mem, tau_syn, and c_m must be positive.");
 
-    const auto options_f = v.options();
-    const auto options_i = event_offsets.options();
-    auto v_out = v.clone();
-    auto psc_out = psc.clone();
-    auto dense_spikes = torch::empty({t_steps, batch_size, n_neuron}, options_f);
-    auto input_current = torch::empty({batch_size, n_neuron}, options_f);
-    auto high_queue_batch = torch::empty({batch_size * n_neuron}, options_i);
-    auto high_queue_pre = torch::empty({batch_size * n_neuron}, options_i);
-    auto low_queue_batch = torch::empty({batch_size * n_neuron}, options_i);
-    auto low_queue_pre = torch::empty({batch_size * n_neuron}, options_i);
-    auto high_spike_count = torch::zeros({1}, options_i);
-    auto low_spike_count = torch::zeros({1}, options_i);
-    auto high_work_counter = torch::zeros({1}, options_i);
-    auto low_work_counter = torch::zeros({1}, options_i);
-    auto event_counts = torch::zeros({t_steps * batch_size}, options_i);
-    auto event_indices_full =
-        torch::empty({t_steps * batch_size * n_neuron}, options_i);
-    auto overflow = torch::zeros({1}, options_i);
-
-    const int grid_dim = cooperative_grid_dim_binned(kThreadsPerBlock);
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
-
-    launch_persistent_snn_binned_kernel(
-        event_offsets.data_ptr<int>(),
-        event_indices.data_ptr<int>(),
-        has_event_values ? event_values.data_ptr<float>() : nullptr,
+    // The unified queue now slices long rows into bounded edge tasks. It
+    // covers both former fanout bins without a high/low grid-wide phase split,
+    // while retaining this entry point for API compatibility.
+    return persistent_snn_forward_cuda(
+        event_offsets,
+        event_indices,
+        event_values,
         has_event_values,
-        graph_indptr.data_ptr<int>(),
-        graph_indices.data_ptr<int>(),
-        graph_weight.data_ptr<float>(),
-        graph_high_fanout.data_ptr<int>(),
-        v_out.data_ptr<float>(),
-        psc_out.data_ptr<float>(),
-        dense_spikes.data_ptr<float>(),
-        input_current.data_ptr<float>(),
-        high_queue_batch.data_ptr<int>(),
-        high_queue_pre.data_ptr<int>(),
-        low_queue_batch.data_ptr<int>(),
-        low_queue_pre.data_ptr<int>(),
-        high_spike_count.data_ptr<int>(),
-        low_spike_count.data_ptr<int>(),
-        high_work_counter.data_ptr<int>(),
-        low_work_counter.data_ptr<int>(),
-        event_counts.data_ptr<int>(),
-        event_indices_full.data_ptr<int>(),
-        overflow.data_ptr<int>(),
-        t_steps,
-        batch_size,
-        n_neuron,
-        static_cast<float>(dt),
-        static_cast<float>(tau_mem),
-        static_cast<float>(tau_syn),
-        static_cast<float>(v_threshold),
-        static_cast<float>(v_reset),
-        static_cast<float>(c_m),
-        grid_dim,
-        kThreadsPerBlock,
-        stream);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+        graph_indptr,
+        graph_indices,
+        graph_weight,
+        graph_delay,
+        has_delay,
+        delay_validated,
+        v,
+        psc,
+        dt,
+        tau_mem,
+        tau_syn,
+        v_threshold,
+        v_reset,
+        c_m,
+        hard_reset,
+        return_dense,
+        return_events);
 
-    torch::Tensor event_offsets_out;
-    torch::Tensor event_indices_out;
-    if (return_events) {
-        event_offsets_out = torch::empty({t_steps * batch_size + 1}, options_i);
-        event_offsets_out[0].zero_();
-        event_offsets_out.slice(0, 1).copy_(torch::cumsum(event_counts, 0));
-        const int total_spikes =
-            event_offsets_out[event_offsets_out.numel() - 1].item<int>();
-        event_indices_out = torch::empty({total_spikes}, options_i);
-        if (total_spikes > 0) {
-            const int compact_grid = std::min(
-                grid_dim,
-                (t_steps * batch_size + kThreadsPerBlock - 1) / kThreadsPerBlock);
-            launch_compact_event_indices_kernel(
-                event_counts.data_ptr<int>(),
-                event_offsets_out.data_ptr<int>(),
-                event_indices_full.data_ptr<int>(),
-                event_indices_out.data_ptr<int>(),
-                t_steps * batch_size,
-                n_neuron,
-                compact_grid,
-                kThreadsPerBlock,
-                stream);
-            C10_CUDA_KERNEL_LAUNCH_CHECK();
-        }
-    } else {
-        event_offsets_out = torch::empty({0}, options_i);
-        event_indices_out = torch::empty({0}, options_i);
-    }
-
-    if (overflow.item<int>() != 0) {
-        TORCH_CHECK(false, "persistent SNN spike queue overflow.");
-    }
-    return {
-        dense_spikes,
-        event_offsets_out,
-        event_indices_out,
-        v_out,
-        psc_out,
-        overflow,
-    };
 }
 
 TORCH_LIBRARY(btorch_cuda, m) {
@@ -583,7 +498,7 @@ TORCH_LIBRARY(btorch_cuda, m) {
         "bool delay_validated, Tensor v, "
         "Tensor psc, float dt, float tau_mem, float tau_syn, "
         "float v_threshold, float v_reset, float c_m, bool hard_reset, "
-        "bool return_events) -> "
+        "bool return_dense, bool return_events) -> "
         "(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def(
         "persistent_snn_forward_binned("
@@ -594,7 +509,7 @@ TORCH_LIBRARY(btorch_cuda, m) {
         "bool delay_validated, Tensor v, "
         "Tensor psc, float dt, float tau_mem, float tau_syn, "
         "float v_threshold, float v_reset, float c_m, bool hard_reset, "
-        "bool return_events) -> "
+        "bool return_dense, bool return_events) -> "
         "(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
 }
 
