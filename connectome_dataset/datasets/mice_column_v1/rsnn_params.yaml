@@ -1,0 +1,40 @@
+name: mice_column_v1_rsnn
+seed: 42
+device: cpu
+dtype: float32
+dataset: noisydc_ou
+network:
+  conn_path: data/external/mice_column_v1
+  glif_dir: external/glif_models_VISp
+  n_neuron: 4166
+  synapse_impl: hetersyn
+  weight:
+    strategy: from_conn
+    weight_ee_scale: 1.0
+    weight_ei_scale: 1.0
+    weight_ie_scale: 1.0
+    weight_ii_scale: 1.0
+  synapse:
+    type: alpha
+    tau: 5.0
+    tau_syn_ee: 2.25
+    tau_syn_ie: 5.5
+    tau_syn_ei: 2.8
+    tau_syn_ii: 5.8
+  deep_r:
+    use_deep_r: false
+    deep_r_alpha: 1.0e-5
+    deep_r_temperature: 1.0e-6
+    deep_r_theta_min: -0.1
+    deep_r_expansion_ratio: 1.5
+input:
+  type: e_only
+  num_input_neuron: 64
+input_layer:
+  type: identical
+  value: 1.0
+train:
+  costs: {}
+notes:
+  - "Minimal BaseRSNN-compatible defaults copied from network.md and source Hydra configs."
+  - "glif_dir is external model data and is intentionally not committed."

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "connectome-bench-scipy"
+version = "0.0.1"
+description = "Example out-of-tree SpMM provider for the connectome benchmark suite"
+requires-python = ">=3.10"
+dependencies = ["numpy", "scipy"]
+
+# This is the whole out-of-tree contract: declare an entry point in the
+# connectome_bench.spmm group pointing at a callable that returns SpmmProvider(s).
+# Installing this package makes the provider show up on the leaderboard with no
+# change to the connectome_dataset tree.
+[project.entry-points."connectome_bench.spmm"]
+scipy = "connectome_bench_scipy:get_providers"
+
+[tool.hatch.build.targets.wheel]
+packages = ["connectome_bench_scipy"]

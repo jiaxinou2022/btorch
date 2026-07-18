@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "connectome-bench-dtc"
+version = "0.0.1"
+description = "Out-of-tree DTC-SpMM (tensor-core weighted SpMM) provider for the connectome benchmark suite"
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+# Requires the DTCSpMM extension built via scripts/build_dtc.sh.
+[project.entry-points."connectome_bench.spmm"]
+dtc = "connectome_bench_dtc:get_providers"
+
+[tool.hatch.build.targets.wheel]
+packages = ["connectome_bench_dtc"]

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "connectome-dataset"
+version = "0.1.0"
+description = "Connectome graph catalog and benchmarks for sparse neural network research"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Alex Fan", email = "f1942357299@gmail.com" }]
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "pandas",
+  "pyarrow",
+  "scipy",
+  "networkx",
+]
+
+[project.optional-dependencies]
+torch = ["torch"]
+jax   = ["jax", "brainevent"]
+bench = ["pytest-benchmark", "pytest"]
+all   = ["connectome-dataset[torch,jax,bench]"]
+
+[project.scripts]
+connectome-catalog     = "connectome_dataset.catalog:main"
+connectome-bench       = "connectome_dataset.benchmarks.run_all:main"
+connectome-bench-report = "connectome_dataset.benchmarks.history.report:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["connectome_dataset"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+  "data/",
+  "*.old",
+  "benchmarks/graphs/",
+  "benchmarks/results/",
+]
