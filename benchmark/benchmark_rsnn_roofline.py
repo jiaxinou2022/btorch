@@ -65,8 +65,10 @@ from btorch.backend.persistent_snn import (  # noqa: E402
     EventCSRGraph,
     PersistentSNNParams,
     PersistentSNNState,
+    PersistentSNNWorkspace,
     WindowedSpikeEvents,
     make_empty_state,
+    make_persistent_snn_workspace,
     persistent_snn_forward,
 )
 from btorch.sparse import CSR  # noqa: E402
@@ -111,6 +113,7 @@ class PreparedWorkload:
     empty_int: torch.Tensor
     x_seq: torch.Tensor
     high_fanout: torch.Tensor
+    workspace: PersistentSNNWorkspace
 
 
 class TorchCUDAGraphRunner:
@@ -330,6 +333,10 @@ def prepare_workload(
         )
         .to(torch.int32)
         .contiguous(),
+        workspace=make_persistent_snn_workspace(
+            graph,
+            provisional.batch_size,
+        ),
     )
 
 
@@ -344,6 +351,7 @@ def run_persistent(workload: PreparedWorkload, *, fanout_binning: bool):
         backend="cuda_persistent",
         return_mode="dense",
         fanout_binning=fanout_binning,
+        workspace=workload.workspace,
     )
 
 
@@ -362,6 +370,13 @@ def run_prepared_operator(
         workload.graph.indptr,
         workload.graph.indices,
         workload.graph.weight,
+        True,
+        workload.workspace.input_current,
+        workload.workspace.queue_batch,
+        workload.workspace.queue_edge_start,
+        workload.workspace.queue_edge_end,
+        workload.workspace.spike_count,
+        workload.workspace.work_counter,
     )
     op_tail = (
         workload.empty_int,

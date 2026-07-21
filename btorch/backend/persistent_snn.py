@@ -65,6 +65,13 @@ _event_offsets_cache: dict[
 ] = {}
 
 
+# Post-synaptic indices are fixed CSR structure in normal use. Validate their
+# range once, then invalidate the result after any in-place tensor mutation.
+_graph_indices_cache: dict[
+    int, tuple["weakref.ref[torch.Tensor]", int, int]
+] = {}
+
+
 def _event_offsets_validated(offsets: torch.Tensor, nnz: int) -> bool:
     cached = _event_offsets_cache.get(id(offsets))
     return (
@@ -82,6 +89,38 @@ def _remember_event_offsets(offsets: torch.Tensor, nnz: int) -> None:
         _event_offsets_cache.pop(key, None)
 
     _event_offsets_cache[key] = (weakref.ref(offsets, _evict), nnz, offsets._version)
+
+
+def _graph_indices_validated(indices: torch.Tensor, n_post: int) -> bool:
+    cached = _graph_indices_cache.get(id(indices))
+    return (
+        cached is not None
+        and cached[0]() is indices
+        and cached[1] == n_post
+        and cached[2] == indices._version
+    )
+
+
+def _remember_graph_indices(indices: torch.Tensor, n_post: int) -> None:
+    key = id(indices)
+
+    def _evict(_: object, key: int = key) -> None:
+        _graph_indices_cache.pop(key, None)
+
+    _graph_indices_cache[key] = (
+        weakref.ref(indices, _evict),
+        n_post,
+        indices._version,
+    )
+
+
+def _validate_graph_indices(indices: torch.Tensor, n_post: int) -> None:
+    if _graph_indices_validated(indices, n_post):
+        return
+    valid = torch.logical_and(indices >= 0, indices < n_post).all().item()
+    if not valid:
+        raise ValueError("graph.indices must be in the range [0, N_post).")
+    _remember_graph_indices(indices, n_post)
 
 
 @dataclass(frozen=True)
@@ -128,6 +167,22 @@ class PersistentSNNState:
     psc: torch.Tensor
     refractory: torch.Tensor | None = None
     delay_ring: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class PersistentSNNWorkspace:
+    """Hold reusable CUDA scratch tensors for steady-state window execution.
+
+    A workspace is mutable scratch storage. Do not reuse the same instance in
+    overlapping forwards or on multiple CUDA streams concurrently.
+    """
+
+    input_current: torch.Tensor
+    queue_batch: torch.Tensor
+    queue_edge_start: torch.Tensor
+    queue_edge_end: torch.Tensor
+    spike_count: torch.Tensor
+    work_counter: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -260,6 +315,40 @@ def make_empty_state(
     )
 
 
+def make_persistent_snn_workspace(
+    graph: EventCSRGraph,
+    batch_size: int,
+) -> PersistentSNNWorkspace:
+    """Create reusable scratch storage for the CUDA persistent backend"""
+
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
+    n_neuron = graph.shape[0]
+    edge_count = graph.indices.numel()
+    # This single workspace serves every kernel variant. The spike-block
+    # variant needs one task per 32-cell block plus up to one rounding task per
+    # CSR row when 1024-edge segments are used.
+    queue_capacity = batch_size * (
+        (n_neuron + 31) // 32 + n_neuron + (edge_count + 1023) // 1024
+    )
+    int_options = {"device": graph.indptr.device, "dtype": torch.int32}
+    return PersistentSNNWorkspace(
+        input_current=torch.zeros(
+            batch_size,
+            n_neuron,
+            device=graph.indptr.device,
+            dtype=torch.float32,
+        ),
+        queue_batch=torch.empty(queue_capacity, **int_options),
+        queue_edge_start=torch.empty(queue_capacity, **int_options),
+        queue_edge_end=torch.empty(queue_capacity, **int_options),
+        # The binned kernel uses index 0 for long-row segments and index 1 for
+        # ordinary rows. The non-binned kernel only touches index 0.
+        spike_count=torch.empty(2, **int_options),
+        work_counter=torch.empty(2, **int_options),
+    )
+
+
 def torch_stub_persistent_snn_forward(
     events: WindowedSpikeEvents,
     graph: EventCSRGraph,
@@ -321,8 +410,23 @@ def _has_cuda_binned_op() -> bool:
     )
 
 
-def _ensure_cuda_op(*, fanout_binning: bool = False) -> None:
-    has_required_op = _has_cuda_binned_op() if fanout_binning else _has_cuda_op()
+def _has_cuda_spike_block_op() -> bool:
+    return hasattr(torch.ops, "btorch_cuda") and hasattr(
+        torch.ops.btorch_cuda, "persistent_snn_forward_spike_block"
+    )
+
+
+def _ensure_cuda_op(
+    *,
+    fanout_binning: bool = False,
+    spike_block: bool = False,
+) -> None:
+    if spike_block:
+        has_required_op = _has_cuda_spike_block_op()
+    elif fanout_binning:
+        has_required_op = _has_cuda_binned_op()
+    else:
+        has_required_op = _has_cuda_op()
     if has_required_op:
         return
     from .persistent import plain_version
@@ -357,6 +461,14 @@ def _make_high_fanout_mask(graph: EventCSRGraph) -> torch.Tensor:
 _zero_delay_cache: dict[int, "weakref.ref[torch.Tensor]"] = {}
 
 
+# Fanout metadata belongs to the graph structure and is reused across windows.
+# Keep it alive only while the corresponding indptr tensor is alive, and
+# invalidate it after any in-place structural mutation.
+_high_fanout_cache: dict[
+    int, tuple["weakref.ref[torch.Tensor]", int, torch.Tensor]
+] = {}
+
+
 def _delay_confirmed_zero(delay: torch.Tensor) -> bool:
     ref = _zero_delay_cache.get(id(delay))
     return ref is not None and ref() is delay
@@ -371,6 +483,30 @@ def _remember_delay_confirmed_zero(delay: torch.Tensor) -> None:
     _zero_delay_cache[key] = weakref.ref(delay, _evict)
 
 
+def _cached_high_fanout_mask(graph: EventCSRGraph) -> torch.Tensor:
+    indptr = graph.indptr
+    cached = _high_fanout_cache.get(id(indptr))
+    if (
+        cached is not None
+        and cached[0]() is indptr
+        and cached[1] == indptr._version
+    ):
+        return cached[2]
+
+    high_fanout = _make_high_fanout_mask(graph)
+    key = id(indptr)
+
+    def _evict(_: object, key: int = key) -> None:
+        _high_fanout_cache.pop(key, None)
+
+    _high_fanout_cache[key] = (
+        weakref.ref(indptr, _evict),
+        indptr._version,
+        high_fanout,
+    )
+    return high_fanout
+
+
 def _cuda_persistent_snn_forward(
     events: WindowedSpikeEvents,
     graph: EventCSRGraph,
@@ -379,6 +515,8 @@ def _cuda_persistent_snn_forward(
     *,
     return_mode: ReturnMode,
     fanout_binning: bool,
+    spike_block: bool,
+    workspace: PersistentSNNWorkspace | None,
 ) -> PersistentSNNOutput:
     t_steps, batch_size, n_pre = _validate_events(events)
     n_post = _validate_graph(graph, n_pre)
@@ -395,6 +533,7 @@ def _cuda_persistent_snn_forward(
         raise TypeError("cuda_persistent v1 requires int32 event tensors.")
     if graph.indptr.dtype != torch.int32 or graph.indices.dtype != torch.int32:
         raise TypeError("cuda_persistent v1 requires int32 graph indices.")
+    _validate_graph_indices(graph.indices, n_post)
     if graph.delay is not None and graph.delay.dtype != torch.int32:
         raise TypeError("cuda_persistent v1 requires int32 graph delay.")
     delay_validated = False
@@ -411,7 +550,16 @@ def _cuda_persistent_snn_forward(
     if events.values is not None and events.values.dtype != torch.float32:
         raise TypeError("cuda_persistent v1 requires float32 event values.")
 
-    _ensure_cuda_op(fanout_binning=fanout_binning)
+    if fanout_binning and spike_block:
+        raise ValueError("fanout_binning and spike_block are mutually exclusive.")
+
+    if workspace is None:
+        workspace = make_persistent_snn_workspace(graph, batch_size)
+
+    _ensure_cuda_op(
+        fanout_binning=fanout_binning,
+        spike_block=spike_block,
+    )
     event_values = (
         events.values
         if events.values is not None
@@ -432,6 +580,13 @@ def _cuda_persistent_snn_forward(
         graph.indptr,
         graph.indices,
         graph.weight,
+        True,
+        workspace.input_current,
+        workspace.queue_batch,
+        workspace.queue_edge_start,
+        workspace.queue_edge_end,
+        workspace.spike_count,
+        workspace.work_counter,
     )
     op_tail = (
         graph_delay,
@@ -449,8 +604,20 @@ def _cuda_persistent_snn_forward(
         return_dense,
         return_events,
     )
-    if fanout_binning:
-        graph_high_fanout = _make_high_fanout_mask(graph)
+    if spike_block:
+        (
+            dense_spikes,
+            event_offsets,
+            event_indices,
+            v_out,
+            psc_out,
+            _overflow,
+        ) = torch.ops.btorch_cuda.persistent_snn_forward_spike_block(
+            *op_args,
+            *op_tail,
+        )
+    elif fanout_binning:
+        graph_high_fanout = _cached_high_fanout_mask(graph)
         (
             dense_spikes,
             event_offsets,
@@ -498,6 +665,8 @@ def persistent_snn_forward(
     backend: Backend = "auto",
     return_mode: ReturnMode = "dense",
     fanout_binning: bool = False,
+    spike_block: bool = False,
+    workspace: PersistentSNNWorkspace | None = None,
 ) -> PersistentSNNOutput:
     """Dispatch the persistent SNN operator.
 
@@ -510,8 +679,14 @@ def persistent_snn_forward(
             for the future compiled operator, or ``"auto"`` to use CUDA when
             registered and fall back to the stub otherwise.
         return_mode: Select dense spikes, event spikes, or both.
-        fanout_binning: Use the experimental CUDA kernel that buckets fired
-            cells into high- and low-fanout queues before recurrent fanout.
+        fanout_binning: Bucket recurrent work by fanout. Long rows are split
+            into bounded warp tasks, while ordinary rows use 8-lane subwarps.
+        spike_block: Group fired cells from each contiguous 32-neuron block
+            into one task. Rows up to 16 edges use their relative block lane;
+            fanout of at least 256 edges uses 1024-edge segments.
+        workspace: Reusable CUDA scratch storage. Create it once with
+            :func:`make_persistent_snn_workspace` for steady-state windows, or
+            leave it unset to allocate scratch tensors for this call.
 
     Returns:
         Operator output with spikes/events and final state.
@@ -521,7 +696,14 @@ def persistent_snn_forward(
     if backend not in ("auto", "torch_stub", "cuda_persistent"):
         raise ValueError(f"Unknown backend: {backend}.")
 
-    has_selected_cuda_op = _has_cuda_binned_op() if fanout_binning else _has_cuda_op()
+    if fanout_binning and spike_block:
+        raise ValueError("fanout_binning and spike_block are mutually exclusive.")
+    if spike_block:
+        has_selected_cuda_op = _has_cuda_spike_block_op()
+    elif fanout_binning:
+        has_selected_cuda_op = _has_cuda_binned_op()
+    else:
+        has_selected_cuda_op = _has_cuda_op()
     use_cuda = backend == "cuda_persistent" or (
         backend == "auto" and has_selected_cuda_op
     )
@@ -533,6 +715,8 @@ def persistent_snn_forward(
             params,
             return_mode=return_mode,
             fanout_binning=fanout_binning,
+            spike_block=spike_block,
+            workspace=workspace,
         )
 
     return torch_stub_persistent_snn_forward(
@@ -549,8 +733,10 @@ __all__ = [
     "PersistentSNNOutput",
     "PersistentSNNParams",
     "PersistentSNNState",
+    "PersistentSNNWorkspace",
     "WindowedSpikeEvents",
     "make_empty_state",
+    "make_persistent_snn_workspace",
     "persistent_snn_forward",
     "torch_stub_persistent_snn_forward",
 ]

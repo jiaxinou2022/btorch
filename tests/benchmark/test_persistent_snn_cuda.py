@@ -8,6 +8,7 @@ from btorch.backend.persistent_snn import (
     PersistentSNNParams,
     PersistentSNNState,
     WindowedSpikeEvents,
+    make_persistent_snn_workspace,
     persistent_snn_forward,
 )
 
@@ -271,20 +272,66 @@ def test_cuda_persistent_soft_reset_preserves_surplus_voltage():
     torch.testing.assert_close(out.state.v, torch.ones_like(out.state.v))
 
 
+def test_cuda_persistent_reusable_workspace_sums_duplicate_input_events():
+    """A reused workspace should preserve duplicate-event accumulation.
+
+    Two events target the same cell in one bucket. Running twice with the same
+    scratch tensors verifies both the CAS accumulation and generation reset
+    semantics without mutating the caller-owned initial state.
+    """
+
+    device = _require_cuda()
+    graph = EventCSRGraph(
+        indptr=torch.tensor([0, 0], device=device, dtype=torch.int32),
+        indices=torch.empty(0, device=device, dtype=torch.int32),
+        weight=torch.empty(0, device=device, dtype=torch.float32),
+        delay=None,
+        shape=(1, 1),
+    )
+    events = WindowedSpikeEvents(
+        offsets=torch.tensor([0, 2], device=device, dtype=torch.int32),
+        indices=torch.tensor([0, 0], device=device, dtype=torch.int32),
+        values=torch.tensor([0.6, 0.7], device=device, dtype=torch.float32),
+        shape=(1, 1, 1),
+    )
+    state = PersistentSNNState(
+        v=torch.zeros(1, 1, device=device),
+        psc=torch.zeros(1, 1, device=device),
+    )
+    workspace = make_persistent_snn_workspace(graph, batch_size=1)
+
+    for _ in range(2):
+        out = _run_cuda_or_skip(
+            events,
+            graph,
+            state,
+            PersistentSNNParams(window_size=1),
+            return_mode="dense",
+            workspace=workspace,
+        )
+        torch.testing.assert_close(out.spikes, torch.ones_like(out.spikes))
+        torch.testing.assert_close(out.state.v, torch.full_like(out.state.v, 0.3))
+
+    torch.testing.assert_close(state.v, torch.zeros_like(state.v))
+    torch.testing.assert_close(state.psc, torch.zeros_like(state.psc))
+
+
 @pytest.mark.parametrize(
     "fanouts",
     [
         (8, 17),
         (256, 257),
         (255, 256),
+        (2050, 17),
     ],
 )
 def test_cuda_persistent_fanout_binning_matches_dense_reference(fanouts):
     """Opt-in fanout binning should preserve the baseline RSNN semantics.
 
-    The cases cover all-low rows, all-high rows, and the exact boundary where
-    ``255`` stays low while ``256`` becomes high. Passing
-    ``fanout_binning=True`` is the only switch needed by callers.
+    The cases cover all-low rows, all-high rows, the exact boundary where
+    ``255`` stays low while ``256`` becomes high, and a long row spanning
+    three 1024-edge tasks. Passing ``fanout_binning=True`` is the only switch
+    needed by callers.
     """
 
     device = _require_cuda()
@@ -319,6 +366,176 @@ def test_cuda_persistent_fanout_binning_matches_dense_reference(fanouts):
     expected = torch.arange(len(fanouts), dtype=indices.dtype)
     assert offsets.tolist() == [0, len(fanouts)]
     torch.testing.assert_close(indices, expected)
+
+
+@pytest.mark.parametrize(
+    "fanouts",
+    [
+        (8, 17),
+        (255, 256),
+        (257, 2050),
+    ],
+)
+def test_cuda_persistent_spike_block_matches_dense_reference(fanouts):
+    """Spike-block tasks should preserve dynamics across the 256-edge split.
+
+    Short rows from the same 32-neuron cell block share one queued task. The
+    8-edge row uses direct relative-lane traversal while the 17-edge row uses
+    a full warp. Rows at or above 256 edges become fixed 1024-edge segment
+    tasks. These cases exercise both paths and the exact boundaries.
+    """
+
+    device = _require_cuda()
+    graph, dense = _fanout_bucket_graph(device, fanouts)
+    n_neuron = graph.shape[0]
+    x_seq = torch.zeros(1, 1, n_neuron, device=device, dtype=torch.float32)
+    x_seq[0, 0, : len(fanouts)] = 1.2
+    state = PersistentSNNState(
+        v=torch.zeros(1, n_neuron, device=device),
+        psc=torch.zeros(1, n_neuron, device=device),
+    )
+    params = PersistentSNNParams(window_size=1)
+
+    out = _run_cuda_or_skip(
+        _dense_to_events(x_seq),
+        graph,
+        state,
+        params,
+        return_mode="both",
+        spike_block=True,
+    )
+    ref_spikes, ref_v, ref_psc = _reference(x_seq, dense, state, params)
+
+    assert out.spikes is not None
+    assert out.spike_events is not None
+    torch.testing.assert_close(out.spikes, ref_spikes, atol=0, rtol=0)
+    torch.testing.assert_close(out.state.v, ref_v, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out.state.psc, ref_psc, atol=1e-5, rtol=1e-5)
+
+
+def test_cuda_persistent_spike_block_merges_duplicate_posts():
+    """Block and segment tasks should sum duplicate posts correctly.
+
+    The first fired row is shorter than 256 edges and therefore travels in a
+    BlockTask. The second has 300 edges and becomes one SegmentTask. Repeated
+    destinations ensure atomic accumulation is exercised in both paths.
+    """
+
+    device = _require_cuda()
+    n_neuron = 301
+    low_count = 40
+    high_count = 300
+    graph = EventCSRGraph(
+        indptr=torch.tensor(
+            [0, low_count, low_count + high_count]
+            + [low_count + high_count] * (n_neuron - 2),
+            device=device,
+            dtype=torch.int32,
+        ),
+        indices=torch.tensor(
+            [7] * low_count + [9] * high_count,
+            device=device,
+            dtype=torch.int32,
+        ),
+        weight=torch.tensor(
+            [0.01] * low_count + [0.002] * high_count,
+            device=device,
+            dtype=torch.float32,
+        ),
+        delay=None,
+        shape=(n_neuron, n_neuron),
+    )
+    x_seq = torch.zeros(1, 1, n_neuron, device=device)
+    x_seq[0, 0, :2] = 1.2
+    state = PersistentSNNState(
+        v=torch.zeros(1, n_neuron, device=device),
+        psc=torch.zeros(1, n_neuron, device=device),
+    )
+
+    out = _run_cuda_or_skip(
+        _dense_to_events(x_seq),
+        graph,
+        state,
+        PersistentSNNParams(window_size=1),
+        return_mode="dense",
+        spike_block=True,
+    )
+
+    expected_psc = torch.zeros_like(state.psc)
+    expected_psc[0, 7] = low_count * 0.01
+    expected_psc[0, 9] = high_count * 0.002
+    torch.testing.assert_close(out.state.psc, expected_psc, atol=1e-5, rtol=1e-5)
+
+
+def test_cuda_persistent_spike_block_maps_nonzero_lane_rows():
+    """A block command should retain the CSR row owned by a nonzero lane.
+
+    Only lane 18 fires. This catches implementations that interpret the spike
+    mask relative to the consuming warp rather than the queued neuron block
+    and accidentally traverse row zero.
+    """
+
+    device = _require_cuda()
+    n_neuron = 64
+    posts = torch.arange(19, 35, device=device, dtype=torch.int32)
+    graph = EventCSRGraph(
+        indptr=torch.tensor(
+            [0] * 19 + [posts.numel()] * (n_neuron - 18),
+            device=device,
+            dtype=torch.int32,
+        ),
+        indices=posts,
+        weight=torch.ones(posts.numel(), device=device),
+        delay=None,
+        shape=(n_neuron, n_neuron),
+    )
+    x_seq = torch.zeros(1, 1, n_neuron, device=device)
+    x_seq[0, 0, 18] = 1.2
+    state = PersistentSNNState(
+        v=torch.zeros(1, n_neuron, device=device),
+        psc=torch.zeros(1, n_neuron, device=device),
+    )
+
+    out = _run_cuda_or_skip(
+        _dense_to_events(x_seq),
+        graph,
+        state,
+        PersistentSNNParams(window_size=1),
+        return_mode="dense",
+        spike_block=True,
+    )
+
+    expected_psc = torch.zeros_like(state.psc)
+    expected_psc[0, posts.to(torch.long)] = 1.0
+    torch.testing.assert_close(out.state.psc, expected_psc, atol=0, rtol=0)
+
+
+def test_cuda_persistent_rejects_multiple_task_schedulers():
+    """Callers must select at most one experimental task scheduler."""
+
+    device = _require_cuda()
+    events = _dense_to_events(torch.ones(1, 1, 1, device=device))
+    graph = EventCSRGraph(
+        indptr=torch.tensor([0, 0], device=device, dtype=torch.int32),
+        indices=torch.empty(0, device=device, dtype=torch.int32),
+        weight=torch.empty(0, device=device, dtype=torch.float32),
+        delay=None,
+        shape=(1, 1),
+    )
+    state = PersistentSNNState(
+        v=torch.zeros(1, 1, device=device),
+        psc=torch.zeros(1, 1, device=device),
+    )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        persistent_snn_forward(
+            events,
+            graph,
+            state,
+            backend="cuda_persistent",
+            fanout_binning=True,
+            spike_block=True,
+        )
 
 
 def test_cuda_persistent_rejects_unsupported_v1_options():
@@ -370,6 +587,43 @@ def test_cuda_persistent_rejects_unsupported_v1_options():
             backend="cuda_persistent",
         )
     with pytest.raises(ValueError, match="nonzero delay"):
+        persistent_snn_forward(
+            events,
+            graph,
+            state,
+            backend="cuda_persistent",
+        )
+
+
+def test_cuda_persistent_rejects_invalid_post_indices_after_mutation():
+    """CSR validation should be cached safely and invalidated by mutation."""
+
+    device = _require_cuda()
+    events = _dense_to_events(torch.ones(1, 1, 1, device=device))
+    indices = torch.tensor([0], device=device, dtype=torch.int32)
+    graph = EventCSRGraph(
+        indptr=torch.tensor([0, 1], device=device, dtype=torch.int32),
+        indices=indices,
+        weight=torch.tensor([0.0], device=device, dtype=torch.float32),
+        delay=None,
+        shape=(1, 1),
+    )
+    state = PersistentSNNState(
+        v=torch.zeros(1, 1, device=device),
+        psc=torch.zeros(1, 1, device=device),
+    )
+
+    # The first call records that this tensor version is a valid CSR column
+    # array. Mutating the same tensor increments Tensor._version, so the next
+    # call must revalidate instead of trusting the cached result.
+    persistent_snn_forward(
+        events,
+        graph,
+        state,
+        backend="cuda_persistent",
+    )
+    indices[0] = 1
+    with pytest.raises(ValueError, match="graph.indices"):
         persistent_snn_forward(
             events,
             graph,

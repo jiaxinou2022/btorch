@@ -8,11 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Added
+- **Persistent spike-block scheduler**: opt-in `spike_block=True` groups fired
+  cells from a contiguous 32-neuron block. Rows up to 16 edges use the
+  neuron's relative block lane for direct CSR lookup, longer rows use a full
+  warp, and fanout of 256 edges or more is split into 1024-edge segments. A
+  focused CUDA benchmark compares it with the other schedulers.
+- **Reusable persistent-SNN workspace** (`PersistentSNNWorkspace`): callers can
+  preallocate CUDA input and fanout scratch tensors across simulation windows.
 - **Two-compartment neuron** (`TwoCompartmentGLIF`): soma-apical neuron with nonlinear apical plateau, bidirectional coupling, and optional adaptive threshold. See [tutorial](tutorials/mixed_neurons.md).
 - **Mixed neuron population** (`MixedNeuronPopulation`): single recurrent layer mixing multiple neuron types (e.g. GLIF3 + TwoCompartmentGLIF) with automatic current slicing and spike concatenation.
 - **Heterogeneous RNN** (`HeteroRecurrentNN`): drop-in replacement for `RecurrentNN` that accepts a `MixedNeuronPopulation`.
 
 ### Changed
+- Persistent CUDA steady-state execution can reuse fanout/input workspace and
+  caches fixed high-fanout graph metadata across simulation windows.
+- Persistent CUDA cell updates avoid per-cell integer division, and validated
+  CSR fanout skips per-edge post-synaptic bounds branches. The binned kernel
+  splits long rows into bounded warp tasks and transitions directly to
+  ordinary-row subwarp tasks without an intermediate grid barrier.
 - Conda environment file renamed from `dev-requirements.yaml` to `environment.yml`.
 
 ### Breaking Changes

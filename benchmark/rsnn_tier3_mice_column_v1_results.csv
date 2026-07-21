@@ -1,0 +1,9 @@
+stage,status,total_time_ms,time_per_timestep_us,correctness,spike_mismatches,spike_mismatch_rate,notes
+tier3_baseline,baseline,5.527552127838135,43.18400099873543,passed,66,0.00012376980316850696,second-tier final code clean sequential run
+unified_binned_queue_binary,kept,5.527552127838135,43.18400099873543,passed,66,0.00012376980316850696,legacy duplicate binned kernel queue machinery excluded from compiled extension
+division_free_cell_update,kept,4.225024223327637,33.00800174474716,passed,66,0.00012376980316850696,explicit batch and neuron loops remove cell division
+validated_unchecked_post,kept,5.291007995605469,41.335999965667725,passed,66,0.00012376980316850696,CSR columns validated once and cached before unchecked release fanout
+final_run1,kept,5.299200057983398,41.4000004529953,passed,66,0.00012376980316850696,final implementation
+final_run2,kept,5.3002238273620605,41.4079986512661,passed,66,0.00012376980316850696,final implementation
+final_run3,kept,4.807680130004883,37.56000101566315,passed,66,0.00012376980316850696,final implementation
+final_cross_process_median,kept,5.299200057983398,41.4000004529953,passed,66,0.00012376980316850696,4.13 percent faster than tier3 baseline despite observed GPU clock variation

@@ -92,7 +92,9 @@ def load():
             name="btorch_persistent_snn_plain",
             sources=[
                 str(here / "persistent_snn.cpp"),
-                str(here / "persistent_snn_kernel.cu"),
+                str(here / "persistent_snn_plain_kernel.cu"),
+                str(here / "persistent_snn_binned_kernel.cu"),
+                str(here / "persistent_snn_spike_block_kernel.cu"),
             ],
             build_directory=str(build_directory),
             extra_cflags=["-O3"],
