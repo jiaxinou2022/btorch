@@ -8,8 +8,12 @@ from btorch.backend.persistent_snn import (
     PersistentSNNParams,
     PersistentSNNState,
     WindowedSpikeEvents,
+    build_persistent_snn_reorder_plan,
     make_persistent_snn_workspace,
     persistent_snn_forward,
+    reorder_persistent_snn_state,
+    reorder_windowed_spike_events,
+    restore_persistent_snn_output,
 )
 
 
@@ -508,6 +512,86 @@ def test_cuda_persistent_spike_block_maps_nonzero_lane_rows():
     expected_psc = torch.zeros_like(state.psc)
     expected_psc[0, posts.to(torch.long)] = 1.0
     torch.testing.assert_close(out.state.psc, expected_psc, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("sort_row_edges", [False, True])
+def test_cuda_persistent_physical_reorder_matches_original_ids(sort_row_edges):
+    """A reordered multi-step window should restore the original API result.
+
+    Random neuron IDs exercise the complete row/post permutation. Optional row
+    sorting additionally changes physical edge order, while restoration must
+    still recover dense spikes, final state, and per-bucket event identities.
+    """
+
+    device = _require_cuda()
+    x_seq = torch.tensor(
+        [
+            [[1.2, 0.0, 1.3, 0.0]],
+            [[0.0, 1.4, 0.0, 1.5]],
+            [[0.8, 0.0, 0.9, 0.0]],
+        ],
+        device=device,
+    )
+    events = _dense_to_events(x_seq)
+    graph, _dense = _graph(device)
+    state = PersistentSNNState(
+        v=torch.zeros(1, 4, device=device),
+        psc=torch.zeros(1, 4, device=device),
+    )
+    params = PersistentSNNParams(window_size=3)
+    reference = _run_cuda_or_skip(
+        events,
+        graph,
+        state,
+        params,
+        return_mode="both",
+        spike_block=True,
+    )
+
+    plan = build_persistent_snn_reorder_plan(
+        graph,
+        method="random",
+        sort_row_edges=sort_row_edges,
+        seed=5,
+    )
+    physical_output = _run_cuda_or_skip(
+        reorder_windowed_spike_events(events, plan),
+        plan.reordered_graph,
+        reorder_persistent_snn_state(state, plan),
+        params,
+        return_mode="both",
+        spike_block=True,
+    )
+    restored = restore_persistent_snn_output(physical_output, plan)
+
+    assert reference.spikes is not None
+    assert restored.spikes is not None
+    torch.testing.assert_close(restored.spikes, reference.spikes, atol=0, rtol=0)
+    torch.testing.assert_close(
+        restored.state.v,
+        reference.state.v,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    torch.testing.assert_close(
+        restored.state.psc,
+        reference.state.psc,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert reference.spike_events is not None
+    assert restored.spike_events is not None
+    torch.testing.assert_close(
+        restored.spike_events.offsets,
+        reference.spike_events.offsets,
+    )
+    offsets = reference.spike_events.offsets
+    for bucket in range(offsets.numel() - 1):
+        start = int(offsets[bucket].item())
+        end = int(offsets[bucket + 1].item())
+        expected = torch.sort(reference.spike_events.indices[start:end]).values
+        actual = torch.sort(restored.spike_events.indices[start:end]).values
+        torch.testing.assert_close(actual, expected)
 
 
 def test_cuda_persistent_rejects_multiple_task_schedulers():

@@ -54,6 +54,14 @@ import torch
 
 Backend = Literal["auto", "torch_stub", "cuda_persistent"]
 ReturnMode = Literal["dense", "events", "both"]
+ReorderMethod = Literal[
+    "identity",
+    "random",
+    "global_fanout",
+    "local_fanout",
+    "global_primary_tile",
+    "local_primary_tile",
+]
 _FANOUT_BINNING_THRESHOLD = 256
 
 
@@ -192,6 +200,29 @@ class PersistentSNNOutput:
     spikes: torch.Tensor | None
     spike_events: WindowedSpikeEvents | None
     state: PersistentSNNState
+
+
+@dataclass(frozen=True)
+class PersistentSNNReorderPlan:
+    """Hold one reusable physical neuron and CSR permutation.
+
+    Args:
+        new_to_old: Original neuron ID for each physical neuron ID.
+        old_to_new: Physical neuron ID for each original neuron ID.
+        reordered_graph: CSR graph stored entirely in physical ID space.
+        method: Strategy used to construct the permutation.
+        region_size: Maximum old-ID region sorted independently.
+        post_tile_size: Number of post neurons in one locality tile.
+        sort_row_edges: Whether each rebuilt row is sorted by physical post ID.
+    """
+
+    new_to_old: torch.Tensor
+    old_to_new: torch.Tensor
+    reordered_graph: EventCSRGraph
+    method: ReorderMethod
+    region_size: int
+    post_tile_size: int
+    sort_row_edges: bool
 
 
 @dataclass(frozen=True)
@@ -346,6 +377,277 @@ def make_persistent_snn_workspace(
         # ordinary rows. The non-binned kernel only touches index 0.
         spike_count=torch.empty(2, **int_options),
         work_counter=torch.empty(2, **int_options),
+    )
+
+
+def _primary_post_tiles(graph: EventCSRGraph, post_tile_size: int) -> torch.Tensor:
+    """Return the most populated post tile for every CSR row."""
+
+    n_neuron = graph.shape[0]
+    n_tiles = (graph.shape[1] + post_tile_size - 1) // post_tile_size
+    degrees = (graph.indptr[1:] - graph.indptr[:-1]).to(torch.long)
+    edge_rows = torch.repeat_interleave(
+        torch.arange(n_neuron, device=graph.indptr.device),
+        degrees,
+    )
+    post_tiles = torch.div(
+        graph.indices.to(torch.long),
+        post_tile_size,
+        rounding_mode="floor",
+    )
+    histogram = torch.bincount(
+        edge_rows * n_tiles + post_tiles,
+        minlength=n_neuron * n_tiles,
+    ).reshape(n_neuron, n_tiles)
+    return histogram.argmax(dim=1)
+
+
+def _build_new_to_old(
+    graph: EventCSRGraph,
+    method: ReorderMethod,
+    region_size: int,
+    post_tile_size: int,
+    seed: int,
+) -> torch.Tensor:
+    """Construct a physical-to-original neuron permutation."""
+
+    n_neuron = graph.shape[0]
+    device = graph.indptr.device
+    if method == "identity":
+        return torch.arange(n_neuron, device=device, dtype=torch.long)
+    if method == "random":
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(seed)
+        return torch.randperm(n_neuron, generator=generator).to(device)
+
+    degrees = (graph.indptr[1:] - graph.indptr[:-1]).detach().cpu().tolist()
+    primary_tiles: list[int] | None = None
+    if method in ("global_primary_tile", "local_primary_tile"):
+        primary_tiles = (
+            _primary_post_tiles(graph, post_tile_size).detach().cpu().tolist()
+        )
+
+    local = method in ("local_fanout", "local_primary_tile")
+    span = region_size if local else n_neuron
+    permutation: list[int] = []
+    for region_start in range(0, n_neuron, span):
+        region_end = min(region_start + span, n_neuron)
+        neurons = range(region_start, region_end)
+        if primary_tiles is None:
+            ordered = sorted(neurons, key=lambda neuron: (degrees[neuron], neuron))
+        else:
+            ordered = sorted(
+                neurons,
+                key=lambda neuron: (
+                    primary_tiles[neuron],
+                    degrees[neuron],
+                    neuron,
+                ),
+            )
+        permutation.extend(ordered)
+    return torch.tensor(permutation, device=device, dtype=torch.long)
+
+
+def build_persistent_snn_reorder_plan(
+    graph: EventCSRGraph,
+    method: ReorderMethod = "local_fanout",
+    *,
+    region_size: int = 128,
+    post_tile_size: int = 128,
+    sort_row_edges: bool = True,
+    seed: int = 0,
+) -> PersistentSNNReorderPlan:
+    """Build a reusable physical neuron and CSR reorder plan.
+
+    The returned graph uses physical IDs for both CSR rows and post indices.
+    Building the plan is an explicit preprocessing operation and is never
+    performed by :func:`persistent_snn_forward`.
+
+    Args:
+        graph: Square recurrent graph in the caller's original neuron IDs.
+        method: Permutation strategy.
+        region_size: Old-ID region sorted independently by local strategies.
+        post_tile_size: Post-ID tile width used by post-aware strategies.
+        sort_row_edges: Sort rebuilt rows by physical post ID.
+        seed: CPU random seed used only by the random strategy.
+
+    Returns:
+        Reusable mappings and rebuilt physical-ID CSR graph.
+
+    Raises:
+        ValueError: If the graph is not square or a parameter is invalid.
+    """
+
+    n_pre, n_post = graph.shape
+    if n_pre != n_post:
+        raise ValueError("persistent SNN physical reorder requires an N x N graph.")
+    if region_size <= 0:
+        raise ValueError("region_size must be positive.")
+    if post_tile_size <= 0:
+        raise ValueError("post_tile_size must be positive.")
+    supported = (
+        "identity",
+        "random",
+        "global_fanout",
+        "local_fanout",
+        "global_primary_tile",
+        "local_primary_tile",
+    )
+    if method not in supported:
+        raise ValueError(f"Unknown reorder method: {method}.")
+
+    _validate_graph(graph, n_pre)
+    _validate_graph_indices(graph.indices, n_post)
+    new_to_old = _build_new_to_old(
+        graph,
+        method,
+        region_size,
+        post_tile_size,
+        seed,
+    )
+    old_to_new = torch.empty_like(new_to_old)
+    old_to_new[new_to_old] = torch.arange(
+        n_pre,
+        device=new_to_old.device,
+        dtype=new_to_old.dtype,
+    )
+
+    old_indptr = graph.indptr.to(torch.long)
+    old_degrees = old_indptr[1:] - old_indptr[:-1]
+    new_degrees = old_degrees.index_select(0, new_to_old)
+    new_indptr_long = torch.zeros(
+        n_pre + 1,
+        device=graph.indptr.device,
+        dtype=torch.long,
+    )
+    new_indptr_long[1:] = torch.cumsum(new_degrees, dim=0)
+    edge_count = graph.indices.numel()
+    new_edge_rows = torch.repeat_interleave(
+        torch.arange(n_pre, device=graph.indptr.device),
+        new_degrees,
+    )
+    new_row_starts = torch.repeat_interleave(
+        new_indptr_long[:-1],
+        new_degrees,
+    )
+    relative_edges = (
+        torch.arange(edge_count, device=graph.indptr.device) - new_row_starts
+    )
+    old_edge_rows = new_to_old.index_select(0, new_edge_rows)
+    old_edges = old_indptr.index_select(0, old_edge_rows) + relative_edges
+    old_posts = graph.indices.to(torch.long).index_select(0, old_edges)
+    new_indices = old_to_new.index_select(0, old_posts)
+    new_weights = graph.weight.index_select(0, old_edges)
+    new_delay = (
+        graph.delay.index_select(0, old_edges) if graph.delay is not None else None
+    )
+
+    if sort_row_edges and edge_count > 0:
+        edge_keys = new_edge_rows * n_pre + new_indices
+        edge_order = torch.argsort(edge_keys, stable=True)
+        new_indices = new_indices.index_select(0, edge_order)
+        new_weights = new_weights.index_select(0, edge_order)
+        if new_delay is not None:
+            new_delay = new_delay.index_select(0, edge_order)
+
+    reordered_graph = EventCSRGraph(
+        indptr=new_indptr_long.to(graph.indptr.dtype).contiguous(),
+        indices=new_indices.to(graph.indices.dtype).contiguous(),
+        weight=new_weights.contiguous(),
+        delay=new_delay.contiguous() if new_delay is not None else None,
+        shape=graph.shape,
+    )
+    return PersistentSNNReorderPlan(
+        new_to_old=new_to_old,
+        old_to_new=old_to_new,
+        reordered_graph=reordered_graph,
+        method=method,
+        region_size=region_size,
+        post_tile_size=post_tile_size,
+        sort_row_edges=sort_row_edges,
+    )
+
+
+def reorder_persistent_snn_state(
+    state: PersistentSNNState,
+    plan: PersistentSNNReorderPlan,
+) -> PersistentSNNState:
+    """Map caller state from original IDs to physical IDs."""
+
+    permutation = plan.new_to_old
+
+    def reorder(tensor: torch.Tensor | None) -> torch.Tensor | None:
+        return tensor.index_select(-1, permutation) if tensor is not None else None
+
+    return PersistentSNNState(
+        v=state.v.index_select(-1, permutation),
+        psc=state.psc.index_select(-1, permutation),
+        refractory=reorder(state.refractory),
+        delay_ring=reorder(state.delay_ring),
+    )
+
+
+def restore_persistent_snn_state(
+    state: PersistentSNNState,
+    plan: PersistentSNNReorderPlan,
+) -> PersistentSNNState:
+    """Map physical state back to the caller's original IDs."""
+
+    permutation = plan.old_to_new
+
+    def restore(tensor: torch.Tensor | None) -> torch.Tensor | None:
+        return tensor.index_select(-1, permutation) if tensor is not None else None
+
+    return PersistentSNNState(
+        v=state.v.index_select(-1, permutation),
+        psc=state.psc.index_select(-1, permutation),
+        refractory=restore(state.refractory),
+        delay_ring=restore(state.delay_ring),
+    )
+
+
+def reorder_windowed_spike_events(
+    events: WindowedSpikeEvents,
+    plan: PersistentSNNReorderPlan,
+) -> WindowedSpikeEvents:
+    """Map sparse input event indices from original IDs to physical IDs."""
+
+    indices = plan.old_to_new.index_select(0, events.indices.to(torch.long))
+    return WindowedSpikeEvents(
+        offsets=events.offsets,
+        indices=indices.to(events.indices.dtype).contiguous(),
+        values=events.values,
+        shape=events.shape,
+    )
+
+
+def restore_persistent_snn_output(
+    output: PersistentSNNOutput,
+    plan: PersistentSNNReorderPlan,
+) -> PersistentSNNOutput:
+    """Map dense/event output and state back to original neuron IDs."""
+
+    spikes = (
+        output.spikes.index_select(-1, plan.old_to_new)
+        if output.spikes is not None
+        else None
+    )
+    spike_events = None
+    if output.spike_events is not None:
+        restored_indices = plan.new_to_old.index_select(
+            0,
+            output.spike_events.indices.to(torch.long),
+        )
+        spike_events = WindowedSpikeEvents(
+            offsets=output.spike_events.offsets,
+            indices=restored_indices.to(output.spike_events.indices.dtype),
+            values=output.spike_events.values,
+            shape=output.spike_events.shape,
+        )
+    return PersistentSNNOutput(
+        spikes=spikes,
+        spike_events=spike_events,
+        state=restore_persistent_snn_state(output.state, plan),
     )
 
 
@@ -732,11 +1034,17 @@ __all__ = [
     "EventCSRGraph",
     "PersistentSNNOutput",
     "PersistentSNNParams",
+    "PersistentSNNReorderPlan",
     "PersistentSNNState",
     "PersistentSNNWorkspace",
     "WindowedSpikeEvents",
+    "build_persistent_snn_reorder_plan",
     "make_empty_state",
     "make_persistent_snn_workspace",
     "persistent_snn_forward",
+    "reorder_persistent_snn_state",
+    "reorder_windowed_spike_events",
+    "restore_persistent_snn_output",
+    "restore_persistent_snn_state",
     "torch_stub_persistent_snn_forward",
 ]

@@ -1,29 +1,30 @@
-"""Compare torch.compile(reduce-overhead), manual CUDA graphs, and the CUDA
-persistent kernel on the same recurrent LIF + ExponentialPSC RSNN dynamics.
+"""Compare standard PyTorch RSNN baselines with persistent CUDA kernels.
 
-All three providers share one forward function (``native_sparse_step``) built
-on ``btorch.sparse``'s native CSR backend (``sparse_mm``), so the only thing
-that differs between providers is *how the per-timestep Python loop gets
-dispatched to the GPU*:
+The default comparison contains four public-API PyTorch baselines and the
+three persistent CUDA task schedulers:
 
-  * ``torch_compile_reduce_overhead`` -- ``torch.compile(fn, mode="reduce-overhead")``.
-    Inductor's cudagraph-trees feature captures a CUDA graph per compiled
-    region internally; we just call the compiled callable.
-  * ``cudagraph_native_sparse`` -- a hand-rolled ``torch.cuda.CUDAGraph()``
-    capture of the whole T-step loop (warmup on a side stream, capture once,
-    replay with fresh input copied into the static input buffer). Same
-    pattern as ``tests/models/test_cudagraph.py``.
-  * ``persistent`` -- the CUDA cooperative-kernel backend from
-    ``btorch.backend.persistent_snn`` (single kernel launch does all T steps
-    with in-kernel ``grid.sync()`` barriers instead of separate per-step
-    kernel launches).
-  * ``eager_native_sparse`` -- no compile, no graph; the same Python loop run
-    directly. Included as a baseline to show what compile/graph buy you.
+* ``torch_dense_eager`` uses :func:`torch.nn.functional.linear`.
+* ``torch_dense_cudagraph`` captures the same dense forward with
+  :class:`torch.cuda.CUDAGraph`.
+* ``torch_csr_eager`` uses :func:`torch.sparse.mm` with a PyTorch CSR tensor.
+* ``torch_csr_cudagraph`` captures the same CSR forward with a CUDA graph.
+* ``cusparse_direct_eager`` calls cuSPARSE SpMV/SpMM directly from a CUDA
+  extension with preallocated descriptors and workspace.
+* ``cusparse_direct_cudagraph`` captures that direct CUDA execution.
+* ``persistent_plain``, ``persistent_binning``, and
+  ``persistent_spike_block`` execute one cooperative CUDA kernel per window.
+
+All providers evaluate the same recurrent LIF and ExponentialPSC equations
+from the same zero state and fixed input. Dataset loading, weight conversion,
+CUDA graph capture, and persistent workspace allocation are outside timing.
+The direct provider uses ``CUSPARSE_SPMV_ALG_DEFAULT`` for batch size one and
+``CUSPARSE_SPMM_CSR_ALG1`` otherwise.
 
 Usage::
 
     python benchmark/benchmark_rsnn_cudagraph_compare.py \
-        --n-neuron 8192 --t-steps 16 32 64 128 256 --fanout 32 --event-rate 0.01
+        --dataset mice_column_v1 --t-steps 128 --batch-size 1 \
+        --csv benchmark/mice_v1_standard_baselines.csv
 """
 
 from __future__ import annotations
@@ -32,23 +33,23 @@ import argparse
 import csv
 import math
 import sys
-import time
 from pathlib import Path
 from typing import Literal
 
 import torch
+import torch.nn.functional as functional
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+CONNECTOME_ROOT = REPO_ROOT / "connectome_dataset"
+for import_root in (REPO_ROOT, CONNECTOME_ROOT):
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
 
 from benchmark.benchmark_persistent_snn import (  # noqa: E402
     BenchCase,
     RSNNResult,
-    csr_to_dense,
     csr_to_persistent_graph,
-    dense_rsnn_forward,
     dense_to_windowed_events,
     make_input_sequence,
     make_recurrent_csr,
@@ -56,43 +57,65 @@ from benchmark.benchmark_persistent_snn import (  # noqa: E402
 from btorch.backend.persistent_snn import (  # noqa: E402
     PersistentSNNParams,
     make_empty_state,
+    make_persistent_snn_workspace,
     persistent_snn_forward,
 )
-from btorch.sparse import CSR, BinaryEvents, event_sparse_mm, sparse_mm  # noqa: E402
+from btorch.sparse import CSR, sparse_mm  # noqa: E402
 
 
 Provider = Literal[
-    "eager_native_sparse",
-    "torch_compile_reduce_overhead",
-    "cudagraph_native_sparse",
-    "cudagraph_native_sparse_chunked",
-    "eager_prespan",
-    "cudagraph_prespan",
-    "cudagraph_prespan_chunked",
-    "persistent",
+    "torch_dense_eager",
+    "torch_dense_cudagraph",
+    "torch_csr_eager",
+    "torch_csr_cudagraph",
+    "cusparse_direct_eager",
+    "cusparse_direct_cudagraph",
+    "persistent_plain",
+    "persistent_binning",
+    "persistent_spike_block",
 ]
 
 PROVIDERS: tuple[Provider, ...] = (
-    "eager_native_sparse",
-    "torch_compile_reduce_overhead",
-    "cudagraph_native_sparse",
-    "cudagraph_native_sparse_chunked",
-    "eager_prespan",
-    "cudagraph_prespan",
-    "cudagraph_prespan_chunked",
-    "persistent",
+    "torch_dense_eager",
+    "torch_dense_cudagraph",
+    "torch_csr_eager",
+    "torch_csr_cudagraph",
+    "cusparse_direct_eager",
+    "cusparse_direct_cudagraph",
+    "persistent_plain",
+    "persistent_binning",
+    "persistent_spike_block",
 )
 
 
-def precompute_csr_row(matrix: CSR) -> torch.Tensor:
-    """Expand ``indptr`` into a per-edge source-row index vector.
+def load_mice_column_v1_csr(
+    root: Path | None, *, weight_scale: float, device: torch.device
+) -> CSR:
+    """Load the mice V1 column graph and normalize its recurrent weights."""
 
-    ``CSR.mm`` recomputes this with ``torch.repeat_interleave`` on every
-    call. That op is *not* stream-capture safe (its output size is resolved
-    with an internal sync), so for the CUDA-graph provider we compute it once
-    outside the graph -- it only depends on the matrix's fixed structure, not
-    on any per-call data.
-    """
+    try:
+        from connectome_dataset.graph_loader import load_mice_column_v1
+    except ImportError as exc:
+        raise RuntimeError(
+            "connectome_dataset is required for --dataset mice_column_v1"
+        ) from exc
+
+    try:
+        scipy_matrix = load_mice_column_v1(root=root, use_weights=False).tocsr()
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"{exc}\nFetch connectome_dataset/data/external/mice_column_v1 "
+            "or pass --connectome-root."
+        ) from exc
+    if scipy_matrix.shape[0] != scipy_matrix.shape[1]:
+        raise ValueError(f"mice_column_v1 must be square, got {scipy_matrix.shape}.")
+    average_fanout = scipy_matrix.nnz / max(scipy_matrix.shape[0], 1)
+    scipy_matrix.data.fill(weight_scale / max(average_fanout, 1.0))
+    return CSR.from_scipy(scipy_matrix, device=device, dtype=torch.float32)
+
+
+def precompute_csr_row(matrix: CSR) -> torch.Tensor:
+    """Expand CSR pointers into source rows for legacy benchmark imports."""
 
     counts = matrix.indptr[1:] - matrix.indptr[:-1]
     return torch.repeat_interleave(
@@ -103,12 +126,7 @@ def precompute_csr_row(matrix: CSR) -> torch.Tensor:
 def csr_mm_with_cached_row(
     matrix: CSR, x: torch.Tensor, row: torch.Tensor
 ) -> torch.Tensor:
-    """Same contraction as ``CSR.mm``, but taking a precomputed ``row``.
-
-    Graph-capture-safe version of ``btorch.sparse.sparse_mm`` for a native
-    CSR matrix: no ``repeat_interleave``, only gather / elementwise / static
-    ``scatter_add_``, all of which are capturable.
-    """
+    """Evaluate the legacy source-oriented CSR gather/scatter operation."""
 
     leading = x.shape[:-1]
     x2d = x.reshape(-1, matrix.shape[0])
@@ -133,13 +151,7 @@ def native_sparse_rsnn_forward(
     t_steps: int,
     row: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Reference RSNN step function shared by all non-persistent providers.
-
-    Pure tensor ops, static shapes for a fixed ``matrix``/``t_steps`` -- safe
-    to trace with ``torch.compile``. Pass ``row`` (see
-    ``precompute_csr_row``) to make this capture-safe for a raw
-    ``torch.cuda.graph()`` capture too.
-    """
+    """Run the legacy btorch CSR path used by the roofline benchmark."""
 
     decay = math.exp(-dt / tau_syn)
     reset_delta = v_threshold - v_reset
@@ -161,674 +173,498 @@ def native_sparse_rsnn_forward(
     return torch.stack(spikes, dim=0), v, psc
 
 
-def _zero_state(
-    case: BenchCase, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor]:
-    v0 = torch.zeros(case.batch_size, case.n_neuron, device=device, dtype=torch.float32)
-    psc0 = torch.zeros_like(v0)
-    return v0, psc0
+def make_torch_csr_weight(matrix: CSR) -> torch.Tensor:
+    """Convert source-oriented btorch CSR into ``(N_post, N_pre)`` CSR.
 
-
-def run_eager_native_sparse(x_seq, matrix, case: BenchCase) -> RSNNResult:
-    v0, psc0 = _zero_state(case, x_seq.device)
-    spikes, v, psc = native_sparse_rsnn_forward(
-        x_seq,
-        matrix,
-        v0,
-        psc0,
-        dt=case.dt,
-        tau_mem=case.tau_mem,
-        tau_syn=case.tau_syn,
-        v_threshold=case.v_threshold,
-        v_reset=case.v_reset,
-        c_m=case.c_m,
-        t_steps=case.t_steps,
-    )
-    return RSNNResult(spikes=spikes, v=v, psc=psc)
-
-
-def prespan_rsnn_forward(
-    x_seq: torch.Tensor,
-    matrix: CSR,
-    v0: torch.Tensor,
-    psc0: torch.Tensor,
-    *,
-    dt: float,
-    tau_mem: float,
-    tau_syn: float,
-    v_threshold: float,
-    v_reset: float,
-    c_m: float,
-    t_steps: int,
-    max_events: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Same RSNN dynamics, but the recurrent fan-out uses the Triton
-    ``pre_span`` event kernel -- the same "pre-synaptic spike list is a task
-    queue, fan out over that neuron's CSR edges" algorithm the persistent CUDA
-    kernel implements (see ``plan.md``: "prespan算法"), just dispatched as
-    ordinary per-timestep kernel launches instead of one cooperative kernel
-    with in-kernel barriers.
-
-    ``max_events`` must be a fixed capacity chosen up front (not derived from
-    data inside this function) for two reasons: it fixes the Triton kernels'
-    launch grid size, and ``compact_binary_events``/``event_sparse_mm`` only
-    take the data-dependent-shape branch (a capture-unsafe ``.item()``-sized
-    allocation) when ``max_events`` is left as ``None``. Passing a fixed value
-    keeps every intermediate shape static, which is what makes this
-    capture-safe for the CUDA-graph provider below.
+    PyTorch sparse matrix multiplication computes ``W @ z.T``. The btorch
+    graph stores rows by pre-synaptic neuron, so its edges are transposed once
+    during untimed preparation. COO coalescing also gives defined behavior if
+    a dataset contains duplicate edges.
     """
 
-    decay = math.exp(-dt / tau_syn)
-    reset_delta = v_threshold - v_reset
+    source = precompute_csr_row(matrix)
+    edge_index = torch.stack((matrix.indices.to(torch.long), source.to(torch.long)))
+    coo = torch.sparse_coo_tensor(
+        edge_index,
+        matrix.effective_values(),
+        size=(matrix.shape[1], matrix.shape[0]),
+        device=matrix.data.device,
+        dtype=matrix.data.dtype,
+    ).coalesce()
+    return coo.to_sparse_csr()
+
+
+def torch_dense_rsnn_forward(
+    x_seq: torch.Tensor,
+    weight: torch.Tensor,
+    v0: torch.Tensor,
+    psc0: torch.Tensor,
+    case: BenchCase,
+) -> RSNNResult:
+    """Run the RSNN with the standard dense PyTorch linear operator."""
+
+    decay = math.exp(-case.dt / case.tau_syn)
+    reset_delta = case.v_threshold - case.v_reset
     v = v0
     psc = psc0
     spikes = []
-    for t in range(t_steps):
+    for t in range(case.t_steps):
         current = psc + x_seq[t]
-        v_pre = v + dt * (-(v - v_reset) / tau_mem + current / c_m)
-        z = (v_pre >= v_threshold).to(v.dtype)
-        v = v_pre - reset_delta * z
-        recurrent = event_sparse_mm(
-            matrix, BinaryEvents(z), schedule="pre_span", max_events=max_events
+        v_pre = v + case.dt * (
+            -(v - case.v_reset) / case.tau_mem + current / case.c_m
         )
+        z = (v_pre >= case.v_threshold).to(v.dtype)
+        v = v_pre - reset_delta * z
+        recurrent = functional.linear(z, weight)
         psc = psc * decay + recurrent
         spikes.append(z)
-    return torch.stack(spikes, dim=0), v, psc
+    return RSNNResult(spikes=torch.stack(spikes), v=v, psc=psc)
 
 
-def run_eager_prespan(x_seq, matrix, case: BenchCase, *, max_events: int) -> RSNNResult:
-    v0, psc0 = _zero_state(case, x_seq.device)
-    spikes, v, psc = prespan_rsnn_forward(
-        x_seq,
-        matrix,
-        v0,
-        psc0,
-        dt=case.dt,
-        tau_mem=case.tau_mem,
-        tau_syn=case.tau_syn,
-        v_threshold=case.v_threshold,
-        v_reset=case.v_reset,
-        c_m=case.c_m,
-        t_steps=case.t_steps,
-        max_events=max_events,
+def torch_csr_rsnn_forward(
+    x_seq: torch.Tensor,
+    weight: torch.Tensor,
+    v0: torch.Tensor,
+    psc0: torch.Tensor,
+    case: BenchCase,
+) -> RSNNResult:
+    """Run the RSNN with the standard PyTorch CSR sparse matrix operator."""
+
+    decay = math.exp(-case.dt / case.tau_syn)
+    reset_delta = case.v_threshold - case.v_reset
+    v = v0
+    psc = psc0
+    spikes = []
+    for t in range(case.t_steps):
+        current = psc + x_seq[t]
+        v_pre = v + case.dt * (
+            -(v - case.v_reset) / case.tau_mem + current / case.c_m
+        )
+        z = (v_pre >= case.v_threshold).to(v.dtype)
+        v = v_pre - reset_delta * z
+        recurrent = torch.sparse.mm(weight, z.transpose(0, 1)).transpose(0, 1)
+        psc = psc * decay + recurrent
+        spikes.append(z)
+    return RSNNResult(spikes=torch.stack(spikes), v=v, psc=psc)
+
+
+def make_eager_runner(
+    x_seq: torch.Tensor,
+    weight: torch.Tensor,
+    case: BenchCase,
+    *,
+    sparse: bool,
+):
+    """Prepare zero state and return a standard eager forward runner."""
+
+    v0 = torch.zeros(
+        case.batch_size,
+        case.n_neuron,
+        device=x_seq.device,
+        dtype=x_seq.dtype,
     )
-    return RSNNResult(spikes=spikes, v=v, psc=psc)
+    psc0 = torch.zeros_like(v0)
+    forward = torch_csr_rsnn_forward if sparse else torch_dense_rsnn_forward
+
+    def run() -> RSNNResult:
+        return forward(x_seq, weight, v0, psc0, case)
+
+    return run
 
 
-class CompiledNativeSparseProvider:
-    """Caches one ``torch.compile`` region per (matrix identity, t_steps)."""
-
-    def __init__(self) -> None:
-        self._compiled: dict[int, object] = {}
-
-    def __call__(self, x_seq: torch.Tensor, matrix: CSR, case: BenchCase) -> RSNNResult:
-        key = id(matrix)
-        compiled = self._compiled.get(key)
-        if compiled is None:
-            fn = torch.compile(native_sparse_rsnn_forward, mode="reduce-overhead")
-            self._compiled[key] = compiled = fn
-        v0, psc0 = _zero_state(case, x_seq.device)
-        spikes, v, psc = compiled(
-            x_seq,
-            matrix,
-            v0,
-            psc0,
-            dt=case.dt,
-            tau_mem=case.tau_mem,
-            tau_syn=case.tau_syn,
-            v_threshold=case.v_threshold,
-            v_reset=case.v_reset,
-            c_m=case.c_m,
-            t_steps=case.t_steps,
-        )
-        return RSNNResult(spikes=spikes.clone(), v=v.clone(), psc=psc.clone())
-
-
-class CUDAGraphNativeSparseProvider:
-    """Manual CUDA graph capture of the whole T-step recurrent loop.
-
-    Mirrors ``tests/models/test_cudagraph.py``: static input/state buffers,
-    a few warmup iterations on a side stream, one capture, then replay with
-    the real input copied into the static buffer.
-    """
+class TorchCUDAGraphProvider:
+    """Capture standard dense or CSR PyTorch forward and replay it."""
 
     def __init__(self) -> None:
-        self._graphs: dict[tuple, dict] = {}
+        self._runners: dict[tuple, object] = {}
 
-    def _build(self, x_seq: torch.Tensor, matrix: CSR, case: BenchCase) -> dict:
-        device = x_seq.device
-        static_x = torch.zeros_like(x_seq)
-        static_v0, static_psc0 = _zero_state(case, device)
-        # Precomputed once outside the graph -- see precompute_csr_row().
-        row = precompute_csr_row(matrix)
-
-        # Warmup on a side stream so the capture doesn't observe the first-run
-        # allocator/cuBLAS/cuSPARSE workspace setup (those calls are not
-        # capturable / would bake in stale addresses).
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(3):
-                native_sparse_rsnn_forward(
-                    static_x,
-                    matrix,
-                    static_v0,
-                    static_psc0,
-                    dt=case.dt,
-                    tau_mem=case.tau_mem,
-                    tau_syn=case.tau_syn,
-                    v_threshold=case.v_threshold,
-                    v_reset=case.v_reset,
-                    c_m=case.c_m,
-                    t_steps=case.t_steps,
-                    row=row,
-                )
-        torch.cuda.current_stream().wait_stream(s)
-
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            static_spikes, static_v, static_psc = native_sparse_rsnn_forward(
-                static_x,
-                matrix,
-                static_v0,
-                static_psc0,
-                dt=case.dt,
-                tau_mem=case.tau_mem,
-                tau_syn=case.tau_syn,
-                v_threshold=case.v_threshold,
-                v_reset=case.v_reset,
-                c_m=case.c_m,
-                t_steps=case.t_steps,
-                row=row,
-            )
-        return {
-            "graph": graph,
-            "static_x": static_x,
-            "static_spikes": static_spikes,
-            "static_v": static_v,
-            "static_psc": static_psc,
-            # Referenced only inside the captured region above, with no
-            # Python-visible output -- if we don't keep them alive here too,
-            # the allocator is free to reclaim their memory once _build()
-            # returns and hand it to something else. On replay the graph
-            # still reads/writes those *addresses*, so a later allocation
-            # landing there silently corrupts the "constant" zero initial
-            # state and the CSR row-index buffer (which then feeds a gather
-            # -> device-side out-of-bounds assert a replay or two later).
-            "static_v0": static_v0,
-            "static_psc0": static_psc0,
-            "row": row,
-        }
-
-    def __call__(self, x_seq: torch.Tensor, matrix: CSR, case: BenchCase) -> RSNNResult:
-        key = (id(matrix), case.t_steps, case.batch_size, x_seq.shape)
-        state = self._graphs.get(key)
-        if state is None:
-            state = self._build(x_seq, matrix, case)
-            self._graphs[key] = state
-        state["static_x"].copy_(x_seq)
-        state["graph"].replay()
-        return RSNNResult(
-            spikes=state["static_spikes"].clone(),
-            v=state["static_v"].clone(),
-            psc=state["static_psc"].clone(),
-        )
-
-
-def _max_events_for_case(
-    case: BenchCase, reference: RSNNResult, *, margin: int = 0
-) -> int:
-    """Fixed per-timestep spike capacity for the pre_span Triton kernels.
-
-    Derived once from the dense reference's realized spike counts (same
-    methodology ``benchmark_persistent_snn.py`` already uses for its eager
-    Triton providers) -- NOT computed inside the timed/captured region.
-    Exceeding this capacity silently truncates spikes in
-    ``dense_event_to_list_kernel`` (masked writes, no error), so a margin can
-    be added for inputs that vary at replay time.
-    """
-
-    observed = int(reference.spikes.count_nonzero(dim=2).max().item())
-    return max(1, min(case.n_neuron, observed + margin))
-
-
-class CUDAGraphPreSpanProvider:
-    """Manual CUDA graph capture of the pre_span (Triton) recurrent loop.
-
-    Same capture pattern as ``CUDAGraphNativeSparseProvider``, but wraps the
-    *actual algorithm the persistent CUDA kernel implements* (prespan
-    event-driven fan-out) instead of a dense CSR gather/scatter -- this is
-    the apples-to-apples comparison of "one cooperative kernel with in-kernel
-    barriers" vs. "the same algorithm as ordinary per-timestep kernels,
-    captured once and replayed" using the same underlying computation.
-    """
-
-    def __init__(self) -> None:
-        self._graphs: dict[tuple, dict] = {}
-
-    def _build(
-        self, x_seq: torch.Tensor, matrix: CSR, case: BenchCase, *, max_events: int
-    ) -> dict:
-        device = x_seq.device
-        static_x = torch.zeros_like(x_seq)
-        static_v0, static_psc0 = _zero_state(case, device)
-        # Force the padded-CSR layout to be built and cached *before* capture
-        # -- computing it lazily inside the graph would not be capture-safe
-        # (it involves data-dependent sizing), and it never changes for a
-        # fixed matrix, so precomputing once here is exactly the same
-        # "structural, not data-dependent -> hoist out of the graph" pattern
-        # as precompute_csr_row() for the native-sparse provider.
-        matrix.padded_csr_layout()
-
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(3):
-                prespan_rsnn_forward(
-                    static_x,
-                    matrix,
-                    static_v0,
-                    static_psc0,
-                    dt=case.dt,
-                    tau_mem=case.tau_mem,
-                    tau_syn=case.tau_syn,
-                    v_threshold=case.v_threshold,
-                    v_reset=case.v_reset,
-                    c_m=case.c_m,
-                    t_steps=case.t_steps,
-                    max_events=max_events,
-                )
-        torch.cuda.current_stream().wait_stream(s)
-
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            static_spikes, static_v, static_psc = prespan_rsnn_forward(
-                static_x,
-                matrix,
-                static_v0,
-                static_psc0,
-                dt=case.dt,
-                tau_mem=case.tau_mem,
-                tau_syn=case.tau_syn,
-                v_threshold=case.v_threshold,
-                v_reset=case.v_reset,
-                c_m=case.c_m,
-                t_steps=case.t_steps,
-                max_events=max_events,
-            )
-        return {
-            "graph": graph,
-            "static_x": static_x,
-            "static_spikes": static_spikes,
-            "static_v": static_v,
-            "static_psc": static_psc,
-            # See CUDAGraphNativeSparseProvider._build for why these must be
-            # kept alive for the graph's lifetime.
-            "static_v0": static_v0,
-            "static_psc0": static_psc0,
-        }
-
-    def __call__(
-        self, x_seq: torch.Tensor, matrix: CSR, case: BenchCase, *, max_events: int
-    ) -> RSNNResult:
-        key = (id(matrix), case.t_steps, case.batch_size, x_seq.shape, max_events)
-        state = self._graphs.get(key)
-        if state is None:
-            state = self._build(x_seq, matrix, case, max_events=max_events)
-            self._graphs[key] = state
-        state["static_x"].copy_(x_seq)
-        state["graph"].replay()
-        return RSNNResult(
-            spikes=state["static_spikes"].clone(),
-            v=state["static_v"].clone(),
-            psc=state["static_psc"].clone(),
-        )
-
-
-class _ChunkedCUDAGraphProvider:
-    """Capture a fixed ``chunk_size``-step window once, replay it repeatedly to
-    cover a full ``case.t_steps`` sequence without paying capture cost for the
-    whole sequence up front.
-
-    ``CUDAGraphNativeSparseProvider``/``CUDAGraphPreSpanProvider`` above
-    capture the *entire* T-step loop as one graph, so capture time costs one
-    full eager-speed pass through all T steps -- fine for T=256, not fine if
-    T is 1000+ or only becomes known in pieces. This instead captures a
-    small chunk once. To keep the recurrence correct across replays with no
-    Python-level state threading, the captured region copies its own output
-    state back into its input buffers (``static_v0.copy_(out_v)``), so
-    replay N+1 automatically continues from replay N's final state via fixed
-    CUDA-graph addresses -- the same "in-place hidden state" trick used for
-    graph-capturing RNN cells. Per-chunk spikes are copied into a
-    pre-allocated full-length history buffer *between* replays, which is
-    ordinary eager code (not part of the capture), so it can address any
-    slice of that buffer dynamically -- recording full history does not
-    require the capture itself to span the full history.
-
-    Requires ``chunk_size`` to evenly divide ``case.t_steps``: a short final
-    chunk would still run the graph's fixed ``chunk_size`` steps internally
-    (LIF state decays even on zero-padded input), corrupting both the padded
-    tail of the spike history and the final ``v``/``psc`` state.
-    """
-
-    def __init__(self) -> None:
-        self._graphs: dict[tuple, dict] = {}
-
-    def _forward(
-        self, static_x, matrix, static_v0, static_psc0, case, chunk_size, extra
-    ):
-        raise NotImplementedError
-
-    def _build_extra(self, matrix, case, chunk_size, **build_kwargs) -> dict:
-        raise NotImplementedError
-
-    def _cache_key(self, **build_kwargs) -> tuple:
-        raise NotImplementedError
-
-    def _build(
-        self, matrix: CSR, case: BenchCase, device, chunk_size: int, build_kwargs: dict
-    ) -> dict:
-        static_x = torch.zeros(
-            chunk_size,
-            case.batch_size,
-            case.n_neuron,
-            device=device,
-            dtype=torch.float32,
-        )
-        static_v0, static_psc0 = _zero_state(case, device)
-        extra = self._build_extra(matrix, case, chunk_size, **build_kwargs)
-
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(3):
-                _, out_v, out_psc = self._forward(
-                    static_x, matrix, static_v0, static_psc0, case, chunk_size, extra
-                )
-                static_v0.copy_(out_v)
-                static_psc0.copy_(out_psc)
-        torch.cuda.current_stream().wait_stream(s)
-        # Warmup left state non-zero (it's chaining on purpose, same as real
-        # replays will); reset to zero before capture so the graph's own
-        # first invocation -- and every run_full() rollout, which re-zeros
-        # before its first chunk -- starts from a clean initial state.
-        static_v0.zero_()
-        static_psc0.zero_()
-
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            static_spikes, out_v, out_psc = self._forward(
-                static_x, matrix, static_v0, static_psc0, case, chunk_size, extra
-            )
-            static_v0.copy_(out_v)
-            static_psc0.copy_(out_psc)
-
-        return {
-            "graph": graph,
-            "static_x": static_x,
-            "static_spikes": static_spikes,
-            "static_v0": static_v0,
-            "static_psc0": static_psc0,
-            "extra": extra,  # kept alive -- see CUDAGraphNativeSparseProvider._build
-        }
-
-    def run_full(
+    def fixed_runner(
         self,
         x_seq: torch.Tensor,
-        matrix: CSR,
+        weight: torch.Tensor,
         case: BenchCase,
         *,
-        chunk_size: int,
-        **build_kwargs,
-    ) -> RSNNResult:
-        if case.t_steps % chunk_size != 0:
-            raise ValueError(
-                f"chunk_size={chunk_size} must evenly divide t_steps={case.t_steps}"
-            )
-        device = x_seq.device
-        key = (
-            id(matrix),
-            case.t_steps,
-            case.batch_size,
-            case.n_neuron,
-            chunk_size,
-        ) + self._cache_key(**build_kwargs)
-        state = self._graphs.get(key)
-        if state is None:
-            state = self._build(matrix, case, device, chunk_size, build_kwargs)
-            self._graphs[key] = state
+        sparse: bool,
+    ):
+        key = (id(weight), case.t_steps, case.batch_size, x_seq.shape, sparse)
+        cached = self._runners.get(key)
+        if cached is not None:
+            return cached
 
-        state["static_v0"].zero_()
-        state["static_psc0"].zero_()
-        history = torch.empty(
-            case.t_steps,
+        static_x = x_seq.clone()
+        static_v0 = torch.zeros(
             case.batch_size,
             case.n_neuron,
-            device=device,
+            device=x_seq.device,
             dtype=x_seq.dtype,
         )
-        for c in range(case.t_steps // chunk_size):
-            start = c * chunk_size
-            end = start + chunk_size
-            state["static_x"].copy_(x_seq[start:end])
-            state["graph"].replay()
-            history[start:end].copy_(state["static_spikes"])
-        return RSNNResult(
-            spikes=history,
-            v=state["static_v0"].clone(),
-            psc=state["static_psc0"].clone(),
-        )
+        static_psc0 = torch.zeros_like(static_v0)
+        forward = torch_csr_rsnn_forward if sparse else torch_dense_rsnn_forward
+
+        def execute() -> RSNNResult:
+            return forward(static_x, weight, static_v0, static_psc0, case)
+
+        side_stream = torch.cuda.Stream()
+        side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_stream):
+            for _ in range(3):
+                execute()
+        torch.cuda.current_stream().wait_stream(side_stream)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = execute()
+
+        def run() -> RSNNResult:
+            graph.replay()
+            return output
+
+        # The closure keeps the graph, static tensors, weight, and outputs
+        # alive at their captured addresses.
+        self._runners[key] = run
+        return run
 
 
-class ChunkedCUDAGraphNativeSparseProvider(_ChunkedCUDAGraphProvider):
-    """Chunked capture of the native-sparse recurrent loop."""
+class PersistentProvider:
+    """Cache immutable event input and scratch space for persistent timing."""
 
-    def _forward(
-        self, static_x, matrix, static_v0, static_psc0, case, chunk_size, extra
+    def __init__(self) -> None:
+        self._runners: dict[tuple, object] = {}
+
+    def fixed_runner(
+        self, x_seq: torch.Tensor, matrix: CSR, case: BenchCase, *, variant: str
     ):
-        return native_sparse_rsnn_forward(
-            static_x,
-            matrix,
-            static_v0,
-            static_psc0,
+        key = (id(matrix), case.t_steps, case.batch_size, x_seq.shape, variant)
+        cached = self._runners.get(key)
+        if cached is not None:
+            return cached
+
+        events = dense_to_windowed_events(x_seq)
+        graph = csr_to_persistent_graph(matrix)
+        state = make_empty_state(
+            case.batch_size,
+            case.n_neuron,
+            device=x_seq.device,
+            refractory=False,
+        )
+        workspace = make_persistent_snn_workspace(graph, case.batch_size)
+        params = PersistentSNNParams(
             dt=case.dt,
             tau_mem=case.tau_mem,
             tau_syn=case.tau_syn,
             v_threshold=case.v_threshold,
             v_reset=case.v_reset,
             c_m=case.c_m,
-            t_steps=chunk_size,
-            row=extra["row"],
+            hard_reset=case.hard_reset,
+            window_size=case.t_steps,
         )
+        options = {
+            "fanout_binning": variant == "binning",
+            "spike_block": variant == "spike_block",
+        }
 
-    def _build_extra(self, matrix, case, chunk_size, **build_kwargs) -> dict:
-        return {"row": precompute_csr_row(matrix)}
+        def run() -> RSNNResult:
+            output = persistent_snn_forward(
+                events,
+                graph,
+                state,
+                params,
+                backend="cuda_persistent",
+                return_mode="dense",
+                workspace=workspace,
+                **options,
+            )
+            assert output.spikes is not None
+            return RSNNResult(
+                spikes=output.spikes,
+                v=output.state.v,
+                psc=output.state.psc,
+            )
 
-    def _cache_key(self, **build_kwargs) -> tuple:
-        return ()
+        self._runners[key] = run
+        return run
 
 
-class ChunkedCUDAGraphPreSpanProvider(_ChunkedCUDAGraphProvider):
-    """Chunked capture of the pre_span (Triton) recurrent loop."""
+class DirectCuSparseProvider:
+    """Run preallocated direct cuSPARSE SpMV/SpMM, eagerly or as a graph."""
 
-    def _forward(
-        self, static_x, matrix, static_v0, static_psc0, case, chunk_size, extra
+    def __init__(self) -> None:
+        self._runners: dict[tuple, object] = {}
+
+    def fixed_runner(
+        self,
+        x_seq: torch.Tensor,
+        weight: torch.Tensor,
+        case: BenchCase,
+        *,
+        use_cudagraph: bool,
     ):
-        return prespan_rsnn_forward(
-            static_x,
-            matrix,
-            static_v0,
-            static_psc0,
-            dt=case.dt,
-            tau_mem=case.tau_mem,
-            tau_syn=case.tau_syn,
-            v_threshold=case.v_threshold,
-            v_reset=case.v_reset,
-            c_m=case.c_m,
-            t_steps=chunk_size,
-            max_events=extra["max_events"],
+        key = (
+            id(weight),
+            case.t_steps,
+            case.batch_size,
+            x_seq.shape,
+            use_cudagraph,
+        )
+        cached = self._runners.get(key)
+        if cached is not None:
+            return cached
+
+        from benchmark.cusparse_rsnn import load
+
+        extension = load()
+        # Direct cuSPARSE uses 32-bit indices, matching the persistent kernels
+        # and avoiding the slower 64-bit index path. Conversion is untimed.
+        crow = weight.crow_indices().to(torch.int32).contiguous()
+        col = weight.col_indices().to(torch.int32).contiguous()
+        values = weight.values().contiguous()
+        static_x = x_seq.clone()
+        v = torch.empty(
+            case.batch_size,
+            case.n_neuron,
+            device=x_seq.device,
+            dtype=x_seq.dtype,
+        )
+        psc = torch.empty_like(v)
+        spikes = torch.empty_like(x_seq)
+        recurrent = torch.empty_like(v)
+        plan = extension.prepare(
+            crow,
+            col,
+            values,
+            spikes,
+            recurrent,
+            case.batch_size,
         )
 
-    def _build_extra(self, matrix, case, chunk_size, *, max_events: int) -> dict:
-        matrix.padded_csr_layout()
-        return {"max_events": max_events}
+        def execute() -> RSNNResult:
+            extension.run(
+                plan,
+                static_x,
+                v,
+                psc,
+                case.dt,
+                case.tau_mem,
+                case.tau_syn,
+                case.v_threshold,
+                case.v_reset,
+                case.c_m,
+            )
+            return RSNNResult(spikes=spikes, v=v, psc=psc)
 
-    def _cache_key(self, *, max_events: int) -> tuple:
-        return (max_events,)
+        if not use_cudagraph:
+            self._runners[key] = execute
+            return execute
 
+        side_stream = torch.cuda.Stream()
+        side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_stream):
+            for _ in range(3):
+                execute()
+        torch.cuda.current_stream().wait_stream(side_stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = execute()
 
-def run_persistent(x_seq, matrix, case: BenchCase, *, backend: str) -> RSNNResult:
-    events = dense_to_windowed_events(x_seq)
-    graph = csr_to_persistent_graph(matrix)
-    state = make_empty_state(
-        case.batch_size, case.n_neuron, device=x_seq.device, refractory=False
-    )
-    params = PersistentSNNParams(
-        dt=case.dt,
-        tau_mem=case.tau_mem,
-        tau_syn=case.tau_syn,
-        v_threshold=case.v_threshold,
-        v_reset=case.v_reset,
-        c_m=case.c_m,
-        hard_reset=case.hard_reset,
-        window_size=case.t_steps,
-    )
-    out = persistent_snn_forward(
-        events, graph, state, params, backend=backend, return_mode="dense"
-    )
-    assert out.spikes is not None
-    return RSNNResult(spikes=out.spikes, v=out.state.v, psc=out.state.psc)
+        def replay() -> RSNNResult:
+            graph.replay()
+            return output
+
+        self._runners[key] = replay
+        return replay
 
 
 def time_ms(fn, *, warmup: int, repeat: int) -> float:
+    """Measure median GPU stream time with CUDA events."""
+
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
-    samples = []
-    for _ in range(repeat):
-        torch.cuda.synchronize()
-        start = time.perf_counter()
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(repeat)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(repeat)]
+    for start, end in zip(starts, ends, strict=True):
+        start.record()
         fn()
-        torch.cuda.synchronize()
-        samples.append((time.perf_counter() - start) * 1000.0)
-    return float(torch.median(torch.tensor(samples, dtype=torch.float64)).item())
+        end.record()
+    torch.cuda.synchronize()
+    samples = [
+        start.elapsed_time(end)
+        for start, end in zip(starts, ends, strict=True)
+    ]
+    return float(torch.tensor(samples, dtype=torch.float64).median().item())
 
 
-def max_abs_diff(a: RSNNResult, b: RSNNResult) -> float:
-    return float(
-        max(
-            (a.spikes - b.spikes).abs().max().item(),
-            (a.v - b.v).abs().max().item(),
-            (a.psc - b.psc).abs().max().item(),
-        )
-    )
+def correctness_metrics(result: RSNNResult, reference: RSNNResult) -> dict:
+    """Return correctness metrics tolerant of floating reduction order."""
+
+    spike_mismatches = int((result.spikes != reference.spikes).sum().item())
+    spike_mismatch_rate = spike_mismatches / reference.spikes.numel()
+    v_diff = float((result.v - reference.v).abs().max().item())
+    psc_diff = float((result.psc - reference.psc).abs().max().item())
+    passed = spike_mismatch_rate <= 1e-3 and v_diff <= 2e-1 and psc_diff <= 5e-3
+    return {
+        "status": "passed" if passed else "correctness_failed",
+        "spike_mismatches": spike_mismatches,
+        "spike_mismatch_rate": spike_mismatch_rate,
+        "v_max_abs_diff": v_diff,
+        "psc_max_abs_diff": psc_diff,
+    }
+
+
+def _empty_metrics(status: str = "not_checked") -> dict:
+    return {
+        "status": status,
+        "spike_mismatches": -1,
+        "spike_mismatch_rate": float("nan"),
+        "v_max_abs_diff": float("nan"),
+        "psc_max_abs_diff": float("nan"),
+    }
 
 
 def bench_case(
     case: BenchCase,
     *,
     device: torch.device,
+    dataset: str,
+    matrix: CSR,
     providers: tuple[Provider, ...],
-    compiled_provider: CompiledNativeSparseProvider,
-    graph_provider: CUDAGraphNativeSparseProvider,
-    prespan_graph_provider: CUDAGraphPreSpanProvider,
-    chunked_graph_provider: ChunkedCUDAGraphNativeSparseProvider,
-    chunked_prespan_provider: ChunkedCUDAGraphPreSpanProvider,
-    chunk_size: int,
+    graph_provider: TorchCUDAGraphProvider,
+    direct_cusparse_provider: DirectCuSparseProvider,
+    persistent_provider: PersistentProvider,
     warmup: int,
     repeat: int,
     check_correctness: bool,
 ) -> list[dict]:
+    """Prepare and benchmark all selected providers for one case."""
+
     x_seq = make_input_sequence(case, device)
-    matrix = make_recurrent_csr(case, device)
-    weight_dense = csr_to_dense(matrix)
-    reference = dense_rsnn_forward(x_seq, weight_dense, case)
-    # Fixed spike-capacity for the Triton pre_span kernels, derived once from
-    # the (deterministic) dense reference for this case -- see
-    # prespan_rsnn_forward's docstring for why this must be static.
-    max_events = _max_events_for_case(case, reference)
+    csr_weight = make_torch_csr_weight(matrix)
+    needs_dense = check_correctness or any(
+        provider.startswith("torch_dense_") for provider in providers
+    )
+    dense_weight = csr_weight.to_dense() if needs_dense else None
+
+    reference = None
+    if check_correctness:
+        assert dense_weight is not None
+        reference = make_eager_runner(
+            x_seq, dense_weight, case, sparse=False
+        )()
 
     rows = []
     for provider in providers:
         try:
-            if provider == "eager_native_sparse":
-                op = lambda: run_eager_native_sparse(x_seq, matrix, case)
-            elif provider == "torch_compile_reduce_overhead":
-                op = lambda: compiled_provider(x_seq, matrix, case)
-            elif provider == "cudagraph_native_sparse":
-                op = lambda: graph_provider(x_seq, matrix, case)
-            elif provider == "eager_prespan":
-                op = lambda: run_eager_prespan(
-                    x_seq, matrix, case, max_events=max_events
+            if provider == "torch_dense_eager":
+                assert dense_weight is not None
+                run = make_eager_runner(x_seq, dense_weight, case, sparse=False)
+            elif provider == "torch_dense_cudagraph":
+                assert dense_weight is not None
+                run = graph_provider.fixed_runner(
+                    x_seq, dense_weight, case, sparse=False
                 )
-            elif provider == "cudagraph_prespan":
-                op = lambda: prespan_graph_provider(
-                    x_seq, matrix, case, max_events=max_events
+            elif provider == "torch_csr_eager":
+                run = make_eager_runner(x_seq, csr_weight, case, sparse=True)
+            elif provider == "torch_csr_cudagraph":
+                run = graph_provider.fixed_runner(
+                    x_seq, csr_weight, case, sparse=True
                 )
-            elif provider == "cudagraph_native_sparse_chunked":
-                op = lambda: chunked_graph_provider.run_full(
-                    x_seq, matrix, case, chunk_size=chunk_size
+            elif provider == "cusparse_direct_eager":
+                run = direct_cusparse_provider.fixed_runner(
+                    x_seq, csr_weight, case, use_cudagraph=False
                 )
-            elif provider == "cudagraph_prespan_chunked":
-                op = lambda: chunked_prespan_provider.run_full(
-                    x_seq, matrix, case, chunk_size=chunk_size, max_events=max_events
+            elif provider == "cusparse_direct_cudagraph":
+                run = direct_cusparse_provider.fixed_runner(
+                    x_seq, csr_weight, case, use_cudagraph=True
                 )
-            elif provider == "persistent":
-                op = lambda: run_persistent(
-                    x_seq, matrix, case, backend="cuda_persistent"
+            elif provider.startswith("persistent_"):
+                run = persistent_provider.fixed_runner(
+                    x_seq,
+                    matrix,
+                    case,
+                    variant=provider.removeprefix("persistent_"),
                 )
             else:
                 raise ValueError(provider)
 
-            result = op()
-            status, diff = "not_checked", float("nan")
-            if check_correctness:
-                diff = max_abs_diff(result, reference)
-                status = "passed" if diff < 1.0 else "diff_ge_1_spike"
-            latency = time_ms(op, warmup=warmup, repeat=repeat)
+            result = run()
+            metrics = (
+                correctness_metrics(result, reference)
+                if reference is not None
+                else _empty_metrics()
+            )
+            latency = time_ms(run, warmup=warmup, repeat=repeat)
         except Exception as exc:  # noqa: BLE001
-            rows.append(
-                {
-                    "provider": provider,
-                    "n_neuron": case.n_neuron,
-                    "t_steps": case.t_steps,
-                    "batch_size": case.batch_size,
-                    "fanout": case.fanout,
-                    "status": f"error:{type(exc).__name__}: {exc}",
-                    "max_abs_diff": float("nan"),
-                    "latency_ms": float("nan"),
-                }
-            )
-            print(
-                f"[error] provider={provider} N={case.n_neuron} T={case.t_steps}: {exc}"
-            )
-            continue
+            metrics = _empty_metrics(f"error:{type(exc).__name__}: {exc}")
+            latency = float("nan")
+            print(f"[error] provider={provider} N={case.n_neuron}: {exc}")
 
         rows.append(
             {
                 "provider": provider,
+                "dataset": dataset,
                 "n_neuron": case.n_neuron,
                 "t_steps": case.t_steps,
                 "batch_size": case.batch_size,
-                "fanout": case.fanout,
-                "status": status,
-                "max_abs_diff": diff,
+                "graph_synapses": int(matrix.indices.numel()),
+                "average_fanout": matrix.indices.numel() / case.n_neuron,
+                "direct_cusparse_primitive": (
+                    "SpMV" if case.batch_size == 1 else "SpMM"
+                ),
+                "direct_cusparse_algorithm": (
+                    "CUSPARSE_SPMV_ALG_DEFAULT"
+                    if case.batch_size == 1
+                    else "CUSPARSE_SPMM_CSR_ALG1"
+                ),
+                **metrics,
                 "latency_ms": latency,
+                "speedup_vs_dense_eager": float("nan"),
+                "speedup_vs_dense_cudagraph": float("nan"),
+                "speedup_vs_csr_eager": float("nan"),
+                "speedup_vs_csr_cudagraph": float("nan"),
+                "speedup_vs_cusparse_direct_eager": float("nan"),
+                "speedup_vs_cusparse_direct_cudagraph": float("nan"),
             }
         )
+
+    latency_by_provider = {
+        row["provider"]: float(row["latency_ms"])
+        for row in rows
+        if math.isfinite(float(row["latency_ms"]))
+    }
+    baselines = (
+        ("torch_dense_eager", "speedup_vs_dense_eager"),
+        ("torch_dense_cudagraph", "speedup_vs_dense_cudagraph"),
+        ("torch_csr_eager", "speedup_vs_csr_eager"),
+        ("torch_csr_cudagraph", "speedup_vs_csr_cudagraph"),
+        ("cusparse_direct_eager", "speedup_vs_cusparse_direct_eager"),
+        (
+            "cusparse_direct_cudagraph",
+            "speedup_vs_cusparse_direct_cudagraph",
+        ),
+    )
+    for row in rows:
+        latency = float(row["latency_ms"])
+        if not math.isfinite(latency) or latency <= 0:
+            continue
+        for baseline, column in baselines:
+            if baseline in latency_by_provider:
+                row[column] = latency_by_provider[baseline] / latency
     return rows
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse and validate command-line arguments."""
+
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--n-neuron", type=int, default=2**13)
     parser.add_argument(
-        "--t-steps",
-        type=int,
-        nargs="+",
-        default=[16, 32, 64, 128, 256],
+        "--dataset",
+        choices=("uniform", "mice_column_v1", "mice_v1_column"),
+        default="mice_column_v1",
     )
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--connectome-root", type=Path, default=None)
+    parser.add_argument("--n-neuron", type=int, default=2**13)
+    parser.add_argument("--t-steps", type=int, nargs="+", default=[128])
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--fanout", type=int, default=32)
     parser.add_argument("--event-rate", type=float, default=0.01)
     parser.add_argument("--dt", type=float, default=1.0)
@@ -841,41 +677,57 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=30)
     parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=16,
-        help=(
-            "steps per capture for the *_chunked providers. Must evenly "
-            "divide every --t-steps value."
-        ),
-    )
-    parser.add_argument(
         "--providers", nargs="+", choices=PROVIDERS, default=list(PROVIDERS)
     )
     parser.add_argument("--skip-correctness", action="store_true")
-    parser.add_argument("--csv", type=str, default=None)
-    return parser.parse_args()
+    parser.add_argument("--csv", type=Path, default=None)
+    args = parser.parse_args()
+    if args.warmup < 0 or args.repeat <= 0:
+        parser.error("--warmup must be non-negative and --repeat must be positive")
+    if args.batch_size <= 0 or any(t_steps <= 0 for t_steps in args.t_steps):
+        parser.error("--batch-size and every --t-steps value must be positive")
+    if args.n_neuron <= 0 or args.fanout < 0:
+        parser.error("--n-neuron must be positive and --fanout non-negative")
+    if not 0.0 <= args.event_rate <= 1.0:
+        parser.error("--event-rate must be in [0, 1]")
+    return args
 
 
 def main() -> None:
+    """Run all requested benchmark cases."""
+
     args = parse_args()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA required for this comparison.")
     device = torch.device("cuda")
 
-    compiled_provider = CompiledNativeSparseProvider()
-    graph_provider = CUDAGraphNativeSparseProvider()
-    prespan_graph_provider = CUDAGraphPreSpanProvider()
-    chunked_graph_provider = ChunkedCUDAGraphNativeSparseProvider()
-    chunked_prespan_provider = ChunkedCUDAGraphPreSpanProvider()
+    dataset = (
+        "mice_column_v1" if args.dataset == "mice_v1_column" else args.dataset
+    )
+    matrix = None
+    if dataset == "mice_column_v1":
+        matrix = load_mice_column_v1_csr(
+            args.connectome_root,
+            weight_scale=args.weight_scale,
+            device=device,
+        )
 
+    graph_provider = TorchCUDAGraphProvider()
+    direct_cusparse_provider = DirectCuSparseProvider()
+    persistent_provider = PersistentProvider()
     all_rows: list[dict] = []
     for t_steps in args.t_steps:
+        if matrix is None:
+            n_neuron = args.n_neuron
+            fanout = args.fanout
+        else:
+            n_neuron = matrix.shape[0]
+            fanout = int(round(matrix.indices.numel() / max(n_neuron, 1)))
         case = BenchCase(
-            n_neuron=args.n_neuron,
+            n_neuron=n_neuron,
             batch_size=args.batch_size,
             t_steps=t_steps,
-            fanout=args.fanout,
+            fanout=fanout,
             event_rate=args.event_rate,
             dt=args.dt,
             tau_mem=args.tau_mem,
@@ -885,36 +737,42 @@ def main() -> None:
             input_amplitude=args.input_amplitude,
             weight_scale=args.weight_scale,
         )
-        print(f"=== N={case.n_neuron} T={t_steps} fanout={case.fanout} ===")
+        case_matrix = (
+            matrix if matrix is not None else make_recurrent_csr(case, device)
+        )
+        print(
+            f"=== dataset={dataset} N={case.n_neuron} T={t_steps} "
+            f"edges={case_matrix.indices.numel()} ==="
+        )
         rows = bench_case(
             case,
             device=device,
+            dataset=dataset,
+            matrix=case_matrix,
             providers=tuple(args.providers),
-            compiled_provider=compiled_provider,
             graph_provider=graph_provider,
-            prespan_graph_provider=prespan_graph_provider,
-            chunked_graph_provider=chunked_graph_provider,
-            chunked_prespan_provider=chunked_prespan_provider,
-            chunk_size=args.chunk_size,
+            direct_cusparse_provider=direct_cusparse_provider,
+            persistent_provider=persistent_provider,
             warmup=args.warmup,
             repeat=args.repeat,
             check_correctness=not args.skip_correctness,
         )
         for row in rows:
             print(
-                f"  {row['provider']:<32} {row['status']:<20} "
-                f"latency={row['latency_ms']:.4f} ms"
+                f"  {row['provider']:<28} {row['status']:<20} "
+                f"latency={row['latency_ms']:.4f} ms "
+                "vs_direct_graph="
+                f"{row['speedup_vs_cusparse_direct_cudagraph']:.3f}x"
             )
         all_rows.extend(rows)
 
-    if args.csv:
-        out_path = Path(args.csv)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with out_path.open("w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(all_rows[0].keys()))
+    if args.csv is not None:
+        args.csv.parent.mkdir(parents=True, exist_ok=True)
+        with args.csv.open("w", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=list(all_rows[0]))
             writer.writeheader()
             writer.writerows(all_rows)
-        print(f"Saved CSV to {out_path}")
+        print(f"Saved CSV to {args.csv}")
 
 
 if __name__ == "__main__":

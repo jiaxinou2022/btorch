@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Added
+- **Persistent-SNN physical reorder plans**: explicit preprocessing can now
+  permute neuron state, rebuild CSR rows/posts, remap sparse inputs, and restore
+  outputs to original neuron IDs. The measured default locally sorts fanout in
+  128-neuron regions and sorts each rebuilt row by physical post ID; alternative
+  fanout and primary-post-tile strategies remain available for experimentation.
 - **Persistent spike-block scheduler**: opt-in `spike_block=True` groups fired
   cells from a contiguous 32-neuron block. Rows up to 16 edges use the
   neuron's relative block lane for direct CSR lookup, longer rows use a full
