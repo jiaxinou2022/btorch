@@ -102,6 +102,7 @@ void launch_persistent_snn_spike_block_kernel(
     int* work_counters,
     int* event_counts,
     int* event_indices_full,
+    int* block_stats,
     bool return_dense,
     bool return_events,
     int t_steps,
@@ -441,7 +442,17 @@ persistent_snn_forward_cuda_impl(
     auto event_indices_full = return_events
         ? torch::empty({t_steps * batch_size * n_neuron}, options_i)
         : torch::empty({0}, options_i);
+#ifdef ENABLE_BLOCK_STATS
+    constexpr int kBlockStatsColumns = 13;
+    const int64_t block_stats_records =
+        static_cast<int64_t>(t_steps) * batch_size * ((n_neuron + 31) / 32);
+    auto overflow = spike_block && return_dense
+        ? torch::zeros(
+              {block_stats_records, kBlockStatsColumns}, options_i)
+        : torch::empty({0}, options_i);
+#else
     auto overflow = torch::empty({0}, options_i);
+#endif
 
     const int grid_dim = spike_block
         ? cooperative_grid_dim_spike_block(
@@ -473,6 +484,7 @@ persistent_snn_forward_cuda_impl(
             work_counter.data_ptr<int>(),
             return_events ? event_counts.data_ptr<int>() : nullptr,
             return_events ? event_indices_full.data_ptr<int>() : nullptr,
+            overflow.numel() ? overflow.data_ptr<int>() : nullptr,
             return_dense,
             return_events,
             t_steps,

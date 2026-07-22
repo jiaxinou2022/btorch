@@ -9,10 +9,23 @@ Normal timing (CUDA Events, median of at least 20 runs)::
     micromamba run -n ml-py312 python \
         benchmark/benchmark_rsnn_roofline.py --dataset uniform --csv roofline.csv
 
-Switch to a manually captured PyTorch CUDA Graph::
+Collect opt-in BlockTask diagnostics (instrumented timing is not production
+performance)::
 
     micromamba run -n ml-py312 python \
-        benchmark/benchmark_rsnn_roofline.py --provider torch_cudagraph
+        benchmark/benchmark_rsnn_roofline.py --dataset mice_column_v1 \
+        --spike-block --block-stats --csv block_stats.csv
+
+Enable the experimental selective shared-memory hash in a fresh process::
+
+    micromamba run -n ml-py312 python \
+        benchmark/benchmark_rsnn_roofline.py --dataset mice_column_v1 \
+        --spike-block --block-hash
+
+Switch to the direct cuSPARSE CUDA Graph baseline::
+
+    micromamba run -n ml-py312 python \
+        benchmark/benchmark_rsnn_roofline.py --provider cusparse_cudagraph
 
 Capture one representative persistent launch with Nsight Compute::
 
@@ -26,7 +39,7 @@ For CUDA Graph analysis, use one whole-graph replay::
     ncu --set roofline --profile-from-start off --graph-profiling graph \
         --launch-count 1 micromamba run -n ml-py312 python \
         benchmark/benchmark_rsnn_roofline.py \
-        --provider torch_cudagraph --mode ncu
+        --provider cusparse_cudagraph --mode ncu
 
 The profiler interval contains one replay. ``--graph-profiling graph`` requires
 a version of Nsight Compute that supports whole-graph profiling.
@@ -35,6 +48,9 @@ a version of Nsight Compute that supports whole-graph profiling.
 timesteps and batches. ``active_synapses`` is the sum of the corresponding
 pre-synaptic CSR row degrees. Thus ``active_synapses_per_second`` measures
 useful event-driven fanout work rather than the graph's total stored edges.
+The selective hash path uses 128 slots, at most 8 linear probes, and only
+64--96 medium-row edges. ``hash_tasks`` counts tasks entering that path;
+``hash_overflow_tasks`` is an overlapping warning set.
 """
 
 from __future__ import annotations
@@ -58,8 +74,8 @@ for path in (REPO_ROOT, CONNECTOME_REPO):
         sys.path.insert(0, str(path))
 
 from benchmark.benchmark_rsnn_cudagraph_compare import (  # noqa: E402
-    native_sparse_rsnn_forward,
-    precompute_csr_row,
+    DirectCuSparseProvider,
+    make_torch_csr_weight,
 )
 from btorch.backend.persistent_snn import (  # noqa: E402
     EventCSRGraph,
@@ -76,8 +92,14 @@ from btorch.sparse import CSR  # noqa: E402
 
 Dataset = Literal["uniform", "mice_column_v1"]
 Mode = Literal["benchmark", "ncu"]
-Provider = Literal["persistent", "torch_cudagraph"]
+Provider = Literal["persistent", "cusparse_cudagraph"]
 FANOUT_BINNING_THRESHOLD = 256
+LANE_ROW_THRESHOLD = 4
+BLOCK_STATS_COLUMNS = 13
+HASH_CAPACITY = 128
+HASH_MAX_PROBES = 8
+HASH_MIN_EDGES = 64
+HASH_MAX_EDGES = 96
 
 
 @dataclass(frozen=True)
@@ -114,51 +136,6 @@ class PreparedWorkload:
     x_seq: torch.Tensor
     high_fanout: torch.Tensor
     workspace: PersistentSNNWorkspace
-
-
-class TorchCUDAGraphRunner:
-    """Capture the native CSR T-step loop and replay only the finished graph."""
-
-    def __init__(self, workload: PreparedWorkload) -> None:
-        case = workload.case
-        matrix = workload.matrix
-        self.static_x = workload.x_seq.clone()
-        self.static_v0 = torch.zeros_like(workload.state.v)
-        self.static_psc0 = torch.zeros_like(workload.state.psc)
-        self.row = precompute_csr_row(matrix)
-
-        def forward() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            return native_sparse_rsnn_forward(
-                self.static_x,
-                matrix,
-                self.static_v0,
-                self.static_psc0,
-                dt=case.dt,
-                tau_mem=case.tau_mem,
-                tau_syn=case.tau_syn,
-                v_threshold=case.v_threshold,
-                v_reset=case.v_reset,
-                c_m=case.c_m,
-                t_steps=case.t_steps,
-                row=self.row,
-            )
-
-        side_stream = torch.cuda.Stream()
-        side_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side_stream):
-            for _ in range(3):
-                forward()
-        torch.cuda.current_stream().wait_stream(side_stream)
-
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
-            self.output = forward()
-
-    def __call__(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Replay the captured fixed-input, fixed-state graph once."""
-
-        self.graph.replay()
-        return self.output
 
 
 def make_fixed_input_sequence(
@@ -340,7 +317,9 @@ def prepare_workload(
     )
 
 
-def run_persistent(workload: PreparedWorkload, *, fanout_binning: bool):
+def run_persistent(
+    workload: PreparedWorkload, *, fanout_binning: bool, spike_block: bool
+):
     """Execute one fixed-window persistent launch from the same zero state."""
 
     return persistent_snn_forward(
@@ -351,12 +330,13 @@ def run_persistent(workload: PreparedWorkload, *, fanout_binning: bool):
         backend="cuda_persistent",
         return_mode="dense",
         fanout_binning=fanout_binning,
+        spike_block=spike_block,
         workspace=workload.workspace,
     )
 
 
 def run_prepared_operator(
-    workload: PreparedWorkload, *, fanout_binning: bool
+    workload: PreparedWorkload, *, fanout_binning: bool, spike_block: bool
 ) -> tuple[torch.Tensor, ...]:
     """Call the loaded CUDA op without repeated Python-side validation syncs."""
 
@@ -398,6 +378,11 @@ def run_prepared_operator(
         return torch.ops.btorch_cuda.persistent_snn_forward_binned(
             *op_args,
             workload.high_fanout,
+            *op_tail,
+        )
+    if spike_block:
+        return torch.ops.btorch_cuda.persistent_snn_forward_spike_block(
+            *op_args,
             *op_tail,
         )
     return torch.ops.btorch_cuda.persistent_snn_forward(*op_args, *op_tail)
@@ -454,20 +439,42 @@ def make_provider_runner(
     *,
     provider: Provider,
     fanout_binning: bool,
+    spike_block: bool,
 ) -> Callable[[], ProviderOutput]:
     """Prepare a provider and return its validation-sync-free repeated call."""
 
-    if provider == "torch_cudagraph":
-        return TorchCUDAGraphRunner(workload)
+    if provider == "cusparse_cudagraph":
+        # Use exactly the same direct cuSPARSE preparation and capture path as
+        # benchmark_rsnn_cudagraph_compare.py: post-by-pre PyTorch CSR,
+        # int32 direct descriptors, SpMV for B=1 / SpMM otherwise, fixed
+        # state/output buffers, three side-stream warmups, then full replay.
+        weight = make_torch_csr_weight(workload.matrix)
+        result_runner = DirectCuSparseProvider().fixed_runner(
+            workload.x_seq,
+            weight,
+            workload.case,
+            use_cudagraph=True,
+        )
+
+        def run_cusparse_graph() -> ProviderOutput:
+            output = result_runner()
+            return output.spikes, output.v, output.psc
+
+        return run_cusparse_graph
 
     # Load/JIT the selected extension and populate launch caches before timing.
-    run_persistent(workload, fanout_binning=fanout_binning)
+    run_persistent(
+        workload,
+        fanout_binning=fanout_binning,
+        spike_block=spike_block,
+    )
     torch.cuda.synchronize()
 
     def run() -> ProviderOutput:
         output = run_prepared_operator(
             workload,
             fanout_binning=fanout_binning,
+            spike_block=spike_block,
         )
         return output[0], output[3], output[4]
 
@@ -495,7 +502,7 @@ def validate_with_torch(
             f"spike mismatch rate {spike_mismatch_rate:.6g} exceeds 1e-3"
         )
     torch.testing.assert_close(actual_v, expected_v, atol=2e-1, rtol=2e-3)
-    #torch.testing.assert_close(actual_psc, expected_psc, atol=5e-4, rtol=2e-3)
+    torch.testing.assert_close(actual_psc, expected_psc, atol=5e-4, rtol=2e-3)
     return {
         "spike_mismatches": spike_mismatches,
         "spike_mismatch_rate": spike_mismatch_rate,
@@ -542,6 +549,177 @@ def activity_counts(
     return active_neurons, unique_active_neurons, active_synapses
 
 
+def _simulate_task_hash(posts: list[int]) -> tuple[int, int, int, int]:
+    """Simulate the proposed bounded shared-memory hash for one BlockTask."""
+
+    keys = [-1] * HASH_CAPACITY
+    insert_count = 0
+    merge_count = 0
+    collision_count = 0
+    overflow_count = 0
+    for post in posts:
+        slot = (post * 2654435761) & (HASH_CAPACITY - 1)
+        for probe in range(HASH_MAX_PROBES):
+            index = (slot + probe) & (HASH_CAPACITY - 1)
+            key = keys[index]
+            if key == post:
+                merge_count += 1
+                break
+            if key < 0:
+                keys[index] = post
+                insert_count += 1
+                break
+            collision_count += 1
+        else:
+            overflow_count += 1
+    return insert_count, merge_count, collision_count, overflow_count
+
+
+def summarize_block_stats(
+    raw_stats: torch.Tensor,
+    graph_indptr: torch.Tensor,
+    graph_indices: torch.Tensor,
+    *,
+    block_hash_enabled: bool = True,
+) -> dict[str, float | int]:
+    """Augment macro-collected task records with exact offline post statistics."""
+
+    if raw_stats.ndim != 2 or raw_stats.shape[1] != BLOCK_STATS_COLUMNS:
+        raise ValueError(
+            f"block stats must have shape (records, {BLOCK_STATS_COLUMNS})"
+        )
+    stats = raw_stats.to(device="cpu", dtype=torch.int64)
+    indptr = graph_indptr.to(device="cpu", dtype=torch.int64).tolist()
+    indices = graph_indices.to(device="cpu", dtype=torch.int64).tolist()
+
+    totals: dict[str, int] = {
+        "block_task_count": 0,
+        "active_rows": 0,
+        "active_edges": 0,
+        "active_run_count": 0,
+        "span_edges": 0,
+        "max_row_degree": 0,
+        "unique_posts": 0,
+        "hash_insert_count": 0,
+        "hash_merge_count": 0,
+        "hash_collision_count": 0,
+        "hash_overflow_count": 0,
+        "global_atomic_count": 0,
+        "flushed_entries": 0,
+        "direct_lane_tasks": 0,
+        "active_run_tasks": 0,
+        "hash_tasks": 0,
+        "hash_beneficial_tasks": 0,
+        "hash_overflow_tasks": 0,
+        "packed_tasks": 0,
+        "long_segment_tasks": int(stats[:, 8].sum().item()),
+    }
+    for record in stats:
+        active_rows = int(record[0].item())
+        if active_rows == 0:
+            continue
+        totals["block_task_count"] += 1
+        totals["active_rows"] += active_rows
+        totals["active_edges"] += int(record[1].item())
+        totals["active_run_count"] += int(record[2].item())
+        totals["span_edges"] += int(record[3].item())
+        totals["max_row_degree"] = max(
+            totals["max_row_degree"], int(record[4].item())
+        )
+        block_start = int(record[11].item())
+        active_mask = int(record[12].item()) & 0xFFFFFFFF
+        posts: list[int] = []
+        medium_posts: list[int] = []
+        medium_mask = 0
+        tiny_edges = 0
+        for lane in range(32):
+            if active_mask & (1 << lane):
+                neuron = block_start + lane
+                row_posts = indices[indptr[neuron] : indptr[neuron + 1]]
+                posts.extend(row_posts)
+                if len(row_posts) <= LANE_ROW_THRESHOLD:
+                    tiny_edges += len(row_posts)
+                else:
+                    medium_mask |= 1 << lane
+                    medium_posts.extend(row_posts)
+        unique_posts = len(set(posts))
+        medium_rows = medium_mask.bit_count()
+        medium_runs = (medium_mask & ~(medium_mask << 1)).bit_count()
+        if medium_rows == 0:
+            totals["direct_lane_tasks"] += 1
+        elif medium_runs * 2 <= medium_rows:
+            totals["active_run_tasks"] += 1
+        else:
+            totals["packed_tasks"] += 1
+
+        use_hash = (
+            block_hash_enabled
+            and medium_rows >= 2
+            and HASH_MIN_EDGES <= len(medium_posts) <= HASH_MAX_EDGES
+        )
+        if use_hash:
+            insert, merge, collisions, overflow = _simulate_task_hash(
+                medium_posts
+            )
+            flushed_entries = tiny_edges + insert + overflow
+            totals["hash_tasks"] += 1
+            if flushed_entries < len(posts):
+                totals["hash_beneficial_tasks"] += 1
+            if overflow:
+                totals["hash_overflow_tasks"] += 1
+        else:
+            insert = merge = collisions = overflow = 0
+            flushed_entries = len(posts)
+        totals["unique_posts"] += unique_posts
+        totals["hash_insert_count"] += insert
+        totals["hash_merge_count"] += merge
+        totals["hash_collision_count"] += collisions
+        totals["hash_overflow_count"] += overflow
+        totals["flushed_entries"] += flushed_entries
+        totals["global_atomic_count"] += flushed_entries
+
+    def ratio(numerator: int, denominator: int) -> float:
+        return numerator / denominator if denominator else 0.0
+
+    task_count = totals["block_task_count"]
+    dispatch_count = task_count + totals["long_segment_tasks"]
+    derived: dict[str, float] = {
+        "average_spikes_per_task": ratio(totals["active_rows"], task_count),
+        "average_runs_per_task": ratio(totals["active_run_count"], task_count),
+        "adjacent_active_row_ratio": ratio(
+            totals["active_rows"] - totals["active_run_count"],
+            totals["active_rows"],
+        ),
+        "run_merge_ratio": ratio(
+            totals["active_rows"], totals["active_run_count"]
+        ),
+        "span_utilization": ratio(totals["active_edges"], totals["span_edges"]),
+        "post_duplicate_ratio": (
+            1.0 - ratio(totals["unique_posts"], totals["active_edges"])
+            if totals["active_edges"]
+            else 0.0
+        ),
+        "atomic_reduction_ratio": (
+            1.0 - ratio(totals["flushed_entries"], totals["active_edges"])
+            if totals["active_edges"]
+            else 0.0
+        ),
+        "direct_lane_task_ratio": ratio(totals["direct_lane_tasks"], task_count),
+        "active_run_task_ratio": ratio(totals["active_run_tasks"], task_count),
+        "hash_task_ratio": ratio(totals["hash_tasks"], task_count),
+        "hash_beneficial_task_ratio": ratio(
+            totals["hash_beneficial_tasks"], task_count
+        ),
+        "hash_overflow_task_ratio": ratio(
+            totals["hash_overflow_tasks"], task_count
+        ),
+        "long_segment_task_ratio": ratio(
+            totals["long_segment_tasks"], dispatch_count
+        ),
+    }
+    return {**totals, **derived}
+
+
 def benchmark_row(
     workload: PreparedWorkload,
     run: Callable[[], ProviderOutput],
@@ -550,6 +728,9 @@ def benchmark_row(
     correctness: dict[str, float | int] | None,
     provider: Provider,
     fanout_binning: bool,
+    spike_block: bool,
+    block_hash: bool,
+    block_stats: dict[str, float | int] | None = None,
 ) -> dict:
     """Run the benchmark and return one flat, CSV-friendly result record."""
 
@@ -561,7 +742,22 @@ def benchmark_row(
     row = {
         "dataset": case.dataset,
         "provider": provider,
+        "direct_cusparse_primitive": (
+            "SpMV" if provider == "cusparse_cudagraph" and case.batch_size == 1
+            else "SpMM" if provider == "cusparse_cudagraph" else ""
+        ),
+        "direct_cusparse_algorithm": (
+            "CUSPARSE_SPMV_ALG_DEFAULT"
+            if provider == "cusparse_cudagraph" and case.batch_size == 1
+            else "CUSPARSE_SPMM_CSR_ALG1"
+            if provider == "cusparse_cudagraph"
+            else ""
+        ),
         "fanout_binning": fanout_binning,
+        "spike_block": spike_block,
+        "block_hash": block_hash,
+        "block_stats": block_stats is not None,
+        "timing_mode": "instrumented_debug" if block_stats is not None else "normal",
         "total_time_ms": latency_ms,
         "timestep_count": case.t_steps,
         "time_per_timestep_us": latency_ms * 1000.0 / case.t_steps,
@@ -569,6 +765,12 @@ def benchmark_row(
         "batch_size": case.batch_size,
         "graph_synapses": int(workload.graph.indices.numel()),
         "average_fanout": workload.graph.indices.numel() / case.n_neuron,
+        "input_event_rate": case.event_rate,
+        "lane_row_threshold": LANE_ROW_THRESHOLD if spike_block else "",
+        "hash_capacity": HASH_CAPACITY if spike_block else "",
+        "hash_max_probes": HASH_MAX_PROBES if spike_block else "",
+        "hash_min_edges": HASH_MIN_EDGES if spike_block else "",
+        "hash_max_edges": HASH_MAX_EDGES if spike_block else "",
         "active_neurons": active_neurons,
         "unique_active_neurons": unique_active_neurons,
         "active_synapses": active_synapses,
@@ -579,6 +781,8 @@ def benchmark_row(
     }
     if correctness is not None:
         row.update(correctness)
+    if block_stats is not None:
+        row.update(block_stats)
     return row
 
 
@@ -605,13 +809,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--provider",
-        choices=("persistent", "torch_cudagraph"),
+        choices=("persistent", "cusparse_cudagraph"),
         default="persistent",
     )
     parser.add_argument(
         "--fanout-binning",
         action="store_true",
         help="Use the opt-in binned persistent kernel (default: disabled).",
+    )
+    parser.add_argument(
+        "--spike-block",
+        action="store_true",
+        help="Use 32-neuron BlockTasks and long-row SegmentTasks.",
+    )
+    parser.add_argument(
+        "--block-stats",
+        action="store_true",
+        help="Compile ENABLE_BLOCK_STATS and emit per-BlockTask debug statistics.",
+    )
+    parser.add_argument(
+        "--block-hash",
+        action="store_true",
+        help="Compile the experimental selective shared-memory BlockTask hash.",
     )
     parser.add_argument("--mode", choices=("benchmark", "ncu"), default="benchmark")
     parser.add_argument("--n-neuron", type=int, default=8192)
@@ -643,6 +862,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("--event-rate must be in [0, 1].")
     if args.fanout_binning and args.provider != "persistent":
         parser.error("--fanout-binning is only valid with --provider persistent.")
+    if args.spike_block and args.provider != "persistent":
+        parser.error("--spike-block is only valid with --provider persistent.")
+    if args.fanout_binning and args.spike_block:
+        parser.error("--fanout-binning and --spike-block are mutually exclusive.")
+    if args.block_stats and not args.spike_block:
+        parser.error("--block-stats requires --spike-block.")
+    if args.block_hash and not args.spike_block:
+        parser.error("--block-hash requires --spike-block.")
     return args
 
 
@@ -652,10 +879,18 @@ def main() -> None:
         raise SystemExit("CUDA is required for the RSNN roofline benchmark.")
 
     workload = prepare_workload(args, torch.device("cuda"))
+    if args.block_stats or args.block_hash:
+        from btorch.backend.persistent import plain_version
+
+        plain_version.load(
+            enable_block_stats=args.block_stats,
+            enable_block_hash=args.block_hash,
+        )
     run = make_provider_runner(
         workload,
         provider=args.provider,
         fanout_binning=args.fanout_binning,
+        spike_block=args.spike_block,
     )
     torch.cuda.synchronize()
     correctness = None
@@ -668,6 +903,26 @@ def main() -> None:
         print(f"Nsight Compute representative {args.provider} launch completed")
         return
 
+    block_stats = None
+    if args.block_stats:
+        raw_output = run_prepared_operator(
+            workload,
+            fanout_binning=False,
+            spike_block=True,
+        )
+        raw_stats = raw_output[5]
+        if raw_stats.numel() == 0:
+            raise RuntimeError(
+                "ENABLE_BLOCK_STATS build returned no statistics; start a fresh "
+                "process so the stats extension is loaded first."
+            )
+        block_stats = summarize_block_stats(
+            raw_stats,
+            workload.graph.indptr,
+            workload.graph.indices,
+            block_hash_enabled=args.block_hash,
+        )
+
     row = benchmark_row(
         workload,
         run,
@@ -676,6 +931,9 @@ def main() -> None:
         correctness,
         args.provider,
         args.fanout_binning,
+        args.spike_block,
+        args.block_hash,
+        block_stats,
     )
     for key, value in row.items():
         print(f"{key}: {value}")

@@ -8,11 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Added
-- **Persistent-SNN physical reorder plans**: explicit preprocessing can now
-  permute neuron state, rebuild CSR rows/posts, remap sparse inputs, and restore
-  outputs to original neuron IDs. The measured default locally sorts fanout in
-  128-neuron regions and sorts each rebuilt row by physical post ID; alternative
-  fanout and primary-post-tile strategies remain available for experimentation.
+- **Optional BlockTask statistics**: the persistent spike-block CUDA extension
+  can be compiled with `ENABLE_BLOCK_STATS` through the roofline benchmark's
+  `--block-stats` mode. It reports row/run/span activity, exact offline post
+  duplication, a bounded hash simulation, atomic-reduction potential, and
+  scheduler path ratios without adding counters to production builds.
 - **Persistent spike-block scheduler**: opt-in `spike_block=True` groups fired
   cells from a contiguous 32-neuron block. Rows up to 16 edges use the
   neuron's relative block lane for direct CSR lookup, longer rows use a full
@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Heterogeneous RNN** (`HeteroRecurrentNN`): drop-in replacement for `RecurrentNN` that accepts a `MixedNeuronPopulation`.
 
 ### Changed
+- The persistent spike-block scheduler now flattens strict adjacent active-row
+  runs and packs scattered medium rows into a warp-wide logical edge stream.
+  The measured lane-direct cutoff is 4 edges. A bounded 128-slot shared hash
+  is retained behind the roofline benchmark's experimental `--block-hash`
+  build because its useful coverage on `mice_column_v1` is too small for the
+  production path.
 - Persistent CUDA steady-state execution can reuse fanout/input workspace and
   caches fixed high-fanout graph metadata across simulation windows.
 - Persistent CUDA cell updates avoid per-cell integer division, and validated

@@ -8,9 +8,95 @@ namespace cg = cooperative_groups;
 namespace {
 
 constexpr int kFanoutThreshold = 256;
-constexpr int kLaneRowThreshold = 16;
+constexpr int kLaneRowThreshold = 4;
 constexpr int kSegmentSize = 1024;
+constexpr int kHashSize = 128;
+constexpr int kHashMaxProbe = 8;
+constexpr int kHashMinEdges = 64;
+constexpr int kHashMaxEdges = 96;
+constexpr int kWarpsPerBlock = 8;
+constexpr int kEmptyHashKey = -1;
 constexpr unsigned kFullWarpMask = 0xffffffffu;
+
+#ifdef ENABLE_BLOCK_STATS
+constexpr int kBlockStatsColumns = 13;
+
+// One diagnostic thread reconstructs one potential 32-neuron task after the
+// persistent launch. This deliberately lives outside the timed/production
+// path; the normal build contains neither this kernel nor its output buffer.
+__global__ void collect_block_stats_kernel(
+    const float* __restrict__ dense_spikes,
+    const int* __restrict__ graph_indptr,
+    int* __restrict__ stats,
+    int t_steps,
+    int batch_size,
+    int n_neuron,
+    int blocks_per_batch) {
+    const int record = blockIdx.x * blockDim.x + threadIdx.x;
+    const int record_count = t_steps * batch_size * blocks_per_batch;
+    if (record >= record_count) {
+        return;
+    }
+    const int block = record % blocks_per_batch;
+    const int bucket = record / blocks_per_batch;
+    const int block_start = block * 32;
+    const int block_end = min(block_start + 32, n_neuron);
+    const float* bucket_spikes = dense_spikes + bucket * n_neuron;
+
+    unsigned active_mask = 0;
+    int active_rows = 0;
+    int active_edges = 0;
+    int active_runs = 0;
+    int max_row_degree = 0;
+    int first_active = -1;
+    int last_active = -1;
+    int long_segment_tasks = 0;
+    bool previous_active = false;
+    bool all_direct_lane = true;
+    for (int neuron = block_start; neuron < block_end; ++neuron) {
+        if (bucket_spikes[neuron] == 0.0f) {
+            previous_active = false;
+            continue;
+        }
+        const int degree = graph_indptr[neuron + 1] - graph_indptr[neuron];
+        if (degree >= kFanoutThreshold) {
+            long_segment_tasks +=
+                (degree + kSegmentSize - 1) / kSegmentSize;
+            previous_active = false;
+            continue;
+        }
+        const int lane = neuron - block_start;
+        active_mask |= 1u << lane;
+        ++active_rows;
+        active_edges += degree;
+        max_row_degree = max(max_row_degree, degree);
+        all_direct_lane = all_direct_lane && degree <= kLaneRowThreshold;
+        if (!previous_active) {
+            ++active_runs;
+        }
+        previous_active = true;
+        first_active = first_active < 0 ? neuron : first_active;
+        last_active = neuron;
+    }
+
+    int* row = stats + record * kBlockStatsColumns;
+    row[0] = active_rows;
+    row[1] = active_edges;
+    row[2] = active_runs;
+    row[3] = first_active < 0
+        ? 0
+        : graph_indptr[last_active + 1] - graph_indptr[first_active];
+    row[4] = max_row_degree;
+    row[5] = active_edges;  // current spike-block path: one atomic per edge
+    row[6] = active_rows > 0 && all_direct_lane ? 1 : 0;
+    row[7] = active_rows > active_runs ? 1 : 0;
+    row[8] = long_segment_tasks;
+    row[9] = bucket / batch_size;
+    row[10] = bucket % batch_size;
+    row[11] = block_start;
+    row[12] = static_cast<int>(active_mask);
+}
+#endif
 
 __device__ __forceinline__ void process_edge_range(
     const int* graph_indices,
@@ -64,6 +150,16 @@ __global__ void persistent_snn_spike_block_kernel(
     const int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int stride = blockDim.x * gridDim.x;
     const int lane = global_tid & 31;
+    const int warp_in_block = threadIdx.x >> 5;
+    __shared__ int packed_prefix[kWarpsPerBlock][32];
+    __shared__ int packed_starts[kWarpsPerBlock][32];
+#ifdef ENABLE_BLOCK_HASH
+    __shared__ int hash_keys[kWarpsPerBlock][kHashSize];
+    __shared__ float hash_values[kWarpsPerBlock][kHashSize];
+#else
+    __shared__ int hash_keys[1][1];
+    __shared__ float hash_values[1][1];
+#endif
     const float decay = expf(-dt / tau_syn);
     const float reset_delta = v_threshold - v_reset;
 
@@ -194,15 +290,15 @@ __global__ void persistent_snn_spike_block_kernel(
             const int lane_edge_end =
                 lane_fired ? graph_indptr[lane_pre + 1] : 0;
             const int lane_degree = lane_edge_end - lane_edge_start;
-            // Very short rows are cheaper when their owning lane walks them
-            // directly. Longer rows retain full-warp traversal below.
-            const bool lane_row =
+            // Tiny rows stay lane-owned. The remaining medium rows are either
+            // consumed as strict adjacent CSR runs or packed into one logical
+            // edge stream so scattered masks no longer serialize per row.
+            const bool tiny_row =
                 lane_fired && lane_degree <= kLaneRowThreshold;
-            unsigned warp_row_mask = __ballot_sync(
-                kFullWarpMask,
-                lane_fired && !lane_row);
+            const unsigned tiny_mask = __ballot_sync(kFullWarpMask, tiny_row);
+            const unsigned medium_mask = spike_mask & ~tiny_mask;
 
-            if (lane_row) {
+            if (tiny_row) {
                 for (int edge = lane_edge_start; edge < lane_edge_end; ++edge) {
                     const int post = graph_indices[edge];
                     atomicAdd(
@@ -210,17 +306,190 @@ __global__ void persistent_snn_spike_block_kernel(
                         graph_weight[edge]);
                 }
             }
-            while (warp_row_mask != 0) {
-                const int spike_lane = __ffs(warp_row_mask) - 1;
-                const int pre = block_start + spike_lane;
-                process_edge_range(
-                    graph_indices,
-                    graph_weight,
-                    psc + b * n_neuron,
-                    graph_indptr[pre],
-                    graph_indptr[pre + 1],
-                    lane);
-                warp_row_mask &= warp_row_mask - 1;
+
+            if (medium_mask != 0) {
+                const int medium_rows = __popc(medium_mask);
+                const unsigned run_starts =
+                    medium_mask & ~(medium_mask << 1);
+                const int run_count = __popc(run_starts);
+                const int medium_degree =
+                    (medium_mask & (1u << lane)) != 0 ? lane_degree : 0;
+                int inclusive_end = medium_degree;
+#pragma unroll
+                for (int offset = 1; offset < 32; offset <<= 1) {
+                    const int value = __shfl_up_sync(
+                        kFullWarpMask, inclusive_end, offset);
+                    if (lane >= offset) {
+                        inclusive_end += value;
+                    }
+                }
+                const int medium_edges = __shfl_sync(
+                    kFullWarpMask, inclusive_end, 31);
+#ifdef ENABLE_BLOCK_HASH
+                const bool use_hash =
+                    medium_rows >= 2
+                    && medium_edges >= kHashMinEdges
+                    && medium_edges <= kHashMaxEdges;
+#else
+                constexpr bool use_hash = false;
+#endif
+                if (use_hash) {
+                    for (int slot = lane; slot < kHashSize; slot += 32) {
+                        hash_keys[warp_in_block][slot] = kEmptyHashKey;
+                        hash_values[warp_in_block][slot] = 0.0f;
+                    }
+                    __syncwarp();
+                }
+                if (run_count * 2 <= medium_rows) {
+                    // P1: adjacent active CSR rows are one physical edge run.
+                    unsigned remaining = medium_mask;
+                    while (remaining != 0) {
+                        const int first_lane = __ffs(remaining) - 1;
+                        const unsigned shifted = remaining >> first_lane;
+                        const int first_zero = __ffs(~shifted);
+                        const int run_length = first_zero == 0
+                            ? 32
+                            : first_zero - 1;
+                        const int end_lane = first_lane + run_length;
+                        const int run_begin =
+                            graph_indptr[block_start + first_lane];
+                        const int run_end =
+                            graph_indptr[block_start + end_lane];
+                        for (int edge_base = run_begin;
+                             edge_base < run_end;
+                             edge_base += 32) {
+                            const int edge = edge_base + lane;
+                            if (edge < run_end) {
+                                const int post = graph_indices[edge];
+                                const float weight = graph_weight[edge];
+                                if (use_hash) {
+                                    int slot = static_cast<int>(
+                                        (static_cast<unsigned>(post)
+                                         * 2654435761u)
+                                        & (kHashSize - 1));
+                                    bool inserted = false;
+#pragma unroll
+                                    for (int probe = 0;
+                                         probe < kHashMaxProbe;
+                                         ++probe) {
+                                        const int old = atomicCAS(
+                                            &hash_keys[warp_in_block][slot],
+                                            kEmptyHashKey,
+                                            post);
+                                        if (old == kEmptyHashKey
+                                            || old == post) {
+                                            atomicAdd(
+                                                &hash_values
+                                                    [warp_in_block][slot],
+                                                weight);
+                                            inserted = true;
+                                            break;
+                                        }
+                                        slot = (slot + 1) & (kHashSize - 1);
+                                    }
+                                    if (!inserted) {
+                                        atomicAdd(
+                                            psc + b * n_neuron + post,
+                                            weight);
+                                    }
+                                } else {
+                                    atomicAdd(
+                                        psc + b * n_neuron + post,
+                                        weight);
+                                }
+                            }
+                        }
+                        const unsigned run_mask = run_length == 32
+                            ? kFullWarpMask
+                            : ((1u << run_length) - 1u) << first_lane;
+                        remaining &= ~run_mask;
+                    }
+                } else {
+                    // P3: prefix-pack scattered rows into one logical stream.
+                    packed_prefix[warp_in_block][lane] = inclusive_end;
+                    packed_starts[warp_in_block][lane] = lane_edge_start;
+                    __syncwarp();
+                    const int total_edges =
+                        packed_prefix[warp_in_block][31];
+                    for (int edge_base = 0;
+                         edge_base < total_edges;
+                         edge_base += 32) {
+                        const int logical_edge = edge_base + lane;
+                        const bool valid = logical_edge < total_edges;
+                        const int lookup_edge = valid
+                            ? logical_edge
+                            : total_edges - 1;
+                        int low = 0;
+                        int high = 31;
+#pragma unroll
+                        for (int step = 0; step < 5; ++step) {
+                            const int middle = (low + high) >> 1;
+                            if (packed_prefix[warp_in_block][middle]
+                                > lookup_edge) {
+                                high = middle;
+                            } else {
+                                low = middle + 1;
+                            }
+                        }
+                        if (valid) {
+                            const int previous_end = low == 0
+                                ? 0
+                                : packed_prefix[warp_in_block][low - 1];
+                            const int edge =
+                                packed_starts[warp_in_block][low]
+                                + logical_edge - previous_end;
+                            const int post = graph_indices[edge];
+                            const float weight = graph_weight[edge];
+                            if (use_hash) {
+                                int slot = static_cast<int>(
+                                    (static_cast<unsigned>(post)
+                                     * 2654435761u)
+                                    & (kHashSize - 1));
+                                bool inserted = false;
+#pragma unroll
+                                for (int probe = 0;
+                                     probe < kHashMaxProbe;
+                                     ++probe) {
+                                    const int old = atomicCAS(
+                                        &hash_keys[warp_in_block][slot],
+                                        kEmptyHashKey,
+                                        post);
+                                    if (old == kEmptyHashKey || old == post) {
+                                        atomicAdd(
+                                            &hash_values
+                                                [warp_in_block][slot],
+                                            weight);
+                                        inserted = true;
+                                        break;
+                                    }
+                                    slot = (slot + 1) & (kHashSize - 1);
+                                }
+                                if (!inserted) {
+                                    atomicAdd(
+                                        psc + b * n_neuron + post,
+                                        weight);
+                                }
+                            } else {
+                                atomicAdd(
+                                    psc + b * n_neuron + post,
+                                    weight);
+                            }
+                        }
+                    }
+                    __syncwarp();
+                }
+                if (use_hash) {
+                    __syncwarp();
+                    for (int slot = lane; slot < kHashSize; slot += 32) {
+                        const int post = hash_keys[warp_in_block][slot];
+                        if (post != kEmptyHashKey) {
+                            atomicAdd(
+                                psc + b * n_neuron + post,
+                                hash_values[warp_in_block][slot]);
+                        }
+                    }
+                    __syncwarp();
+                }
             }
         }
         grid.sync();
@@ -248,6 +517,7 @@ void launch_persistent_snn_spike_block_kernel(
     int* work_counters,
     int* event_counts,
     int* event_indices_full,
+    int* block_stats,
     bool return_dense,
     bool return_events,
     int t_steps,
@@ -304,6 +574,27 @@ void launch_persistent_snn_spike_block_kernel(
         args,
         0,
         stream);
+#ifdef ENABLE_BLOCK_STATS
+    if (block_stats != nullptr) {
+        const int blocks_per_batch = (n_neuron + 31) / 32;
+        const int record_count = t_steps * batch_size * blocks_per_batch;
+        constexpr int kStatsThreads = 256;
+        collect_block_stats_kernel<<<
+            (record_count + kStatsThreads - 1) / kStatsThreads,
+            kStatsThreads,
+            0,
+            stream>>>(
+            dense_spikes,
+            graph_indptr,
+            block_stats,
+            t_steps,
+            batch_size,
+            n_neuron,
+            blocks_per_batch);
+    }
+#else
+    (void)block_stats;
+#endif
 }
 
 int persistent_snn_spike_block_max_active_blocks_per_sm(

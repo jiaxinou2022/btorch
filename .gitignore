@@ -50,3 +50,4 @@ coverage.xml
 .kilocode/
 .kilo/
 .playwright-mcp/btorch/backend/persistent/plain_version/problems.md
+results/persistent_kernel/
