@@ -5,7 +5,9 @@
 #include <torch/library.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <tuple>
 
@@ -258,6 +260,30 @@ int cooperative_grid_dim_spike_block(
     return cached[mode];
 }
 
+int requested_cooperative_grid_dim(int maximum_grid_dim) {
+    const char* value = std::getenv("BTORCH_PERSISTENT_GRID_BLOCKS");
+    if (value == nullptr || value[0] == '\0') {
+        return maximum_grid_dim;
+    }
+
+    errno = 0;
+    char* end = nullptr;
+    const long requested = std::strtol(value, &end, 10);
+    TORCH_CHECK(
+        errno == 0 && end != value && *end == '\0',
+        "BTORCH_PERSISTENT_GRID_BLOCKS must be a positive integer, got '",
+        value,
+        "'.");
+    TORCH_CHECK(
+        requested > 0 && requested <= maximum_grid_dim,
+        "BTORCH_PERSISTENT_GRID_BLOCKS must be in [1, ",
+        maximum_grid_dim,
+        "], got ",
+        requested,
+        ".");
+    return static_cast<int>(requested);
+}
+
 std::tuple<
     torch::Tensor,
     torch::Tensor,
@@ -454,7 +480,7 @@ persistent_snn_forward_cuda_impl(
     auto overflow = torch::empty({0}, options_i);
 #endif
 
-    const int grid_dim = spike_block
+    const int maximum_grid_dim = spike_block
         ? cooperative_grid_dim_spike_block(
               kThreadsPerBlock, return_dense, return_events)
         : (fanout_binning
@@ -462,6 +488,7 @@ persistent_snn_forward_cuda_impl(
                      kThreadsPerBlock, return_dense, return_events)
                : cooperative_grid_dim(
                      kThreadsPerBlock, return_dense, return_events));
+    const int grid_dim = requested_cooperative_grid_dim(maximum_grid_dim);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     if (spike_block) {

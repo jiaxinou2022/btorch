@@ -58,6 +58,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import os
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -757,6 +758,7 @@ def benchmark_row(
         "spike_block": spike_block,
         "block_hash": block_hash,
         "block_stats": block_stats is not None,
+        "grid_blocks": os.environ.get("BTORCH_PERSISTENT_GRID_BLOCKS", "auto"),
         "timing_mode": "instrumented_debug" if block_stats is not None else "normal",
         "total_time_ms": latency_ms,
         "timestep_count": case.t_steps,
@@ -833,6 +835,15 @@ def parse_args() -> argparse.Namespace:
         help="Compile the experimental selective shared-memory BlockTask hash.",
     )
     parser.add_argument("--mode", choices=("benchmark", "ncu"), default="benchmark")
+    parser.add_argument(
+        "--grid-blocks",
+        type=int,
+        default=None,
+        help=(
+            "Override the cooperative persistent grid size. The requested value "
+            "must not exceed this kernel's occupancy limit."
+        ),
+    )
     parser.add_argument("--n-neuron", type=int, default=8192)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--t-steps", type=int, default=128)
@@ -858,6 +869,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--repeat must be at least 20.")
     if args.t_steps <= 0 or args.batch_size <= 0 or args.n_neuron <= 0:
         parser.error("--t-steps, --batch-size, and --n-neuron must be positive.")
+    if args.grid_blocks is not None and args.grid_blocks <= 0:
+        parser.error("--grid-blocks must be positive.")
     if not 0.0 <= args.event_rate <= 1.0:
         parser.error("--event-rate must be in [0, 1].")
     if args.fanout_binning and args.provider != "persistent":
@@ -877,6 +890,9 @@ def main() -> None:
     args = parse_args()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for the RSNN roofline benchmark.")
+
+    if args.grid_blocks is not None:
+        os.environ["BTORCH_PERSISTENT_GRID_BLOCKS"] = str(args.grid_blocks)
 
     workload = prepare_workload(args, torch.device("cuda"))
     if args.block_stats or args.block_hash:
