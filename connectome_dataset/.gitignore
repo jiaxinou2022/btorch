@@ -14,8 +14,9 @@ cpp/build*/
 # Data - large binary files, regenerate/download or DVC-manage them.
 data/*
 !data/external/
+data/external/*
 !data/external/*.dvc
-data/external/.gitignore
+!data/external/.gitignore
 
 # External repos
 /external/

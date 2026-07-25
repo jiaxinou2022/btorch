@@ -12,6 +12,7 @@ import benchmark.benchmark_rsnn_cudagraph_compare as comparison
 import benchmark.benchmark_rsnn_roofline as roofline
 from benchmark.benchmark_persistent_snn import (
     BenchCase,
+    RSNNResult,
     make_input_sequence,
     make_recurrent_csr,
 )
@@ -19,9 +20,11 @@ from benchmark.benchmark_rsnn_cudagraph_compare import (
     FLYBRAIN_DEFAULT_PROVIDERS,
     PROVIDERS,
     DirectCuSparseProvider,
+    correctness_metrics,
     load_flybrain_csr,
     make_eager_runner,
     make_torch_csr_weight,
+    resolve_dataset_defaults,
 )
 from btorch.sparse import CSR
 
@@ -171,6 +174,61 @@ def test_flybrain_is_the_default_dataset(monkeypatch):
     assert comparison_args.weight_scale == pytest.approx(0.275)
     assert roofline_args.dataset == "flybrain"
     assert roofline_args.weight_scale == pytest.approx(0.275)
+
+
+def test_dataset_specific_weight_scale_defaults():
+    """Dataset defaults should preserve legacy mouse and uniform behavior."""
+
+    assert resolve_dataset_defaults("flybrain", None) == ("flybrain", 0.275)
+    assert resolve_dataset_defaults("flywire_783", None) == ("flybrain", 0.275)
+    assert resolve_dataset_defaults("mice_column_v1", None) == (
+        "mice_column_v1",
+        0.15,
+    )
+    assert resolve_dataset_defaults("uniform", None) == ("uniform", 0.15)
+    assert resolve_dataset_defaults("flybrain", 0.5) == ("flybrain", 0.5)
+
+
+def test_correctness_accepts_small_relative_error_on_large_states():
+    """Large FlyWire states should not fail solely due to absolute error."""
+
+    reference = RSNNResult(
+        spikes=torch.zeros(2, 1, 2),
+        v=torch.tensor([[190_525.0, -80_000.0]]),
+        psc=torch.tensor([[66_377.0, -40_000.0]]),
+    )
+    result = RSNNResult(
+        spikes=reference.spikes.clone(),
+        v=reference.v + torch.tensor([[0.72, -0.30]]),
+        psc=reference.psc + torch.tensor([[0.48, -0.20]]),
+    )
+
+    metrics = correctness_metrics(result, reference)
+
+    assert metrics["status"] == "passed"
+    assert metrics["v_max_abs_diff"] > 0.2
+    assert metrics["psc_max_abs_diff"] > 0.005
+    assert metrics["v_max_normalized_error"] < 1.0
+    assert metrics["psc_max_normalized_error"] < 1.0
+
+
+def test_correctness_rejects_material_error_near_zero():
+    """Relative tolerance should not hide incorrect low-magnitude state."""
+
+    reference = RSNNResult(
+        spikes=torch.zeros(1, 1, 1),
+        v=torch.zeros(1, 1),
+        psc=torch.zeros(1, 1),
+    )
+    result = RSNNResult(
+        spikes=reference.spikes.clone(),
+        v=torch.tensor([[0.21]]),
+        psc=torch.tensor([[0.006]]),
+    )
+
+    metrics = correctness_metrics(result, reference)
+
+    assert metrics["status"] == "correctness_failed"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

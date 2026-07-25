@@ -15,10 +15,12 @@ three persistent CUDA task schedulers:
   ``persistent_spike_block`` execute one cooperative CUDA kernel per window.
 
 All providers evaluate the same recurrent LIF and ExponentialPSC equations
-from the same zero state and fixed input. Dataset loading, weight conversion,
-CUDA graph capture, and persistent workspace allocation are outside timing.
-The direct provider uses ``CUSPARSE_SPMV_ALG_DEFAULT`` for batch size one and
-``CUSPARSE_SPMM_CSR_ALG1`` otherwise.
+from the same zero state and fixed input. Thus ``flybrain`` means this common
+RSNN workload running on the signed FlyWire graph; it does not enable the full
+Shiu et al. refractory, delay, and hard-reset dynamics. Dataset loading,
+weight conversion, CUDA graph capture, and persistent workspace allocation
+are outside timing. The direct provider uses ``CUSPARSE_SPMV_ALG_DEFAULT`` for
+batch size one and ``CUSPARSE_SPMM_CSR_ALG1`` otherwise.
 
 FlyBrain (FlyWire v783) is the default dataset. Its signed synapse counts are
 scaled by ``--weight-scale``. Dense providers are opt-in for FlyBrain because
@@ -95,6 +97,33 @@ PROVIDERS: tuple[Provider, ...] = (
 FLYBRAIN_DEFAULT_PROVIDERS: tuple[Provider, ...] = tuple(
     provider for provider in PROVIDERS if not provider.startswith("torch_dense_")
 )
+DEFAULT_WEIGHT_SCALES = {
+    "flybrain": 0.275,
+    "mice_column_v1": 0.15,
+    "uniform": 0.15,
+}
+SPIKE_MISMATCH_RATE_TOL = 1e-3
+STATE_RTOL = 2e-3
+V_ATOL = 2e-1
+PSC_ATOL = 5e-3
+
+
+def resolve_dataset_defaults(
+    dataset: str,
+    weight_scale: float | None,
+) -> tuple[str, float]:
+    """Canonicalize a dataset name and select its default weight scale."""
+
+    aliases = {"mice_v1_column": "mice_column_v1", "flywire_783": "flybrain"}
+    canonical = aliases.get(dataset, dataset)
+    if canonical not in DEFAULT_WEIGHT_SCALES:
+        raise ValueError(f"Unsupported dataset: {dataset}.")
+    scale = (
+        DEFAULT_WEIGHT_SCALES[canonical]
+        if weight_scale is None
+        else float(weight_scale)
+    )
+    return canonical, scale
 
 
 def load_flybrain_csr(
@@ -533,6 +562,19 @@ def time_ms(fn, *, warmup: int, repeat: int) -> float:
     return float(torch.tensor(samples, dtype=torch.float64).median().item())
 
 
+def max_normalized_error(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    *,
+    atol: float,
+    rtol: float,
+) -> float:
+    """Return the largest error relative to an ``atol + rtol * abs(x)`` bound."""
+
+    bound = atol + rtol * expected.abs()
+    return float(((actual - expected).abs() / bound).max().item())
+
+
 def correctness_metrics(result: RSNNResult, reference: RSNNResult) -> dict:
     """Return correctness metrics tolerant of floating reduction order."""
 
@@ -540,13 +582,31 @@ def correctness_metrics(result: RSNNResult, reference: RSNNResult) -> dict:
     spike_mismatch_rate = spike_mismatches / reference.spikes.numel()
     v_diff = float((result.v - reference.v).abs().max().item())
     psc_diff = float((result.psc - reference.psc).abs().max().item())
-    passed = spike_mismatch_rate <= 1e-3 and v_diff <= 2e-1 and psc_diff <= 5e-3
+    v_normalized = max_normalized_error(
+        result.v,
+        reference.v,
+        atol=V_ATOL,
+        rtol=STATE_RTOL,
+    )
+    psc_normalized = max_normalized_error(
+        result.psc,
+        reference.psc,
+        atol=PSC_ATOL,
+        rtol=STATE_RTOL,
+    )
+    passed = (
+        spike_mismatch_rate <= SPIKE_MISMATCH_RATE_TOL
+        and v_normalized <= 1.0
+        and psc_normalized <= 1.0
+    )
     return {
         "status": "passed" if passed else "correctness_failed",
         "spike_mismatches": spike_mismatches,
         "spike_mismatch_rate": spike_mismatch_rate,
         "v_max_abs_diff": v_diff,
         "psc_max_abs_diff": psc_diff,
+        "v_max_normalized_error": v_normalized,
+        "psc_max_normalized_error": psc_normalized,
     }
 
 
@@ -557,6 +617,8 @@ def _empty_metrics(status: str = "not_checked") -> dict:
         "spike_mismatch_rate": float("nan"),
         "v_max_abs_diff": float("nan"),
         "psc_max_abs_diff": float("nan"),
+        "v_max_normalized_error": float("nan"),
+        "psc_max_normalized_error": float("nan"),
     }
 
 
@@ -720,10 +782,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--weight-scale",
         type=float,
-        default=0.275,
+        default=None,
         help=(
-            "Global recurrent weight scale. The FlyBrain default is its "
-            "published per-synapse weight, 0.275."
+            "Global recurrent weight scale. Defaults to 0.275 for FlyBrain "
+            "and 0.15 for mice_column_v1 or uniform."
         ),
     )
     parser.add_argument("--warmup", type=int, default=10)
@@ -740,6 +802,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--n-neuron must be positive and --fanout non-negative")
     if not 0.0 <= args.event_rate <= 1.0:
         parser.error("--event-rate must be in [0, 1]")
+    args.dataset, args.weight_scale = resolve_dataset_defaults(
+        args.dataset,
+        args.weight_scale,
+    )
     return args
 
 
@@ -751,8 +817,7 @@ def main() -> None:
         raise SystemExit("CUDA required for this comparison.")
     device = torch.device("cuda")
 
-    aliases = {"mice_v1_column": "mice_column_v1", "flywire_783": "flybrain"}
-    dataset = aliases.get(args.dataset, args.dataset)
+    dataset = args.dataset
     providers = tuple(
         args.providers
         if args.providers is not None

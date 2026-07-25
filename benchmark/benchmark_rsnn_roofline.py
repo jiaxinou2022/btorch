@@ -1,8 +1,10 @@
 """Profile the persistent RSNN kernel with synthetic or connectome graphs.
 
 The input spike trace, recurrent graph, and initial state are fixed for every
-run.  One persistent CUDA launch advances exactly ``--t-steps`` timesteps, so
-neither timing nor profiling depends on host polling.
+run. One persistent CUDA launch advances exactly ``--t-steps`` timesteps, so
+neither timing nor profiling depends on host polling. The ``flybrain`` dataset
+selects the signed FlyWire graph for this common RSNN workload, not the full
+Shiu et al. refractory, delay, and hard-reset dynamics.
 
 Normal timing (CUDA Events, median of at least 20 runs)::
 
@@ -75,9 +77,15 @@ for path in (REPO_ROOT, CONNECTOME_REPO):
         sys.path.insert(0, str(path))
 
 from benchmark.benchmark_rsnn_cudagraph_compare import (  # noqa: E402
+    PSC_ATOL,
+    SPIKE_MISMATCH_RATE_TOL,
+    STATE_RTOL,
+    V_ATOL,
     DirectCuSparseProvider,
     load_flybrain_csr,
     make_torch_csr_weight,
+    max_normalized_error,
+    resolve_dataset_defaults,
 )
 from btorch.backend.persistent_snn import (  # noqa: E402
     EventCSRGraph,
@@ -506,17 +514,42 @@ def validate_with_torch(
     # Recurrent thresholding can amplify tiny differences between the CUDA
     # kernel's atomicAdd order and PyTorch scatter_add_'s reduction order.
     # Keep strict bounds on both the discrete mismatch rate and final state.
-    if spike_mismatch_rate > 1e-3:
+    # Relative tolerance is essential for signed FlyWire counts, whose state
+    # magnitudes can be orders of magnitude larger than normalized graphs.
+    if spike_mismatch_rate > SPIKE_MISMATCH_RATE_TOL:
         raise AssertionError(
-            f"spike mismatch rate {spike_mismatch_rate:.6g} exceeds 1e-3"
+            f"spike mismatch rate {spike_mismatch_rate:.6g} exceeds "
+            f"{SPIKE_MISMATCH_RATE_TOL}"
         )
-    torch.testing.assert_close(actual_v, expected_v, atol=2e-1, rtol=2e-3)
-    torch.testing.assert_close(actual_psc, expected_psc, atol=5e-4, rtol=2e-3)
+    torch.testing.assert_close(
+        actual_v,
+        expected_v,
+        atol=V_ATOL,
+        rtol=STATE_RTOL,
+    )
+    torch.testing.assert_close(
+        actual_psc,
+        expected_psc,
+        atol=PSC_ATOL,
+        rtol=STATE_RTOL,
+    )
     return {
         "spike_mismatches": spike_mismatches,
         "spike_mismatch_rate": spike_mismatch_rate,
         "v_max_abs_diff": v_max_abs_diff,
         "psc_max_abs_diff": psc_max_abs_diff,
+        "v_max_normalized_error": max_normalized_error(
+            actual_v,
+            expected_v,
+            atol=V_ATOL,
+            rtol=STATE_RTOL,
+        ),
+        "psc_max_normalized_error": max_normalized_error(
+            actual_psc,
+            expected_psc,
+            atol=PSC_ATOL,
+            rtol=STATE_RTOL,
+        ),
     }
 
 
@@ -861,10 +894,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--weight-scale",
         type=float,
-        default=0.275,
+        default=None,
         help=(
-            "Global recurrent weight scale. The FlyBrain default is its "
-            "published per-synapse weight, 0.275."
+            "Global recurrent weight scale. Defaults to 0.275 for FlyBrain "
+            "and 0.15 for mice_column_v1 or uniform."
         ),
     )
     parser.add_argument("--dt", type=float, default=1.0)
@@ -879,8 +912,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-correctness", action="store_true")
     parser.add_argument("--csv", type=Path, default=None)
     args = parser.parse_args()
-    if args.dataset == "flywire_783":
-        args.dataset = "flybrain"
+    args.dataset, args.weight_scale = resolve_dataset_defaults(
+        args.dataset,
+        args.weight_scale,
+    )
     if not 5 <= args.warmup <= 20:
         parser.error("--warmup must be between 5 and 20.")
     if args.repeat < 20:
