@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
+import scipy.sparse as sp
 import torch
 
+import benchmark.benchmark_rsnn_cudagraph_compare as comparison
+import benchmark.benchmark_rsnn_roofline as roofline
 from benchmark.benchmark_persistent_snn import (
     BenchCase,
     make_input_sequence,
     make_recurrent_csr,
 )
 from benchmark.benchmark_rsnn_cudagraph_compare import (
+    FLYBRAIN_DEFAULT_PROVIDERS,
     PROVIDERS,
     DirectCuSparseProvider,
+    load_flybrain_csr,
     make_eager_runner,
     make_torch_csr_weight,
 )
@@ -88,6 +95,82 @@ def test_default_providers_are_standard_pytorch_and_persistent_variants():
         "persistent_binning",
         "persistent_spike_block",
     )
+
+
+def test_flybrain_defaults_avoid_dense_whole_brain_weights():
+    """FlyBrain defaults should remain sparse at whole-connectome scale.
+
+    FlyWire contains enough neurons that a dense adjacency commonly exceeds
+    accelerator memory. Keeping both dense providers out of this dataset's
+    implicit provider list prevents an unexpected allocation while leaving
+    them available through an explicit ``--providers`` argument.
+    """
+
+    assert FLYBRAIN_DEFAULT_PROVIDERS
+    assert all(
+        not provider.startswith("torch_dense_")
+        for provider in FLYBRAIN_DEFAULT_PROVIDERS
+    )
+    assert set(FLYBRAIN_DEFAULT_PROVIDERS).issubset(PROVIDERS)
+
+
+def test_flybrain_loader_preserves_signed_weights_and_orientation(monkeypatch):
+    """FlyBrain loading should scale signed pre-to-post synapse counts.
+
+    The asymmetric edge locations verify that the loader does not transpose
+    the source-oriented CSR graph. Positive and negative values verify that
+    excitatory and inhibitory FlyWire connections both survive conversion.
+    """
+
+    source = sp.csr_matrix(
+        (
+            [2.0, -3.0],
+            ([0, 2], [1, 0]),
+        ),
+        shape=(3, 3),
+        dtype="float32",
+    )
+    calls = {}
+
+    def fake_load_flywire_783(*, root, use_weights):
+        calls.update(root=root, use_weights=use_weights)
+        return source.copy()
+
+    monkeypatch.setattr(
+        "connectome_dataset.graph_loader.load_flywire_783",
+        fake_load_flywire_783,
+    )
+    matrix = load_flybrain_csr(
+        None,
+        weight_scale=0.25,
+        device=torch.device("cpu"),
+    )
+
+    assert calls == {"root": None, "use_weights": True}
+    torch.testing.assert_close(
+        matrix.to_dense(),
+        torch.tensor(
+            [
+                [0.0, 0.5, 0.0],
+                [0.0, 0.0, 0.0],
+                [-0.75, 0.0, 0.0],
+            ]
+        ),
+    )
+
+
+def test_flybrain_is_the_default_dataset(monkeypatch):
+    """Both command-line benchmarks should select FlyBrain by default."""
+
+    monkeypatch.setattr(sys, "argv", [comparison.__file__])
+    comparison_args = comparison.parse_args()
+    monkeypatch.setattr(sys, "argv", [roofline.__file__])
+    roofline_args = roofline.parse_args()
+
+    assert comparison_args.dataset == "flybrain"
+    assert comparison_args.weight_scale == pytest.approx(0.275)
+    assert roofline_args.dataset == "flybrain"
+    assert roofline_args.weight_scale == pytest.approx(0.275)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

@@ -7,7 +7,7 @@ neither timing nor profiling depends on host polling.
 Normal timing (CUDA Events, median of at least 20 runs)::
 
     micromamba run -n ml-py312 python \
-        benchmark/benchmark_rsnn_roofline.py --dataset uniform --csv roofline.csv
+        benchmark/benchmark_rsnn_roofline.py --dataset flybrain --csv roofline.csv
 
 Collect opt-in BlockTask diagnostics (instrumented timing is not production
 performance)::
@@ -76,6 +76,7 @@ for path in (REPO_ROOT, CONNECTOME_REPO):
 
 from benchmark.benchmark_rsnn_cudagraph_compare import (  # noqa: E402
     DirectCuSparseProvider,
+    load_flybrain_csr,
     make_torch_csr_weight,
 )
 from btorch.backend.persistent_snn import (  # noqa: E402
@@ -91,7 +92,7 @@ from btorch.backend.persistent_snn import (  # noqa: E402
 from btorch.sparse import CSR  # noqa: E402
 
 
-Dataset = Literal["uniform", "mice_column_v1"]
+Dataset = Literal["flybrain", "uniform", "mice_column_v1"]
 Mode = Literal["benchmark", "ncu"]
 Provider = Literal["persistent", "cusparse_cudagraph"]
 FANOUT_BINNING_THRESHOLD = 256
@@ -174,12 +175,18 @@ def make_uniform_csr(case: RooflineCase, device: torch.device) -> CSR:
 
 
 def load_connectome_csr(
+    dataset: Dataset,
     root: Path | None,
     *,
     weight_scale: float,
     device: torch.device,
 ) -> CSR:
-    """Load mice_column_v1 through connectome_dataset and normalize weights."""
+    """Load a connectome graph with its dataset-specific weight conversion."""
+
+    if dataset == "flybrain":
+        return load_flybrain_csr(root, weight_scale=weight_scale, device=device)
+    if dataset != "mice_column_v1":
+        raise ValueError(f"Unsupported connectome dataset: {dataset}.")
 
     try:
         from connectome_dataset.graph_loader import load_mice_column_v1
@@ -258,6 +265,7 @@ def prepare_workload(
         matrix = make_uniform_csr(provisional, device)
     else:
         matrix = load_connectome_csr(
+            args.dataset,
             args.connectome_root,
             weight_scale=args.weight_scale,
             device=device,
@@ -806,8 +814,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--dataset",
-        choices=("uniform", "mice_column_v1"),
-        default="uniform",
+        choices=("flybrain", "flywire_783", "uniform", "mice_column_v1"),
+        default="flybrain",
     )
     parser.add_argument(
         "--provider",
@@ -850,7 +858,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fanout", type=int, default=32)
     parser.add_argument("--event-rate", type=float, default=0.01)
     parser.add_argument("--input-amplitude", type=float, default=30.0)
-    parser.add_argument("--weight-scale", type=float, default=0.15)
+    parser.add_argument(
+        "--weight-scale",
+        type=float,
+        default=0.275,
+        help=(
+            "Global recurrent weight scale. The FlyBrain default is its "
+            "published per-synapse weight, 0.275."
+        ),
+    )
     parser.add_argument("--dt", type=float, default=1.0)
     parser.add_argument("--tau-mem", type=float, default=20.0)
     parser.add_argument("--tau-syn", type=float, default=5.0)
@@ -863,6 +879,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-correctness", action="store_true")
     parser.add_argument("--csv", type=Path, default=None)
     args = parser.parse_args()
+    if args.dataset == "flywire_783":
+        args.dataset = "flybrain"
     if not 5 <= args.warmup <= 20:
         parser.error("--warmup must be between 5 and 20.")
     if args.repeat < 20:

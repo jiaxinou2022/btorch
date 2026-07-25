@@ -34,9 +34,14 @@ Large binary/parquet/zip payloads should not be committed directly to git.
 ```bash
 dvc status
 dvc pull data/external/mice_column_v1.dvc
+dvc pull data/external/mice_v1_guozhang.dvc
 dvc pull data/external/suitesparse.dvc
 dvc pull data/external/microns.dvc
 ```
+
+`mice_v1_guozhang` is preprocessed from a machine-local raw model rather than
+downloaded; if the payload is missing and no DVC remote has it, regenerate it
+with `python scripts/build_mice_v1_guozhang.py`.
 
 To update the materialized payload after changing files under
 `data/external/mice_column_v1/`:

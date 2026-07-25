@@ -73,6 +73,8 @@ def main() -> None:
     _pytest("jax/", common)
     _pytest("torch/", common)
     _pytest("cupy/", common)  # cuSPARSE baseline (GPU only; skips cleanly on CPU)
+    _pytest("nest/", common)  # NEST reference simulator (skips cleanly if nest not installed)
+    _pytest("brian2/", common)  # brian2 reference simulator (skips cleanly if brian2 not installed)
     _pytest("external/", common)  # out-of-tree providers via entry points (skips if none installed)
     new_files = sorted(set(glob.glob(_AUTOSAVE_GLOB, recursive=True)) - before)
 

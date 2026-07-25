@@ -26,6 +26,9 @@ CATALOG_DIR = _REPO / ".cache"
 CATALOG_FILE = CATALOG_DIR / "graph_catalog.json"
 
 MICE_COLUMN_V1_ROOT = DATA_ROOT / "external" / "mice_column_v1"
+MICE_V1_GUOZHANG_PATH = DATA_ROOT / "external" / "mice_v1_guozhang" / "mice_v1_guozhang.npz"
+FLYWIRE_783_ROOT = DATA_ROOT / "external" / "flywire_783"
+MULTIAREA_MESOSCALE_ROOT = DATA_ROOT / "external" / "multiarea_mesoscale"
 SUITESPARSE_ROOT = DATA_ROOT / "external" / "suitesparse"
 MICRONS_MM3_PATH = DATA_ROOT / "external" / "microns" / "microns_mm3_connectome.h5"
 
@@ -134,7 +137,7 @@ def _make_file_entry(
 
 def build_catalog() -> None:
     from connectome_dataset.graph_loader import (
-        load_graphml, load_csv_zip, load_mice_column_v1,
+        load_graphml, load_csv_zip, load_mice_column_v1, load_npz,
         load_conn2res_csv, load_conn2res_npy, load_suitesparse_mm,
     )
 
@@ -559,6 +562,117 @@ def build_catalog() -> None:
 
     else:
         print(f"  [SKIP missing] {MICE_COLUMN_V1_ROOT}")
+
+    # ── mice_v1_guozhang: Guozhang V1 GLIF model core (preprocessed npz) ─────
+    if MICE_V1_GUOZHANG_PATH.exists():
+        print("  Loading mice_v1_guozhang ...")
+        try:
+            mat = load_npz(MICE_V1_GUOZHANG_PATH)
+            graphs.append(_make_entry(
+                "mice_v1_guozhang", mat, str(MICE_V1_GUOZHANG_PATH), "npz",
+                "mouse", "V1",
+                ["connectome", "npz", "mouse", "V1", "GLIF", "guozhang", "large"],
+                description=(
+                    "Guozhang V1 GLIF model core (51,978 neurons, r<400um): the canonical "
+                    "Billeh-style mouse V1 column, ~12x larger than mice_column_v1. Built once "
+                    "by scripts/build_mice_v1_guozhang.py from network_dat.pkl + v1_nodes.h5 by "
+                    "selecting the radial core and summing the four GLIF receptor channels into "
+                    "one signed synaptic weight per (pre, post) pair. Rows=presynaptic, cols=postsynaptic."
+                ),
+                paper="Internal dataset - Guozhang V1 GLIF model (Billeh et al. 2020 fit).",
+                doi="10.1016/j.neuron.2020.01.040",
+                source_url="datasets/mice_v1_guozhang/README.md",
+                notes=(
+                    "In-repo metadata lives under datasets/mice_v1_guozhang. The preprocessed npz "
+                    "lives under data/external/mice_v1_guozhang and is DVC-managed, not committed."
+                ),
+            ))
+        except Exception as e:
+            print(f"  [ERROR] mice_v1_guozhang: {e}")
+    else:
+        print(f"  [SKIP missing] {MICE_V1_GUOZHANG_PATH}")
+
+    # ── flywire_783: whole-brain adult Drosophila connectome (Shiu et al. LIF model) ──
+    if (FLYWIRE_783_ROOT / "Connectivity_783.parquet").exists():
+        print("  Loading flywire_783 ...")
+        try:
+            from connectome_dataset.graph_loader import load_flywire_783
+            mat = load_flywire_783(FLYWIRE_783_ROOT, use_weights=True)
+            graphs.append(_make_entry(
+                "flywire_783", mat, str(FLYWIRE_783_ROOT), "flywire_783",
+                "fly", "whole_brain",
+                ["connectome", "flywire", "fly", "whole_brain", "EM", "large", "LIF"],
+                description=(
+                    "Whole-brain adult Drosophila connectome (FlyWire v783, 138,639 neurons, "
+                    "15.1M signed synaptic connections): the wiring underlying the Shiu et al. "
+                    "leaky-integrate-and-fire model of the entire fly brain. Loaded in the model's "
+                    "own original format (Completeness_783.csv + Connectivity_783.parquet); the "
+                    "signed weight is Excitatory x Connectivity (synapse count times sign, negative "
+                    "for inhibitory). Rows=presynaptic, cols=postsynaptic."
+                ),
+                paper=(
+                    "Shiu et al. (2024) A leaky integrate-and-fire computational model based on "
+                    "the connectome of the entire adult Drosophila brain reveals insights into "
+                    "sensorimotor processing. Nature."
+                ),
+                doi="10.1038/s41586-024-07763-9",
+                source_url="datasets/flywire_783/README.md",
+                notes=(
+                    "In-repo metadata lives under datasets/flywire_783. The original Shiu tables "
+                    "live under data/external/flywire_783 and are DVC-managed, not committed. The "
+                    "btorch FlyBrain model (torch/btorch/flybrain.py) simulates on this graph."
+                ),
+            ))
+        except Exception as e:
+            print(f"  [ERROR] flywire_783: {e}")
+    else:
+        print(f"  [SKIP missing] {FLYWIRE_783_ROOT / 'Connectivity_783.parquet'}")
+
+    # ── macaque multi-area model: cortical microcircuit + full multi-area network ──
+    # Instantiated from the staged mesoscale at a CONFIGURABLE scale (env overrides).
+    # Full scale is 4.13M neurons / ~24e9 synapses; the neuron-level graph is only ever
+    # built at the small default scales below (opt into larger via the env vars).
+    if (MULTIAREA_MESOSCALE_ROOT / "multiarea_mesoscale.npz").exists():
+        from connectome_dataset.cortical_network import (
+            instantiate_connectivity, microcircuit_spec, multiarea_spec,
+        )
+        mc_scale = float(os.environ.get("CONNECTOME_MICROCIRCUIT_SCALING", "0.05"))
+        mam_scale = float(os.environ.get("CONNECTOME_MULTIAREA_SCALING", "0.005"))
+        specs = [
+            ("microcircuit_v1", lambda: microcircuit_spec(area="V1", n_scaling=mc_scale), mc_scale,
+             "macaque", "V1",
+             ["cortical-microcircuit", "macaque", "V1", "layered", "iaf_psc_exp", "generated"],
+             f"Potjans-Diesmann-type cortical microcircuit for macaque V1 (8 layered populations), "
+             f"instantiated at n_scaling={mc_scale} from the multi-area model's mesoscale in-degrees. "
+             f"Rows=presynaptic, cols=postsynaptic; signed synaptic weights (pA). Scale via "
+             f"CONNECTOME_MICROCIRCUIT_SCALING."),
+            ("multiarea_mam", lambda: multiarea_spec(n_scaling=mam_scale), mam_scale,
+             "macaque", "visual_cortex",
+             ["multi-area-model", "macaque", "visual-cortex", "layered", "iaf_psc_exp", "generated"],
+             f"Macaque multi-area model (Schmidt et al. 2018): 32 areas x 8 populations of the "
+             f"visual cortex, instantiated at n_scaling={mam_scale} (full scale is 4.13M neurons / "
+             f"~24e9 synapses). Rows=presynaptic, cols=postsynaptic; signed weights (pA). Scale via "
+             f"CONNECTOME_MULTIAREA_SCALING."),
+        ]
+        for name, make_spec, scale, species, region, tags, desc in specs:
+            print(f"  Loading {name} (n_scaling={scale}) ...")
+            try:
+                mat = instantiate_connectivity(make_spec(), seed=0)
+                graphs.append(_make_entry(
+                    name, mat, str(MULTIAREA_MESOSCALE_ROOT), "multiarea_generated",
+                    species, region, tags, description=desc,
+                    paper="Schmidt et al. (2018) A multi-scale layer-resolved spiking network "
+                          "model of resting-state dynamics in macaque cortex. PLOS Comput Biol.",
+                    doi="10.1371/journal.pcbi.1006359",
+                    source_url="datasets/multiarea/README.md",
+                    notes="Generated at a configurable scale by connectome_dataset.cortical_network "
+                          "from the staged mesoscale (data/external/multiarea_mesoscale). The btorch "
+                          "(torch/btorch/microcircuit.py) and NEST (benchmarks/nest) models simulate it.",
+                ))
+            except Exception as e:
+                print(f"  [ERROR] {name}: {e}")
+    else:
+        print(f"  [SKIP missing] {MULTIAREA_MESOSCALE_ROOT / 'multiarea_mesoscale.npz'}")
 
     # ── MICrONS mm3 HDF5 payload (cataloged without heavy conntility load) ───
     if MICRONS_MM3_PATH.exists():

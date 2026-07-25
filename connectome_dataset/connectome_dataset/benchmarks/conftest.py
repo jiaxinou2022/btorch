@@ -6,8 +6,12 @@ from types import SimpleNamespace
 import pytest
 
 from connectome_dataset.benchmarks import corpora, synthetic
-from connectome_dataset.benchmarks.cases import load_rsnn_case, load_spmv_case
-from connectome_dataset.benchmarks.config import BENNCH_DEFAULTS, RSNN_DEFAULTS, SPMV_DEFAULTS
+from connectome_dataset.benchmarks.cases import (
+    load_rsnn_case, load_spgemm_case, load_spmspv_case, load_spmv_case,
+)
+from connectome_dataset.benchmarks.config import (
+    BENNCH_DEFAULTS, RSNN_DEFAULTS, SPGEMM_DEFAULTS, SPMSPV_DEFAULTS, SPMV_DEFAULTS,
+)
 
 
 def _csv(value: str | None) -> list[str]:
@@ -19,10 +23,19 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption("--rounds", type=int, default=None, help="Benchmark rounds (default: per-target from config)")
     parser.addoption("--graph", default="mice_column_v1", help="Dataset graph ID for sparse cases")
     parser.addoption("--replicate", type=int, default=1)
+    parser.addoption(
+        "--replicate-inter-density", type=float, default=None, dest="replicate_inter_density",
+        help="Density of random inter-block edges added when --replicate > 1 "
+             "(default 1%%; 0 = pure block-diagonal).",
+    )
     parser.addoption("--batch-size", type=int, default=None, dest="batch_size")
     parser.addoption("--timesteps", type=int, default=None)
     parser.addoption("--device", default=None, help="Device override (cuda, cpu, ...)")
     parser.addoption("--mode", default="all", choices=["dense", "sparse", "all"])
+    parser.addoption(
+        "--strict-correctness", action="store_true", dest="strict_correctness",
+        help="Fail the test (not just tag status=incorrect) when oracle validation fails.",
+    )
     parser.addoption(
         "--synthetic", action="store_true",
         help="Run the synthetic controlled sweep (banded/ER/power-law/RMAT) instead of the catalog graph",
@@ -51,6 +64,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
+def _corpus_graphs(cfg) -> list[str]:
+    """The catalog graph IDs selected by --matrix-set (or the single --graph)."""
+    matrix_set = cfg.getoption("matrix_set")
+    return corpora.resolve_matrix_set(matrix_set) if matrix_set else [cfg.getoption("--graph")]
+
+
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     cfg = metafunc.config
     # Expand the case fixture over the selected corpus so every benchmark leaf runs
@@ -60,10 +79,14 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
             specs = synthetic.default_sweep(cfg.getoption("synthetic_size"), cfg.getoption("synthetic_degree"))
             params, ids = [("synthetic", s) for s in specs], [s.name for s in specs]
         else:
-            matrix_set = cfg.getoption("matrix_set")
-            graphs = corpora.resolve_matrix_set(matrix_set) if matrix_set else [cfg.getoption("--graph")]
+            graphs = _corpus_graphs(cfg)
             params, ids = [("catalog", g) for g in graphs], list(graphs)
         metafunc.parametrize("spmv_case", params, ids=ids, indirect=True)
+    # SpGEMM / SpMSpV sweep the same catalog corpus (no synthetic path yet).
+    for name in ("spgemm_case", "spmspv_case"):
+        if name in metafunc.fixturenames:
+            graphs = _corpus_graphs(cfg)
+            metafunc.parametrize(name, list(graphs), ids=list(graphs), indirect=True)
     # The precision knob is a plain value fixture (not indirect) that any leaf can request.
     if "precision" in metafunc.fixturenames:
         precisions = [p.strip() for p in cfg.getoption("precisions").split(",") if p.strip()]
@@ -88,14 +111,20 @@ def bench_cfg(request: pytest.FixtureRequest) -> SimpleNamespace:
     return SimpleNamespace(
         warmup_rsnn=warmup if warmup is not None else RSNN_DEFAULTS.warmup,
         warmup_spmv=warmup if warmup is not None else SPMV_DEFAULTS.warmup,
+        warmup_spgemm=warmup if warmup is not None else SPGEMM_DEFAULTS.warmup,
+        warmup_spmspv=warmup if warmup is not None else SPMSPV_DEFAULTS.warmup,
         rounds_rsnn=rounds if rounds is not None else RSNN_DEFAULTS.rep,
         rounds_spmv=rounds if rounds is not None else SPMV_DEFAULTS.rep,
+        rounds_spgemm=rounds if rounds is not None else SPGEMM_DEFAULTS.rep,
+        rounds_spmspv=rounds if rounds is not None else SPMSPV_DEFAULTS.rep,
         graph=opt("--graph"),
         replicate=opt("--replicate"),
+        replicate_inter_density=opt("--replicate-inter-density"),
         batch_size=opt("--batch-size"),
         timesteps=opt("--timesteps"),
         device=opt("--device"),
         mode=opt("--mode"),
+        strict_correctness=opt("strict_correctness"),
     )
 
 
@@ -108,6 +137,25 @@ def spmv_case(request, bench_cfg):
     return load_spmv_case(
         ref, replicate=bench_cfg.replicate,
         batch_sizes=list(SPMV_DEFAULTS.batch_sizes),
+        inter_density=bench_cfg.replicate_inter_density,
+    )
+
+
+@pytest.fixture(scope="module")
+def spgemm_case(request, bench_cfg):
+    graph = getattr(request, "param", bench_cfg.graph)
+    return load_spgemm_case(
+        graph, replicate=bench_cfg.replicate,
+        inter_density=bench_cfg.replicate_inter_density,
+    )
+
+
+@pytest.fixture(scope="module")
+def spmspv_case(request, bench_cfg):
+    graph = getattr(request, "param", bench_cfg.graph)
+    return load_spmspv_case(
+        graph, replicate=bench_cfg.replicate,
+        inter_density=bench_cfg.replicate_inter_density,
     )
 
 
@@ -117,6 +165,7 @@ def rsnn_case(bench_cfg):
         bench_cfg.graph, replicate=bench_cfg.replicate,
         timesteps=bench_cfg.timesteps or RSNN_DEFAULTS.timesteps,
         batch_size=bench_cfg.batch_size or RSNN_DEFAULTS.batch_size,
+        inter_density=bench_cfg.replicate_inter_density,
     )
 
 

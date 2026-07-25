@@ -18,4 +18,17 @@ clone https://github.com/google-research/sputnik.git sputnik --single-branch
 # FlashSparse bundles large data; grab just the kernel/cmake via a blobless sparse checkout.
 clone https://github.com/ParCIS/FlashSparse.git FlashSparse --single-branch --branch main --filter=blob:none
 clone https://github.com/HPMLL/DTC-SpMM_ASPLOS24.git DTC-SpMM --single-branch --branch main --filter=blob:none
+
+# MH-SpGEMM is a local checkout (not a public URL here); mirror its sources in (no .git /
+# build artifacts). Override the source with MH_SPGEMM_ROOT.
+MH_SRC="${MH_SPGEMM_ROOT:-$HOME/src/MH-SpGEMM}"
+if [ ! -d external/MH-SpGEMM/inc ] && [ -d "$MH_SRC/inc" ]; then
+  echo "copying MH-SpGEMM from $MH_SRC ..."
+  mkdir -p external/MH-SpGEMM
+  rsync -a --exclude='.git' --exclude='obj' --exclude='spgemm' --exclude='*.o' \
+    "$MH_SRC"/ external/MH-SpGEMM/ 2>/dev/null \
+    || cp -r "$MH_SRC"/inc "$MH_SRC"/src external/MH-SpGEMM/
+else
+  echo "external/MH-SpGEMM present or source $MH_SRC missing"
+fi
 echo "done. build with: cmake -B cpp/build-cuda -S cpp -DCONNECTOME_BENCH_BUILD_SPUTNIK=ON"

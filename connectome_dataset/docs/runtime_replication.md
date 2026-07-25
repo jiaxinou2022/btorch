@@ -1,14 +1,18 @@
 # Runtime Graph Replication
 
 Any square catalog graph can be expanded at runtime by block-diagonal
-replication. This creates independent copies of the same graph:
+replication plus a sparse layer of random inter-block edges:
 
 ```text
-A_rep = block_diag(A, A, ..., A)
+A_rep = block_diag(A, A, ..., A) + random_inter_block_edges
 ```
 
-There are no inter-copy edges. This is useful for scaling sparse kernels and
-RSNN benchmarks without generating new biological data.
+The block diagonal gives `times` copies with identical local structure; the
+inter-block edges (default **1% density** of the off-block-diagonal region,
+weights `N(0, 0.1)`) connect the copies into a single network instead of
+isolated islands. Set the density with `--replicate-inter-density` (`0` = pure
+block-diagonal). This is useful for scaling sparse kernels and RSNN benchmarks
+without generating new biological data.
 
 ## Supported Commands
 
@@ -77,7 +81,8 @@ from connectome_dataset import load_catalog, find_graph, replicate_graph_entry
 
 catalog = load_catalog()
 entry = find_graph("mice_column_v1")
-rep_entry, matrix = replicate_graph_entry(entry, catalog, times=16)
+# inter_density defaults to 0.01 (1%); pass 0.0 for pure block-diagonal.
+rep_entry, matrix = replicate_graph_entry(entry, catalog, times=16, inter_density=0.01)
 
 print(rep_entry["name"], matrix.shape, matrix.nnz)
 ```
@@ -87,6 +92,9 @@ print(rep_entry["name"], matrix.shape, matrix.nnz)
 - The source graph must be square.
 - `--replicate` requires `--graph` for SpMV commands to avoid accidentally
   expanding the whole catalog.
+- `--replicate-inter-density` controls the random inter-block edge density
+  (default 1%; `0` = pure block-diagonal). Inter-block edges are deterministic
+  in the replication seed.
 - RSNN sparse mode defaults to the catalog `mice_column_v1` entries; use
   `--graph` when requesting a custom replication factor.
 - `--sparse-backend auto` prefers `brainevent` and falls back to `jax_bcoo`

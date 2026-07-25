@@ -59,9 +59,15 @@ def _canonical_problem(problem: dict[str, Any] | None, target: str | None) -> di
     rsnn is keyed on ``timesteps`` and ``batch_size``.
     """
     p = dict(problem or {})
-    if target in ("spmm", "spgemm"):
+    if target == "spmm":
         n = p.get("N", p.get("batch_size", p.get("bs")))
         return {"N": n} if n is not None else {}
+    if target == "spgemm":
+        return {}  # C = A·Aᵀ is fully determined by the case; no free size axis
+    if target == "spmspv":
+        # y = A·x is keyed on how sparse the operand vector is.
+        s = p.get("vector_sparsity")
+        return {"vector_sparsity": s} if s is not None else {}
     # rsnn: fwd vs fwd+bwd is a distinct workload, so `pass` is part of the cell.
     return {k: p[k] for k in ("timesteps", "batch_size", "pass") if p.get(k) is not None}
 

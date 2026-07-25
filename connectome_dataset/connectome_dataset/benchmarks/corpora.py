@@ -73,10 +73,20 @@ SNAP_POWER_LAW = [
     "suitesparse_snap_web_stanford",     # n=281903  web graph, 2.3M nnz (largest)
 ]
 
+# Guozhang mouse-V1 family — the primary in-house targets, spanning two orders of scale so a
+# kernel's ranking can be read as network size grows (and further via ``--replicate``):
+#   mice_column_v1    n=4,166    726k nnz   — the 200um V1 column
+#   mice_v1_guozhang  n=51,978   14.4M nnz  — the full GLIF V1 model core (~12x / ~20x)
+V1_FAMILY = [
+    "mice_column_v1",
+    "mice_v1_guozhang",
+]
+
 MATRIX_SETS: dict[str, list[str]] = {
     "connectome": CONNECTOME_REPRESENTATIVE,
     "suitesparse": SUITESPARSE_LITERATURE,
     "snap": SNAP_POWER_LAW,
+    "v1": V1_FAMILY,
 }
 
 

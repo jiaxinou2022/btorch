@@ -24,7 +24,7 @@ The identity of every measured run is the tuple **`(framework, provider, target,
 
 | axis | meaning | examples |
 |------|---------|----------|
-| `framework` | the runtime that **invokes** the kernel | `torch`, `jax`, `cupy`, `cpp`, `scipy` |
+| `framework` | the runtime that **invokes** the kernel | `torch`, `jax`, `cupy`, `nest`, `brian2`, `cpp`, `scipy` |
 | `provider` | the library / algorithm being benchmarked | `cusparse`, `sputnik`, `flashsparse`, `dtc_spmm`, `native_sparse` |
 | `target` | the operation | `spmm` (SpMV is `spmm` with `N=1`), `rsnn` |
 | `variant` | a within-provider kernel/config axis | `csr`, `coo`, `bcoo`, `event` |
@@ -46,6 +46,7 @@ Selected with `--matrix-set` / `--graph` / `--synthetic` (precedence:
 |----------|------|-----|
 | `--graph mice_column_v1` | a single catalog graph (default) | quick smoke / focused run |
 | `--matrix-set connectome` | curated real connectomes (8 graphs) | spans size (n 213→21.7k), density (0.15%→48%), degree-skew (Gini .24→.87) |
+| `--matrix-set v1` | Guozhang mouse-V1 family (`mice_column_v1`, `mice_v1_guozhang`) | same V1 wiring across two orders of scale (n 4.2k→52k); scale further with `--replicate` |
 | `--matrix-set suitesparse` | Newman/DIMACS10/Arenas graph collections | literature baseline: heavy-tailed social ↔ near-uniform meshes |
 | `--matrix-set snap` | SNAP power-law graphs (social/web/citation/…) | **off-distribution but connectome-like** heavy-tailed graphs, 29k→2.3M nnz |
 | `--matrix-set 'suitesparse_newman_*'` | prefix glob over catalog names | ad-hoc subsets |
@@ -84,6 +85,32 @@ kernels reached through the entry-point registry (§6).
 
 The three SOTA kernels are vendored from external repos (§7) and wired **both in-tree and
 out-of-tree** as cross-checks of the integration paths.
+
+Two further targets have their own providers (same registry, cases, oracle, record schema):
+
+**SpGEMM** (`C = A·Aᵀ`, sparse×sparse), validated against an fp64 SciPy oracle:
+
+| identity | class | precision | notes |
+|----------|-------|-----------|-------|
+| `cupy.cusparse` (spgemm) | cuSPARSE SpGEMM (CuPy) | fp32/fp16 | designated `×baseline` |
+| `cuda.mh_spgemm` | **MH-SpGEMM** (masking + hashing SOTA) | fp32 | out-of-tree; `A·Aᵀ` via `B = Aᵀ`; fp16 disabled (vendored fp64-centric kernel faults on some graphs) |
+
+**SpMSpV** (`y = A·x`, sparse matrix × **sparse vector** — event-driven spike delivery),
+swept over vector sparsities `0.01/0.05/0.10/0.20`, validated against a SciPy oracle:
+
+| identity | class | precision | notes |
+|----------|-------|-----------|-------|
+| `cupy.cusparse` (spmspv) | cuSPARSE dense-vector SpMV | fp32/fp16 | sparsity-insensitive baseline |
+| `cuda.vdha` | **VDHA** (vector-driven hash aggregation SOTA) | fp32/fp16 | out-of-tree; A in CSC; fp16 halves value traffic, accumulates in fp32 |
+
+Both also plug into the **btorch connectome RSNN** as the recurrent spike-delivery operator
+(`spikes @ W`, the beNNch *deliver* phase) — recorded as the `variant` axis of
+`torch.btorch.rsnn`: `native` (torch sparse SpMV), `vdha` (SpMSpV, one spike vector),
+`mh_spgemm` (SpGEMM, batch of sparse spike vectors). See
+`torch/btorch/test_rsnn_deliver.py`.
+
+See [`benchmark_design/spgemm_spmspv.md`](benchmark_design/spgemm_spmspv.md) for both
+algorithms, the SpMSpV target, the RSNN delivery track, and measurement caveats.
 
 ### Precision knob
 `--precisions fp32,fp16,bf16` sweeps precision (a `knobs` axis, so a kernel only ever ranks
@@ -126,6 +153,7 @@ Batch scripts live in `scripts/` (partition `debug`, one GPU):
 | `bench_flashsparse.sbatch` | build + run FlashSparse (in-tree + out-of-tree) |
 | `bench_dtc.sbatch` | build + run DTC-SpMM (in-tree + out-of-tree) |
 | `bench_external.sbatch` | out-of-tree registry validation |
+| `bench_mh_vdha.sbatch` | build + validate + run MH-SpGEMM vs cuSPARSE (SpGEMM) and VDHA vs cuSPARSE SpMV (SpMSpV) |
 
 ```bash
 sbatch scripts/bench.sbatch          # queues; results land in results/slurm/<job>.out

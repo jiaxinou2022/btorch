@@ -1,6 +1,6 @@
 """Compare standard PyTorch RSNN baselines with persistent CUDA kernels.
 
-The default comparison contains four public-API PyTorch baselines and the
+The available comparison contains four public-API PyTorch baselines and the
 three persistent CUDA task schedulers:
 
 * ``torch_dense_eager`` uses :func:`torch.nn.functional.linear`.
@@ -20,11 +20,16 @@ CUDA graph capture, and persistent workspace allocation are outside timing.
 The direct provider uses ``CUSPARSE_SPMV_ALG_DEFAULT`` for batch size one and
 ``CUSPARSE_SPMM_CSR_ALG1`` otherwise.
 
+FlyBrain (FlyWire v783) is the default dataset. Its signed synapse counts are
+scaled by ``--weight-scale``. Dense providers are opt-in for FlyBrain because
+materializing its whole-brain adjacency as a dense tensor is usually
+impractical.
+
 Usage::
 
     python benchmark/benchmark_rsnn_cudagraph_compare.py \
-        --dataset mice_column_v1 --t-steps 128 --batch-size 1 \
-        --csv benchmark/mice_v1_standard_baselines.csv
+        --dataset flybrain --t-steps 128 --batch-size 1 \
+        --csv benchmark/flybrain_standard_baselines.csv
 """
 
 from __future__ import annotations
@@ -86,6 +91,40 @@ PROVIDERS: tuple[Provider, ...] = (
     "persistent_binning",
     "persistent_spike_block",
 )
+
+FLYBRAIN_DEFAULT_PROVIDERS: tuple[Provider, ...] = tuple(
+    provider for provider in PROVIDERS if not provider.startswith("torch_dense_")
+)
+
+
+def load_flybrain_csr(
+    root: Path | None, *, weight_scale: float, device: torch.device
+) -> CSR:
+    """Load the signed FlyWire v783 graph used by the FlyBrain model.
+
+    The source data stores signed synapse counts with pre-synaptic rows. The
+    FlyBrain model converts those counts to synaptic strength by multiplying
+    them by one scalar ``w_syn``; ``weight_scale`` serves that role here.
+    """
+
+    try:
+        from connectome_dataset.graph_loader import load_flywire_783
+    except ImportError as exc:
+        raise RuntimeError(
+            "connectome_dataset is required for --dataset flybrain"
+        ) from exc
+
+    try:
+        scipy_matrix = load_flywire_783(root=root, use_weights=True).tocsr()
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"{exc}\nFetch connectome_dataset/data/external/flywire_783 "
+            "or pass --connectome-root."
+        ) from exc
+    if scipy_matrix.shape[0] != scipy_matrix.shape[1]:
+        raise ValueError(f"flybrain must be square, got {scipy_matrix.shape}.")
+    scipy_matrix.data *= weight_scale
+    return CSR.from_scipy(scipy_matrix, device=device, dtype=torch.float32)
 
 
 def load_mice_column_v1_csr(
@@ -539,16 +578,15 @@ def bench_case(
 
     x_seq = make_input_sequence(case, device)
     csr_weight = make_torch_csr_weight(matrix)
-    needs_dense = check_correctness or any(
+    needs_dense = any(
         provider.startswith("torch_dense_") for provider in providers
     )
     dense_weight = csr_weight.to_dense() if needs_dense else None
 
     reference = None
     if check_correctness:
-        assert dense_weight is not None
         reference = make_eager_runner(
-            x_seq, dense_weight, case, sparse=False
+            x_seq, csr_weight, case, sparse=True
         )()
 
     rows = []
@@ -658,8 +696,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--dataset",
-        choices=("uniform", "mice_column_v1", "mice_v1_column"),
-        default="mice_column_v1",
+        choices=(
+            "flybrain",
+            "flywire_783",
+            "uniform",
+            "mice_column_v1",
+            "mice_v1_column",
+        ),
+        default="flybrain",
     )
     parser.add_argument("--connectome-root", type=Path, default=None)
     parser.add_argument("--n-neuron", type=int, default=2**13)
@@ -673,12 +717,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--v-threshold", type=float, default=1.0)
     parser.add_argument("--c-m", type=float, default=1.0)
     parser.add_argument("--input-amplitude", type=float, default=30.0)
-    parser.add_argument("--weight-scale", type=float, default=0.15)
+    parser.add_argument(
+        "--weight-scale",
+        type=float,
+        default=0.275,
+        help=(
+            "Global recurrent weight scale. The FlyBrain default is its "
+            "published per-synapse weight, 0.275."
+        ),
+    )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=30)
-    parser.add_argument(
-        "--providers", nargs="+", choices=PROVIDERS, default=list(PROVIDERS)
-    )
+    parser.add_argument("--providers", nargs="+", choices=PROVIDERS, default=None)
     parser.add_argument("--skip-correctness", action="store_true")
     parser.add_argument("--csv", type=Path, default=None)
     args = parser.parse_args()
@@ -701,11 +751,21 @@ def main() -> None:
         raise SystemExit("CUDA required for this comparison.")
     device = torch.device("cuda")
 
-    dataset = (
-        "mice_column_v1" if args.dataset == "mice_v1_column" else args.dataset
+    aliases = {"mice_v1_column": "mice_column_v1", "flywire_783": "flybrain"}
+    dataset = aliases.get(args.dataset, args.dataset)
+    providers = tuple(
+        args.providers
+        if args.providers is not None
+        else (FLYBRAIN_DEFAULT_PROVIDERS if dataset == "flybrain" else PROVIDERS)
     )
     matrix = None
-    if dataset == "mice_column_v1":
+    if dataset == "flybrain":
+        matrix = load_flybrain_csr(
+            args.connectome_root,
+            weight_scale=args.weight_scale,
+            device=device,
+        )
+    elif dataset == "mice_column_v1":
         matrix = load_mice_column_v1_csr(
             args.connectome_root,
             weight_scale=args.weight_scale,
@@ -749,7 +809,7 @@ def main() -> None:
             device=device,
             dataset=dataset,
             matrix=case_matrix,
-            providers=tuple(args.providers),
+            providers=providers,
             graph_provider=graph_provider,
             direct_cusparse_provider=direct_cusparse_provider,
             persistent_provider=persistent_provider,

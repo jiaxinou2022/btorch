@@ -12,6 +12,15 @@ def flops_spmm(nnz: int, batch: int) -> int:
     return 2 * nnz * batch
 
 
+def flops_spmspv(products: int) -> int:
+    """2 * (scalar multiply-adds) for y = A·x, x sparse.
+
+    ``products`` = sum over active x entries of the nnz in the corresponding column of A
+    (the work actually touched), not 2·nnz(A).
+    """
+    return 2 * products
+
+
 def flops_spgemm(intermediate_products: int) -> int:
     """2 * (intermediate multiply-adds) FLOPs for C = A @ B.
 
