@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
+import numpy as np
 import pytest
 import scipy.sparse as sp
 import torch
@@ -25,6 +27,10 @@ from benchmark.benchmark_rsnn_cudagraph_compare import (
     make_eager_runner,
     make_torch_csr_weight,
     resolve_dataset_defaults,
+)
+from benchmark.external_rsnn_simulators import (
+    _patch_brian_timer,
+    _source_indices,
 )
 from btorch.sparse import CSR
 
@@ -84,8 +90,8 @@ def test_standard_dense_and_csr_rsnn_baselines_are_equivalent():
     torch.testing.assert_close(dense.psc, sparse.psc, atol=1e-6, rtol=1e-6)
 
 
-def test_default_providers_are_standard_pytorch_and_persistent_variants():
-    """The published default comparison should not include custom scatter."""
+def test_default_providers_include_external_simulator_comparisons():
+    """The published comparison should include both generated-code simulators."""
 
     assert PROVIDERS == (
         "torch_dense_eager",
@@ -97,6 +103,8 @@ def test_default_providers_are_standard_pytorch_and_persistent_variants():
         "persistent_plain",
         "persistent_binning",
         "persistent_spike_block",
+        "genn",
+        "brian2cuda",
     )
 
 
@@ -187,6 +195,39 @@ def test_dataset_specific_weight_scale_defaults():
     )
     assert resolve_dataset_defaults("uniform", None) == ("uniform", 0.15)
     assert resolve_dataset_defaults("flybrain", 0.5) == ("flybrain", 0.5)
+
+
+def test_external_csr_source_expansion_preserves_empty_rows():
+    """External simulators should receive the exact pre-to-post edge list.
+
+    The empty middle row makes this more than a simple fixed-fanout example
+    and checks the conversion used for both GeNN and Brian2CUDA.
+    """
+
+    source = _source_indices(np.array([0, 2, 2, 3], dtype=np.int64))
+
+    np.testing.assert_array_equal(source, np.array([0, 0, 2]))
+
+
+def test_brian_timer_patch_synchronizes_both_interval_boundaries(tmp_path: Path):
+    """Brian2CUDA timing should exclude preceding work and include queued work."""
+
+    template = (
+        "void Network::run() {\n"
+        "    start = std::chrono::high_resolution_clock::now();\n"
+        "    Network::_globally_running = false;\n\n"
+        "    current = std::chrono::high_resolution_clock::now();\n"
+        "}\n"
+    )
+    path = tmp_path / "network.cu"
+    path.write_text(template)
+
+    _patch_brian_timer(tmp_path)
+
+    patched = path.read_text()
+    assert patched.count("CUDA_SAFE_CALL(cudaDeviceSynchronize());") == 2
+    assert patched.index("cudaDeviceSynchronize") < patched.index("start =")
+    assert patched.rindex("cudaDeviceSynchronize") < patched.index("current =")
 
 
 def test_correctness_accepts_small_relative_error_on_large_states():

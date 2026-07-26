@@ -1,4 +1,4 @@
-"""Compare standard PyTorch RSNN baselines with persistent CUDA kernels.
+"""Compare RSNN implementations across PyTorch and SNN code generators.
 
 The available comparison contains four public-API PyTorch baselines and the
 three persistent CUDA task schedulers:
@@ -13,14 +13,21 @@ three persistent CUDA task schedulers:
 * ``cusparse_direct_cudagraph`` captures that direct CUDA execution.
 * ``persistent_plain``, ``persistent_binning``, and
   ``persistent_spike_block`` execute one cooperative CUDA kernel per window.
+* ``genn`` uses PyGeNN's generated CUDA backend with sparse connectivity.
+* ``brian2cuda`` uses Brian2CUDA's single-precision standalone backend.
 
 All providers evaluate the same recurrent LIF and ExponentialPSC equations
 from the same zero state and fixed input. Thus ``flybrain`` means this common
 RSNN workload running on the signed FlyWire graph; it does not enable the full
 Shiu et al. refractory, delay, and hard-reset dynamics. Dataset loading,
-weight conversion, CUDA graph capture, and persistent workspace allocation
-are outside timing. The direct provider uses ``CUSPARSE_SPMV_ALG_DEFAULT`` for
-batch size one and ``CUSPARSE_SPMM_CSR_ALG1`` otherwise.
+weight conversion, code generation/compilation, CUDA graph capture, and
+persistent workspace allocation are outside timing. The direct provider uses
+``CUSPARSE_SPMV_ALG_DEFAULT`` for batch size one and
+``CUSPARSE_SPMM_CSR_ALG1`` otherwise. GeNN and Brian2CUDA run in isolated
+processes so each framework owns a clean CUDA context. Their device-synchronised
+steady-state samples exclude process startup, compilation, initialisation, and
+host/device result transfer. Framework versions, build time, timing method,
+and every raw latency sample are written to the CSV.
 
 FlyBrain (FlyWire v783) is the default dataset. Its signed synapse counts are
 scaled by ``--weight-scale``. Dense providers are opt-in for FlyBrain because
@@ -32,6 +39,12 @@ Usage::
     python benchmark/benchmark_rsnn_cudagraph_compare.py \
         --dataset flybrain --t-steps 128 --batch-size 1 \
         --csv benchmark/flybrain_standard_baselines.csv
+
+To retain generated sources for artifact review, pass
+``--external-build-root benchmark/generated``. The external providers are
+optional: ``genn`` requires PyGeNN 5 and ``brian2cuda`` requires Brian2CUDA;
+an unavailable framework is emitted as an error row without stopping the
+remaining comparison.
 """
 
 from __future__ import annotations
@@ -80,6 +93,8 @@ Provider = Literal[
     "persistent_plain",
     "persistent_binning",
     "persistent_spike_block",
+    "genn",
+    "brian2cuda",
 ]
 
 PROVIDERS: tuple[Provider, ...] = (
@@ -92,6 +107,8 @@ PROVIDERS: tuple[Provider, ...] = (
     "persistent_plain",
     "persistent_binning",
     "persistent_spike_block",
+    "genn",
+    "brian2cuda",
 )
 
 FLYBRAIN_DEFAULT_PROVIDERS: tuple[Provider, ...] = tuple(
@@ -542,8 +559,8 @@ class DirectCuSparseProvider:
         return replay
 
 
-def time_ms(fn, *, warmup: int, repeat: int) -> float:
-    """Measure median GPU stream time with CUDA events."""
+def time_samples_ms(fn, *, warmup: int, repeat: int) -> list[float]:
+    """Measure individual GPU stream times with CUDA events."""
 
     for _ in range(warmup):
         fn()
@@ -559,7 +576,19 @@ def time_ms(fn, *, warmup: int, repeat: int) -> float:
         start.elapsed_time(end)
         for start, end in zip(starts, ends, strict=True)
     ]
+    return samples
+
+
+def median_ms(samples: list[float]) -> float:
+    """Return the median of non-empty latency samples."""
+
     return float(torch.tensor(samples, dtype=torch.float64).median().item())
+
+
+def time_ms(fn, *, warmup: int, repeat: int) -> float:
+    """Measure median GPU stream time with CUDA events."""
+
+    return median_ms(time_samples_ms(fn, warmup=warmup, repeat=repeat))
 
 
 def max_normalized_error(
@@ -632,6 +661,7 @@ def bench_case(
     graph_provider: TorchCUDAGraphProvider,
     direct_cusparse_provider: DirectCuSparseProvider,
     persistent_provider: PersistentProvider,
+    external_build_root: Path | None = None,
     warmup: int,
     repeat: int,
     check_correctness: bool,
@@ -653,8 +683,37 @@ def bench_case(
 
     rows = []
     for provider in providers:
+        framework_version = ""
+        build_time_s = float("nan")
+        timing_method = "torch_cuda_event"
+        samples: list[float] = []
         try:
-            if provider == "torch_dense_eager":
+            if provider in ("genn", "brian2cuda"):
+                from benchmark.external_rsnn_simulators import run_external_provider
+
+                external = run_external_provider(
+                    provider,
+                    x_seq,
+                    matrix,
+                    case,
+                    warmup=warmup,
+                    repeat=repeat,
+                    check_correctness=check_correctness,
+                    build_root=external_build_root,
+                )
+                result = external.result
+                samples = external.latency_samples_ms
+                framework_version = external.framework_version
+                build_time_s = external.build_time_s
+                timing_method = external.timing_method
+                metrics = (
+                    correctness_metrics(result, reference)
+                    if reference is not None and result is not None
+                    else _empty_metrics()
+                )
+                latency = median_ms(samples)
+                run = None
+            elif provider == "torch_dense_eager":
                 assert dense_weight is not None
                 run = make_eager_runner(x_seq, dense_weight, case, sparse=False)
             elif provider == "torch_dense_cudagraph":
@@ -686,13 +745,19 @@ def bench_case(
             else:
                 raise ValueError(provider)
 
-            result = run()
-            metrics = (
-                correctness_metrics(result, reference)
-                if reference is not None
-                else _empty_metrics()
-            )
-            latency = time_ms(run, warmup=warmup, repeat=repeat)
+            if run is not None:
+                result = run()
+                metrics = (
+                    correctness_metrics(result, reference)
+                    if reference is not None
+                    else _empty_metrics()
+                )
+                samples = time_samples_ms(
+                    run,
+                    warmup=warmup,
+                    repeat=repeat,
+                )
+                latency = median_ms(samples)
         except Exception as exc:  # noqa: BLE001
             metrics = _empty_metrics(f"error:{type(exc).__name__}: {exc}")
             latency = float("nan")
@@ -715,6 +780,10 @@ def bench_case(
                     if case.batch_size == 1
                     else "CUSPARSE_SPMM_CSR_ALG1"
                 ),
+                "framework_version": framework_version,
+                "build_time_s": build_time_s,
+                "timing_method": timing_method,
+                "latency_samples_ms": ";".join(f"{x:.9g}" for x in samples),
                 **metrics,
                 "latency_ms": latency,
                 "speedup_vs_dense_eager": float("nan"),
@@ -723,6 +792,8 @@ def bench_case(
                 "speedup_vs_csr_cudagraph": float("nan"),
                 "speedup_vs_cusparse_direct_eager": float("nan"),
                 "speedup_vs_cusparse_direct_cudagraph": float("nan"),
+                "speedup_vs_genn": float("nan"),
+                "speedup_vs_brian2cuda": float("nan"),
             }
         )
 
@@ -741,6 +812,8 @@ def bench_case(
             "cusparse_direct_cudagraph",
             "speedup_vs_cusparse_direct_cudagraph",
         ),
+        ("genn", "speedup_vs_genn"),
+        ("brian2cuda", "speedup_vs_brian2cuda"),
     )
     for row in rows:
         latency = float(row["latency_ms"])
@@ -791,6 +864,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=30)
     parser.add_argument("--providers", nargs="+", choices=PROVIDERS, default=None)
+    parser.add_argument(
+        "--external-build-root",
+        type=Path,
+        default=None,
+        help=(
+            "Keep GeNN/Brian2CUDA generated projects below this directory. "
+            "By default a temporary directory is removed after each case."
+        ),
+    )
     parser.add_argument("--skip-correctness", action="store_true")
     parser.add_argument("--csv", type=Path, default=None)
     args = parser.parse_args()
@@ -878,6 +960,7 @@ def main() -> None:
             graph_provider=graph_provider,
             direct_cusparse_provider=direct_cusparse_provider,
             persistent_provider=persistent_provider,
+            external_build_root=args.external_build_root,
             warmup=args.warmup,
             repeat=args.repeat,
             check_correctness=not args.skip_correctness,
