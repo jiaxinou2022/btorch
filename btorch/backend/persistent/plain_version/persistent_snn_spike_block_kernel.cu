@@ -19,20 +19,50 @@ namespace {
 #define BTORCH_TILE_REDUCE_MODE 0
 #endif
 
+#ifndef BTORCH_BLOCK_HASH_AGGREGATION
+#define BTORCH_BLOCK_HASH_AGGREGATION 512
+#endif
+
+#ifndef BTORCH_BLOCK_HASH_CAPACITY
+#define BTORCH_BLOCK_HASH_CAPACITY 512
+#endif
+
+#ifndef BTORCH_BLOCK_HASH_MAX_PROBE
+#define BTORCH_BLOCK_HASH_MAX_PROBE 4
+#endif
+
+#ifndef BTORCH_BLOCK_HASH_MIN_EDGES
+#define BTORCH_BLOCK_HASH_MIN_EDGES 256
+#endif
+
+#ifndef BTORCH_BLOCK_HASH_USED_SLOTS
+#define BTORCH_BLOCK_HASH_USED_SLOTS 1
+#endif
+
 constexpr int kFanoutThreshold = 256;
 constexpr int kLaneRowThreshold = 4;
 constexpr int kBlockEdgeBudget = BTORCH_BLOCK_EDGE_BUDGET;
 constexpr int kSegmentSize = BTORCH_LONG_SEGMENT_SIZE;
 constexpr int kTileReduceMode = BTORCH_TILE_REDUCE_MODE;
-constexpr int kHashSize = 128;
-constexpr int kHashMaxProbe = 8;
-constexpr int kHashMinEdges = 64;
-constexpr int kHashMaxEdges = 96;
+constexpr int kHashAggregation = BTORCH_BLOCK_HASH_AGGREGATION;
+constexpr int kHashSize = BTORCH_BLOCK_HASH_CAPACITY;
+constexpr int kHashMaxProbe = BTORCH_BLOCK_HASH_MAX_PROBE;
+constexpr int kHashMinEdges = BTORCH_BLOCK_HASH_MIN_EDGES;
+constexpr bool kHashUsedSlots = BTORCH_BLOCK_HASH_USED_SLOTS != 0;
+constexpr int kLegacyHashMaxEdges = 96;
 constexpr int kWarpsPerBlock = 8;
 constexpr int kEmptyHashKey = -1;
 constexpr unsigned kFullWarpMask = 0xffffffffu;
 constexpr int kBlockIndexBits = 24;
 constexpr unsigned kBlockIndexMask = (1u << kBlockIndexBits) - 1u;
+#ifdef ENABLE_BLOCK_HASH
+constexpr int kBlockTaskSpan =
+    kHashAggregation > kBlockEdgeBudget
+    ? kHashAggregation
+    : kBlockEdgeBudget;
+#else
+constexpr int kBlockTaskSpan = kBlockEdgeBudget;
+#endif
 
 static_assert(
     kBlockEdgeBudget == 0
@@ -47,13 +77,35 @@ static_assert(
         || kSegmentSize == 1024
         || kSegmentSize == 2048);
 static_assert(kTileReduceMode >= 0 && kTileReduceMode <= 2);
+static_assert(
+    kHashAggregation == 128
+        || kHashAggregation == 256
+        || kHashAggregation == 512);
+static_assert(kHashSize == 128 || kHashSize == 256 || kHashSize == 512);
+static_assert(
+    kHashMaxProbe == 4 || kHashMaxProbe == 8 || kHashMaxProbe == 16);
+static_assert(
+    kHashMinEdges == 0
+        || kHashMinEdges == 64
+        || kHashMinEdges == 128
+        || kHashMinEdges == 192
+        || kHashMinEdges == 256);
+static_assert(
+    BTORCH_BLOCK_HASH_USED_SLOTS == 0
+        || BTORCH_BLOCK_HASH_USED_SLOTS == 1);
 
 #ifdef ENABLE_BLOCK_STATS
-constexpr int kBlockStatsColumns = 17;
+constexpr int kBlockStatsColumns = 23;
 constexpr int kV4InputEdgesColumn = 13;
 constexpr int kV4GlobalAtomicsColumn = 14;
 constexpr int kV4ReduceTasksColumn = 15;
 constexpr int kV4ReduceEdgesColumn = 16;
+constexpr int kHashTasksColumn = 17;
+constexpr int kHashWindowsColumn = 18;
+constexpr int kHashInputEdgesColumn = 19;
+constexpr int kHashFlushAtomicsColumn = 20;
+constexpr int kHashFallbackAtomicsColumn = 21;
+constexpr int kHashProbeAttemptsColumn = 22;
 
 // One diagnostic thread reconstructs one potential 32-neuron task after the
 // persistent launch. This deliberately lives outside the timed/production
@@ -149,6 +201,25 @@ __device__ __forceinline__ void process_edge_range(
     }
 }
 
+__device__ __forceinline__ int map_packed_edge(
+    const int* packed_prefix,
+    const int* packed_starts,
+    int logical_edge) {
+    int low = 0;
+    int high = 31;
+#pragma unroll
+    for (int step = 0; step < 5; ++step) {
+        const int middle = (low + high) >> 1;
+        if (packed_prefix[middle] > logical_edge) {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    const int previous_end = low == 0 ? 0 : packed_prefix[low - 1];
+    return packed_starts[low] + logical_edge - previous_end;
+}
+
 template <bool ReturnDense>
 __global__ void persistent_snn_spike_block_kernel(
     const int* __restrict__ event_offsets,
@@ -191,12 +262,26 @@ __global__ void persistent_snn_spike_block_kernel(
 #ifdef ENABLE_BLOCK_HASH
     __shared__ int hash_keys[kWarpsPerBlock][kHashSize];
     __shared__ float hash_values[kWarpsPerBlock][kHashSize];
+    __shared__ unsigned short
+        hash_used_slots[kWarpsPerBlock][kHashSize];
 #else
     __shared__ int hash_keys[1][1];
     __shared__ float hash_values[1][1];
+    __shared__ unsigned short hash_used_slots[1][1];
 #endif
     const float decay = expf(-dt / tau_syn);
     const float reset_delta = v_threshold - v_reset;
+
+#ifdef ENABLE_BLOCK_HASH
+    if constexpr (kHashUsedSlots) {
+        for (int hash_slot = lane;
+             hash_slot < kHashSize;
+             hash_slot += 32) {
+            hash_keys[warp_in_block][hash_slot] = kEmptyHashKey;
+        }
+        __syncwarp();
+    }
+#endif
 
     for (int t = 0; t < t_steps; ++t) {
         if (global_tid == 0) {
@@ -259,8 +344,8 @@ __global__ void persistent_snn_spike_block_kernel(
                         warp_active, inclusive_edges, final_lane);
                     if (lane == 0 && active_edges > 0) {
                         const int logical_task_count =
-                            (active_edges + kBlockEdgeBudget - 1)
-                            / kBlockEdgeBudget;
+                            (active_edges + kBlockTaskSpan - 1)
+                            / kBlockTaskSpan;
                         const int first_task = atomicAdd(
                             task_counts + 1, logical_task_count);
                         const int block_index = n >> 5;
@@ -384,10 +469,250 @@ __global__ void persistent_snn_spike_block_kernel(
 
                 const int total_edges = packed_prefix[warp_in_block][31];
                 const int logical_begin =
-                    logical_segment * kBlockEdgeBudget;
+                    logical_segment * kBlockTaskSpan;
                 const int logical_end = min(
-                    total_edges, logical_begin + kBlockEdgeBudget);
+                    total_edges, logical_begin + kBlockTaskSpan);
                 const int task_edges = logical_end - logical_begin;
+#ifdef ENABLE_BLOCK_HASH
+#ifdef ENABLE_BLOCK_STATS
+                if (lane == 0 && block_stats != nullptr) {
+                    atomicAdd(
+                        block_stats + kV4InputEdgesColumn,
+                        task_edges);
+                }
+#endif
+                bool task_used_hash = false;
+                for (int window_begin = logical_begin;
+                     window_begin < logical_end;
+                     window_begin += kHashAggregation) {
+                    const int window_end = min(
+                        logical_end, window_begin + kHashAggregation);
+                    const int window_edges = window_end - window_begin;
+                    const bool use_hash = window_edges >= kHashMinEdges;
+                    if (!use_hash) {
+                        for (int edge_base = window_begin;
+                             edge_base < window_end;
+                             edge_base += 32) {
+                            const int logical_edge = edge_base + lane;
+                            if (logical_edge < window_end) {
+                                const int edge = map_packed_edge(
+                                    packed_prefix[warp_in_block],
+                                    packed_starts[warp_in_block],
+                                    logical_edge);
+                                atomicAdd(
+                                    psc + b * n_neuron
+                                        + graph_indices[edge],
+                                    graph_weight[edge]);
+                            }
+                        }
+#ifdef ENABLE_BLOCK_STATS
+                        if (lane == 0 && block_stats != nullptr) {
+                            atomicAdd(
+                                block_stats + kV4GlobalAtomicsColumn,
+                                window_edges);
+                        }
+#endif
+                        continue;
+                    }
+
+                    task_used_hash = true;
+                    if constexpr (!kHashUsedSlots) {
+                        for (int hash_slot = lane;
+                             hash_slot < kHashSize;
+                             hash_slot += 32) {
+                            hash_keys[warp_in_block][hash_slot] =
+                                kEmptyHashKey;
+                            hash_values[warp_in_block][hash_slot] = 0.0f;
+                        }
+                        __syncwarp();
+                    }
+                    int used_count = 0;
+
+#ifdef ENABLE_BLOCK_STATS
+                    if (lane == 0 && block_stats != nullptr) {
+                        atomicAdd(
+                            block_stats + kHashWindowsColumn, 1);
+                        atomicAdd(
+                            block_stats + kHashInputEdgesColumn,
+                            window_edges);
+                    }
+#endif
+                    for (int edge_base = window_begin;
+                         edge_base < window_end;
+                         edge_base += 32) {
+                        const int logical_edge = edge_base + lane;
+                        const bool valid = logical_edge < window_end;
+                        int post = 0;
+                        float weight = 0.0f;
+                        if (valid) {
+                            const int edge = map_packed_edge(
+                                packed_prefix[warp_in_block],
+                                packed_starts[warp_in_block],
+                                logical_edge);
+                            post = graph_indices[edge];
+                            weight = graph_weight[edge];
+                        }
+
+                        int destination_slot = -1;
+                        int probe_attempts = 0;
+                        bool claimed_new = false;
+                        if (valid) {
+                            int hash_slot = static_cast<int>(
+                                (static_cast<unsigned>(post)
+                                 * 2654435761u)
+                                & (kHashSize - 1));
+#pragma unroll
+                            for (int probe = 0;
+                                 probe < kHashMaxProbe;
+                                 ++probe) {
+                                ++probe_attempts;
+                                const int old = atomicCAS(
+                                    &hash_keys
+                                        [warp_in_block][hash_slot],
+                                    kEmptyHashKey,
+                                    post);
+                                if (old == kEmptyHashKey
+                                    || old == post) {
+                                    destination_slot = hash_slot;
+                                    claimed_new =
+                                        old == kEmptyHashKey;
+                                    if constexpr (kHashUsedSlots) {
+                                        if (claimed_new) {
+                                            hash_values
+                                                [warp_in_block][hash_slot] =
+                                                0.0f;
+                                        }
+                                    }
+                                    break;
+                                }
+                                hash_slot =
+                                    (hash_slot + 1) & (kHashSize - 1);
+                            }
+                        }
+
+                        if constexpr (kHashUsedSlots) {
+                            const unsigned new_key_mask =
+                                __ballot_sync(
+                                    kFullWarpMask, claimed_new);
+                            if (claimed_new) {
+                                const unsigned lower_lanes =
+                                    lane == 0
+                                    ? 0u
+                                    : (1u << lane) - 1u;
+                                const int used_rank = __popc(
+                                    new_key_mask & lower_lanes);
+                                hash_used_slots
+                                    [warp_in_block]
+                                    [used_count + used_rank] =
+                                    static_cast<unsigned short>(
+                                        destination_slot);
+                            }
+                            used_count += __popc(new_key_mask);
+                        }
+
+                        // Key publication, value initialization, and used-slot
+                        // recording complete before any lane accumulates.
+                        __syncwarp();
+                        if (destination_slot >= 0) {
+                            atomicAdd(
+                                &hash_values
+                                    [warp_in_block][destination_slot],
+                                weight);
+                        } else if (valid) {
+                            atomicAdd(
+                                psc + b * n_neuron + post,
+                                weight);
+                        }
+                        __syncwarp();
+
+#ifdef ENABLE_BLOCK_STATS
+                        const int warp_probe_attempts = __reduce_add_sync(
+                            kFullWarpMask, probe_attempts);
+                        const unsigned fallback_mask = __ballot_sync(
+                            kFullWarpMask,
+                            valid && destination_slot < 0);
+                        if (lane == 0 && block_stats != nullptr) {
+                            atomicAdd(
+                                block_stats + kHashProbeAttemptsColumn,
+                                warp_probe_attempts);
+                            const int fallback_count =
+                                __popc(fallback_mask);
+                            atomicAdd(
+                                block_stats
+                                    + kHashFallbackAtomicsColumn,
+                                fallback_count);
+                            atomicAdd(
+                                block_stats + kV4GlobalAtomicsColumn,
+                                fallback_count);
+                        }
+#endif
+                    }
+
+                    int flush_count = 0;
+                    if constexpr (kHashUsedSlots) {
+                        flush_count = used_count;
+                        for (int used_index = lane;
+                             used_index < used_count;
+                             used_index += 32) {
+                            const int hash_slot = hash_used_slots
+                                [warp_in_block][used_index];
+                            const int post =
+                                hash_keys[warp_in_block][hash_slot];
+                            atomicAdd(
+                                psc + b * n_neuron + post,
+                                hash_values[warp_in_block][hash_slot]);
+                            hash_keys[warp_in_block][hash_slot] =
+                                kEmptyHashKey;
+                        }
+                    } else {
+                        const bool occupied =
+                            hash_keys[warp_in_block][lane]
+                            != kEmptyHashKey;
+                        flush_count = __popc(__ballot_sync(
+                            kFullWarpMask, occupied));
+                        for (int hash_slot = lane;
+                             hash_slot < kHashSize;
+                             hash_slot += 32) {
+                            if (hash_slot >= 32) {
+                                const bool extra_occupied =
+                                    hash_keys
+                                        [warp_in_block][hash_slot]
+                                    != kEmptyHashKey;
+                                flush_count += __popc(__ballot_sync(
+                                    kFullWarpMask, extra_occupied));
+                            }
+                            const int post =
+                                hash_keys[warp_in_block][hash_slot];
+                            if (post != kEmptyHashKey) {
+                                atomicAdd(
+                                    psc + b * n_neuron + post,
+                                    hash_values
+                                        [warp_in_block][hash_slot]);
+                            }
+                        }
+                    }
+#ifdef ENABLE_BLOCK_STATS
+                    if (lane == 0 && block_stats != nullptr) {
+                        atomicAdd(
+                            block_stats + kHashFlushAtomicsColumn,
+                            flush_count);
+                        atomicAdd(
+                            block_stats + kV4GlobalAtomicsColumn,
+                            flush_count);
+                    }
+#endif
+                    __syncwarp();
+                }
+#ifdef ENABLE_BLOCK_STATS
+                if (lane == 0
+                    && task_used_hash
+                    && block_stats != nullptr) {
+                    atomicAdd(block_stats + kHashTasksColumn, 1);
+                }
+#endif
+                __syncwarp();
+                continue;
+#else
                 const bool reduce_task =
                     kTileReduceMode == 1
                     || (kTileReduceMode == 2 && task_edges >= 64);
@@ -490,6 +815,7 @@ __global__ void persistent_snn_spike_block_kernel(
                 }
                 __syncwarp();
                 continue;
+#endif
             }
 
             // Tiny rows stay lane-owned. The remaining medium rows are either
@@ -531,7 +857,7 @@ __global__ void persistent_snn_spike_block_kernel(
                 const bool use_hash =
                     medium_rows >= 2
                     && medium_edges >= kHashMinEdges
-                    && medium_edges <= kHashMaxEdges;
+                    && medium_edges <= kLegacyHashMaxEdges;
 #else
                 constexpr bool use_hash = false;
 #endif

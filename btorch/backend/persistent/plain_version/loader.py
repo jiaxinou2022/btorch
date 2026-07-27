@@ -11,7 +11,9 @@ from shutil import which
 from torch.utils.cpp_extension import load as load_extension
 
 
-_loaded_config: tuple[bool, bool, int, int, int] | None = None
+_loaded_config: tuple[
+    bool, bool, int, int, int, int, int, int, int, int
+] | None = None
 
 
 def _block_v4_config() -> tuple[int, int, int]:
@@ -25,6 +27,25 @@ def _block_v4_config() -> tuple[int, int, int]:
     if tile_reduce not in (0, 1, 2):
         raise ValueError("BTORCH_TILE_REDUCE_MODE has an unsupported value.")
     return block_budget, long_segment, tile_reduce
+
+
+def _block_hash_config() -> tuple[int, int, int, int, int]:
+    aggregation = int(os.environ.get("BTORCH_BLOCK_HASH_AGGREGATION", "512"))
+    capacity = int(os.environ.get("BTORCH_BLOCK_HASH_CAPACITY", "512"))
+    max_probe = int(os.environ.get("BTORCH_BLOCK_HASH_MAX_PROBE", "4"))
+    min_edges = int(os.environ.get("BTORCH_BLOCK_HASH_MIN_EDGES", "256"))
+    used_slots = int(os.environ.get("BTORCH_BLOCK_HASH_USED_SLOTS", "1"))
+    if aggregation not in (128, 256, 512):
+        raise ValueError("BTORCH_BLOCK_HASH_AGGREGATION is unsupported.")
+    if capacity not in (128, 256, 512):
+        raise ValueError("BTORCH_BLOCK_HASH_CAPACITY is unsupported.")
+    if max_probe not in (4, 8, 16):
+        raise ValueError("BTORCH_BLOCK_HASH_MAX_PROBE is unsupported.")
+    if min_edges not in (0, 64, 128, 192, 256):
+        raise ValueError("BTORCH_BLOCK_HASH_MIN_EDGES is unsupported.")
+    if used_slots not in (0, 1):
+        raise ValueError("BTORCH_BLOCK_HASH_USED_SLOTS is unsupported.")
+    return aggregation, capacity, max_probe, min_edges, used_slots
 
 
 def _host_compiler() -> str | None:
@@ -88,12 +109,24 @@ def load(
 
     global _loaded_config
     block_budget, long_segment, tile_reduce = _block_v4_config()
+    (
+        hash_aggregation,
+        hash_capacity,
+        hash_max_probe,
+        hash_min_edges,
+        hash_used_slots,
+    ) = _block_hash_config()
     requested_config = (
         enable_block_stats,
         enable_block_hash,
         block_budget,
         long_segment,
         tile_reduce,
+        hash_aggregation,
+        hash_capacity,
+        hash_max_probe,
+        hash_min_edges,
+        hash_used_slots,
     )
     if (
         _loaded_config is not None
@@ -132,12 +165,27 @@ def load(
             f"r{tile_reduce}",
         ]
     )
+    if enable_block_hash:
+        suffixes.extend(
+            [
+                f"ha{hash_aggregation}",
+                f"hc{hash_capacity}",
+                f"hp{hash_max_probe}",
+                f"hm{hash_min_edges}",
+                f"hu{hash_used_slots}",
+            ]
+        )
     extension_suffix = f"_{'_'.join(suffixes)}"
     cuda_cflags.extend(
         [
             f"-DBTORCH_BLOCK_EDGE_BUDGET={block_budget}",
             f"-DBTORCH_LONG_SEGMENT_SIZE={long_segment}",
             f"-DBTORCH_TILE_REDUCE_MODE={tile_reduce}",
+            f"-DBTORCH_BLOCK_HASH_AGGREGATION={hash_aggregation}",
+            f"-DBTORCH_BLOCK_HASH_CAPACITY={hash_capacity}",
+            f"-DBTORCH_BLOCK_HASH_MAX_PROBE={hash_max_probe}",
+            f"-DBTORCH_BLOCK_HASH_MIN_EDGES={hash_min_edges}",
+            f"-DBTORCH_BLOCK_HASH_USED_SLOTS={hash_used_slots}",
         ]
     )
     if enable_block_stats:

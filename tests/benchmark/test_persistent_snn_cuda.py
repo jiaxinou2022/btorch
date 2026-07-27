@@ -390,10 +390,10 @@ def test_cuda_persistent_reusable_workspace_sums_duplicate_input_events():
 @pytest.mark.parametrize(
     "fanouts",
     [
-        (8, 17),
+        (8, 23),
         (256, 257),
         (255, 256),
-        (2050, 17),
+        (2050, 23),
     ],
 )
 def test_cuda_persistent_fanout_binning_matches_dense_reference(fanouts):
@@ -442,7 +442,7 @@ def test_cuda_persistent_fanout_binning_matches_dense_reference(fanouts):
 @pytest.mark.parametrize(
     "fanouts",
     [
-        (8, 17),
+        (8, 23),
         (255, 254, 253),
         (255, 256),
         (257, 2050),

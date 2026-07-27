@@ -11,7 +11,7 @@ from benchmark.benchmark_rsnn_roofline import summarize_block_stats
 def test_block_stats_summary_derives_requested_metrics():
     indptr = torch.tensor([0, 2, 4, 4, 5] + [5] * 28, dtype=torch.int32)
     indices = torch.tensor([1, 2, 2, 3, 4], dtype=torch.int32)
-    raw = torch.zeros((2, 17), dtype=torch.int32)
+    raw = torch.zeros((2, 23), dtype=torch.int32)
     raw[0, :13] = torch.tensor(
         [2, 4, 1, 4, 2, 4, 1, 1, 0, 0, 0, 0, 0b11]
     )
@@ -41,7 +41,7 @@ def test_block_stats_summary_derives_requested_metrics():
 def test_block_stats_models_the_selective_hash_path():
     indptr = torch.tensor([0, 32, 64] + [64] * 30, dtype=torch.int32)
     indices = torch.tensor(list(range(32)) * 2, dtype=torch.int32)
-    raw = torch.zeros((1, 17), dtype=torch.int32)
+    raw = torch.zeros((1, 23), dtype=torch.int32)
     raw[0, :13] = torch.tensor(
         [2, 64, 1, 64, 32, 64, 0, 1, 0, 0, 0, 0, 0b11]
     )
@@ -54,11 +54,15 @@ def test_block_stats_models_the_selective_hash_path():
     assert summary["hash_merge_count"] == 32
     assert summary["flushed_entries"] == 32
     assert summary["atomic_reduction_ratio"] == 0.5
+    assert summary["aggregation_32_ideal_atomic_reduction"] == 0.0
+    assert summary["aggregation_64_ideal_atomic_reduction"] == 0.5
+    assert summary["aggregation_64_edge_coverage_ratio_ge_1_5"] == 1.0
+    assert summary["aggregation_full_edges_per_unique_p50"] == 2.0
 
 
 def test_empty_block_stats_have_zero_ratios():
     summary = summarize_block_stats(
-        torch.zeros((1, 17), dtype=torch.int32),
+        torch.zeros((1, 23), dtype=torch.int32),
         torch.tensor([0, 0], dtype=torch.int32),
         torch.empty(0, dtype=torch.int32),
     )
@@ -68,13 +72,14 @@ def test_empty_block_stats_have_zero_ratios():
     assert summary["atomic_reduction_ratio"] == 0.0
     assert summary["hash_task_ratio"] == 0.0
     assert summary["v4_atomic_ratio"] == 0.0
+    assert summary["aggregation_256_covered_edges"] == 0
 
 
 def test_block_stats_report_v4_kernel_atomic_counters():
     """The first stats record carries kernel-wide block-v4 counters."""
 
-    raw = torch.zeros((1, 17), dtype=torch.int32)
-    raw[0, 13:] = torch.tensor([128, 80, 1, 128])
+    raw = torch.zeros((1, 23), dtype=torch.int32)
+    raw[0, 13:17] = torch.tensor([128, 80, 1, 128])
 
     summary = summarize_block_stats(
         raw,
@@ -89,10 +94,32 @@ def test_block_stats_report_v4_kernel_atomic_counters():
     assert summary["v4_atomic_ratio"] == 0.625
 
 
+def test_block_stats_report_hash_kernel_counters():
+    """Hash counters distinguish flush atomics from probe fallbacks."""
+
+    raw = torch.zeros((1, 23), dtype=torch.int32)
+    raw[0, 13:] = torch.tensor(
+        [256, 236, 0, 0, 1, 1, 256, 220, 16, 384]
+    )
+
+    summary = summarize_block_stats(
+        raw,
+        torch.tensor([0, 0], dtype=torch.int32),
+        torch.empty(0, dtype=torch.int32),
+        block_hash_enabled=True,
+        block_edge_budget=256,
+    )
+
+    assert summary["kernel_hash_tasks"] == 1
+    assert summary["kernel_hash_atomic_ratio"] == 236 / 256
+    assert summary["kernel_hash_fallback_ratio"] == 16 / 256
+    assert summary["kernel_hash_average_probes"] == 1.5
+
+
 def test_block_stats_model_v4_edge_budget_task_splitting():
     """Logical task statistics should reflect the configured edge cap."""
 
-    raw = torch.zeros((1, 17), dtype=torch.int32)
+    raw = torch.zeros((1, 23), dtype=torch.int32)
     raw[0, :13] = torch.tensor(
         [3, 600, 1, 600, 255, 600, 0, 1, 0, 0, 0, 0, 0b111]
     )

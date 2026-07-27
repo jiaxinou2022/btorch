@@ -18,11 +18,12 @@ performance)::
         benchmark/benchmark_rsnn_roofline.py --dataset mice_column_v1 \
         --spike-block --block-stats --csv block_stats.csv
 
-Enable the experimental selective shared-memory hash in a fresh process::
+Enable the experimental warp-private hash in a fresh process::
 
     micromamba run -n ml-py312 python \
-        benchmark/benchmark_rsnn_roofline.py --dataset mice_column_v1 \
-        --spike-block --block-hash
+        benchmark/benchmark_rsnn_roofline.py --dataset flybrain \
+        --spike-block --block-edge-budget 256 --long-segment-size 512 \
+        --block-hash
 
 Switch to the direct cuSPARSE CUDA Graph baseline::
 
@@ -50,9 +51,9 @@ a version of Nsight Compute that supports whole-graph profiling.
 timesteps and batches. ``active_synapses`` is the sum of the corresponding
 pre-synaptic CSR row degrees. Thus ``active_synapses_per_second`` measures
 useful event-driven fanout work rather than the graph's total stored edges.
-The selective hash path uses 128 slots, at most 8 linear probes, and only
-64--96 medium-row edges. ``hash_tasks`` counts tasks entering that path;
-``hash_overflow_tasks`` is an overlapping warning set.
+The V4 hash path scans aggregation scales, capacities, probe limits, and a
+minimum-window threshold through explicit CLI options. Instrumented builds
+report flush and fallback atomics separately from the production timing.
 """
 
 from __future__ import annotations
@@ -61,10 +62,11 @@ import argparse
 import csv
 import math
 import os
+import subprocess
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -114,7 +116,8 @@ Mode = Literal["benchmark", "ncu"]
 Provider = Literal["persistent", "cusparse_cudagraph"]
 FANOUT_BINNING_THRESHOLD = 256
 LANE_ROW_THRESHOLD = 4
-BLOCK_STATS_COLUMNS = 17
+BLOCK_STATS_COLUMNS = 23
+HASH_AGGREGATION_SCALES = (32, 64, 128, 256, 512)
 HASH_CAPACITY = 128
 HASH_MAX_PROBES = 8
 HASH_MIN_EDGES = 64
@@ -753,6 +756,83 @@ def _simulate_task_hash(posts: list[int]) -> tuple[int, int, int, int]:
     return insert_count, merge_count, collision_count, overflow_count
 
 
+@dataclass
+class _AggregationScaleAccumulator:
+    """Accumulate aggregation bounds without retaining task edge streams."""
+
+    scale: int | None
+    covered_edges: int = 0
+    ideal_atomics: int = 0
+    window_edges: list[int] = field(default_factory=list)
+    ratios: list[float] = field(default_factory=list)
+
+    def update(self, posts: list[int]) -> None:
+        """Add one original spike-block logical edge stream."""
+
+        window_size = len(posts) if self.scale is None else self.scale
+        if window_size == 0:
+            return
+        for begin in range(0, len(posts), window_size):
+            window = posts[begin : begin + window_size]
+            edges = len(window)
+            unique = len(set(window))
+            self.covered_edges += edges
+            self.ideal_atomics += unique
+            self.window_edges.append(edges)
+            self.ratios.append(edges / unique)
+
+    def summarize(self) -> dict[str, float | int]:
+        """Return ideal atomics, quantiles, and edge-weighted coverage."""
+
+        def quantile(q: float) -> float:
+            if not self.ratios:
+                return 0.0
+            return float(
+                torch.quantile(torch.tensor(self.ratios), q).item()
+            )
+
+        result: dict[str, float | int] = {
+            "covered_edges": self.covered_edges,
+            "unique_posts": self.ideal_atomics,
+            "ideal_global_atomics": self.ideal_atomics,
+            "ideal_atomic_reduction": (
+                1.0 - self.ideal_atomics / self.covered_edges
+                if self.covered_edges
+                else 0.0
+            ),
+            "edges_per_unique_p50": quantile(0.50),
+            "edges_per_unique_p90": quantile(0.90),
+            "edges_per_unique_p99": quantile(0.99),
+        }
+        for threshold in (1.1, 1.25, 1.5, 2.0):
+            suffix = str(threshold).replace(".", "_")
+            duplicate_edges = sum(
+                edges
+                for edges, ratio_value in zip(
+                    self.window_edges, self.ratios, strict=True
+                )
+                if ratio_value >= threshold
+            )
+            result[f"edge_coverage_ratio_ge_{suffix}"] = (
+                duplicate_edges / self.covered_edges
+                if self.covered_edges
+                else 0.0
+            )
+        return result
+
+
+def _aggregation_scale_stats(
+    task_posts: list[list[int]],
+    scale: int | None,
+) -> dict[str, float | int]:
+    """Measure the ideal atomic reduction for one aggregation scale."""
+
+    accumulator = _AggregationScaleAccumulator(scale)
+    for posts in task_posts:
+        accumulator.update(posts)
+    return accumulator.summarize()
+
+
 def summarize_block_stats(
     raw_stats: torch.Tensor,
     graph_indptr: torch.Tensor,
@@ -760,6 +840,7 @@ def summarize_block_stats(
     *,
     block_hash_enabled: bool = True,
     block_edge_budget: int = 0,
+    hash_aggregation: int = 256,
 ) -> dict[str, float | int]:
     """Augment macro-collected task records with exact offline post statistics."""
 
@@ -770,14 +851,19 @@ def summarize_block_stats(
     stats = raw_stats.to(device="cpu", dtype=torch.int64)
     active_task_edges = stats[:, 1]
     active_task_edges = active_task_edges[active_task_edges > 0]
-    if block_edge_budget > 0 and active_task_edges.numel():
-        full_task_counts = active_task_edges // block_edge_budget
+    logical_edge_budget = (
+        max(block_edge_budget, hash_aggregation)
+        if block_hash_enabled and block_edge_budget > 0
+        else block_edge_budget
+    )
+    if logical_edge_budget > 0 and active_task_edges.numel():
+        full_task_counts = active_task_edges // logical_edge_budget
         full_edges = torch.full(
             (int(full_task_counts.sum().item()),),
-            block_edge_budget,
+            logical_edge_budget,
             dtype=torch.int64,
         )
-        remainders = active_task_edges % block_edge_budget
+        remainders = active_task_edges % logical_edge_budget
         logical_task_edges = torch.cat(
             [full_edges, remainders[remainders > 0]]
         )
@@ -826,7 +912,25 @@ def summarize_block_stats(
         "v4_global_atomics": int(stats[0, 14].item()) if stats.numel() else 0,
         "v4_reduce_tasks": int(stats[0, 15].item()) if stats.numel() else 0,
         "v4_reduce_edges": int(stats[0, 16].item()) if stats.numel() else 0,
+        "kernel_hash_tasks": int(stats[0, 17].item()) if stats.numel() else 0,
+        "kernel_hash_windows": int(stats[0, 18].item()) if stats.numel() else 0,
+        "kernel_hash_input_edges": (
+            int(stats[0, 19].item()) if stats.numel() else 0
+        ),
+        "kernel_hash_flush_atomics": (
+            int(stats[0, 20].item()) if stats.numel() else 0
+        ),
+        "kernel_hash_fallback_atomics": (
+            int(stats[0, 21].item()) if stats.numel() else 0
+        ),
+        "kernel_hash_probe_attempts": (
+            int(stats[0, 22].item()) if stats.numel() else 0
+        ),
         "logical_block_task_count": int(logical_task_edges.numel()),
+    }
+    aggregation_accumulators = {
+        scale: _AggregationScaleAccumulator(scale)
+        for scale in (*HASH_AGGREGATION_SCALES, None)
     }
     for record in stats:
         active_rows = int(record[0].item())
@@ -857,6 +961,8 @@ def summarize_block_stats(
                     medium_mask |= 1 << lane
                     medium_posts.extend(row_posts)
         unique_posts = len(set(posts))
+        for accumulator in aggregation_accumulators.values():
+            accumulator.update(posts)
         medium_rows = medium_mask.bit_count()
         medium_runs = (medium_mask & ~(medium_mask << 1)).bit_count()
         if medium_rows == 0:
@@ -868,6 +974,7 @@ def summarize_block_stats(
 
         use_hash = (
             block_hash_enabled
+            and block_edge_budget == 0
             and medium_rows >= 2
             and HASH_MIN_EDGES <= len(medium_posts) <= HASH_MAX_EDGES
         )
@@ -934,6 +1041,21 @@ def summarize_block_stats(
             totals["v4_global_atomics"],
             totals["v4_input_edges"],
         ),
+        "kernel_hash_atomic_ratio": ratio(
+            (
+                totals["kernel_hash_flush_atomics"]
+                + totals["kernel_hash_fallback_atomics"]
+            ),
+            totals["kernel_hash_input_edges"],
+        ),
+        "kernel_hash_fallback_ratio": ratio(
+            totals["kernel_hash_fallback_atomics"],
+            totals["kernel_hash_input_edges"],
+        ),
+        "kernel_hash_average_probes": ratio(
+            totals["kernel_hash_probe_attempts"],
+            totals["kernel_hash_input_edges"],
+        ),
         "logical_tasks_per_spike_block": ratio(
             totals["logical_block_task_count"],
             task_count,
@@ -955,7 +1077,17 @@ def summarize_block_stats(
             else 0
         ),
     }
-    return {**totals, **derived}
+    aggregation: dict[str, float | int] = {}
+    for scale, accumulator in aggregation_accumulators.items():
+        label = "full" if scale is None else str(scale)
+        scale_stats = accumulator.summarize()
+        aggregation.update(
+            {
+                f"aggregation_{label}_{key}": value
+                for key, value in scale_stats.items()
+            }
+        )
+    return {**totals, **derived, **aggregation}
 
 
 def benchmark_row(
@@ -1011,6 +1143,21 @@ def benchmark_row(
             "1": "all",
             "2": "hinted",
         }[os.environ.get("BTORCH_TILE_REDUCE_MODE", "0")],
+        "hash_aggregation": int(
+            os.environ.get("BTORCH_BLOCK_HASH_AGGREGATION", "512")
+        ),
+        "hash_capacity": int(
+            os.environ.get("BTORCH_BLOCK_HASH_CAPACITY", "512")
+        ),
+        "hash_max_probes": int(
+            os.environ.get("BTORCH_BLOCK_HASH_MAX_PROBE", "4")
+        ),
+        "hash_min_edges": int(
+            os.environ.get("BTORCH_BLOCK_HASH_MIN_EDGES", "256")
+        ),
+        "hash_used_slots": (
+            os.environ.get("BTORCH_BLOCK_HASH_USED_SLOTS", "1") == "1"
+        ),
         "reorder": workload.permutation.config.mode,
         "reorder_window": workload.permutation.config.local_window_size,
         "reorder_extreme_threshold": (
@@ -1033,9 +1180,6 @@ def benchmark_row(
         "average_fanout": workload.graph.indices.numel() / case.n_neuron,
         "input_event_rate": case.event_rate,
         "lane_row_threshold": LANE_ROW_THRESHOLD if spike_block else "",
-        "hash_capacity": HASH_CAPACITY if spike_block else "",
-        "hash_max_probes": HASH_MAX_PROBES if spike_block else "",
-        "hash_min_edges": HASH_MIN_EDGES if spike_block else "",
         "hash_max_edges": HASH_MAX_EDGES if spike_block else "",
         "active_neurons": active_neurons,
         "unique_active_neurons": unique_active_neurons,
@@ -1065,6 +1209,45 @@ def profile_one_launch(
     run()
     torch.cuda.synchronize()
     torch.cuda.profiler.stop()
+
+
+def wait_for_idle_gpu(
+    consecutive_samples: int,
+    *,
+    utilization_threshold: int = 2,
+    interval_s: float = 0.2,
+    timeout_s: float = 300.0,
+) -> None:
+    """Wait for a sustained idle window immediately before timing."""
+
+    if consecutive_samples <= 0:
+        return
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+    physical_device = visible_devices.split(",", maxsplit=1)[0].strip()
+    deadline = time.monotonic() + timeout_s
+    idle_samples = 0
+    while idle_samples < consecutive_samples:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                f"--id={physical_device}",
+                "--query-gpu=utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        utilization = int(result.stdout.strip())
+        idle_samples = (
+            idle_samples + 1
+            if utilization <= utilization_threshold
+            else 0
+        )
+        if time.monotonic() >= deadline:
+            raise TimeoutError("GPU did not reach a sustained idle window.")
+        if idle_samples < consecutive_samples:
+            time.sleep(interval_s)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1097,7 +1280,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--block-hash",
         action="store_true",
-        help="Compile the experimental selective shared-memory BlockTask hash.",
+        help="Compile the warp-private hash for edge-budget BlockTasks.",
+    )
+    parser.add_argument(
+        "--hash-aggregation",
+        type=int,
+        choices=(128, 256, 512),
+        default=512,
+        help="Maximum logical edges accumulated by one hash window.",
+    )
+    parser.add_argument(
+        "--hash-capacity",
+        type=int,
+        choices=(128, 256, 512),
+        default=512,
+        help="Number of shared-memory slots in each warp-private hash.",
+    )
+    parser.add_argument(
+        "--hash-max-probes",
+        type=int,
+        choices=(4, 8, 16),
+        default=4,
+        help="Maximum linear probes before falling back to a global atomic.",
+    )
+    parser.add_argument(
+        "--hash-min-edges",
+        type=int,
+        choices=(0, 64, 128, 192, 256),
+        default=256,
+        help="Minimum edges in a window before enabling the hash.",
+    )
+    parser.add_argument(
+        "--hash-used-slots",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Flush and clear only slots claimed by the current hash window.",
     )
     parser.add_argument(
         "--block-edge-budget",
@@ -1183,6 +1400,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--c-m", type=float, default=1.0)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=30)
+    parser.add_argument(
+        "--wait-idle-samples",
+        type=int,
+        default=0,
+        help=(
+            "Require consecutive <=2%% GPU-utilization samples immediately "
+            "before timing; samples are 0.2 seconds apart."
+        ),
+    )
     parser.add_argument("--connectome-root", type=Path, default=None)
     parser.add_argument("--skip-correctness", action="store_true")
     parser.add_argument("--csv", type=Path, default=None)
@@ -1195,6 +1421,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--warmup must be between 5 and 20.")
     if args.repeat < 20:
         parser.error("--repeat must be at least 20.")
+    if args.wait_idle_samples < 0:
+        parser.error("--wait-idle-samples must be nonnegative.")
     if args.t_steps <= 0 or args.batch_size <= 0 or args.n_neuron <= 0:
         parser.error("--t-steps, --batch-size, and --n-neuron must be positive.")
     if args.grid_blocks is not None and args.grid_blocks <= 0:
@@ -1223,8 +1451,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--tile-reduce requires --spike-block.")
     if args.tile_reduce != "off" and args.block_edge_budget == 0:
         parser.error("--tile-reduce requires a nonzero --block-edge-budget.")
-    if args.block_hash and args.block_edge_budget:
-        parser.error("--block-hash only applies to the unlimited v3 path.")
+    if args.block_hash and args.block_edge_budget == 0:
+        parser.error("--block-hash requires a nonzero --block-edge-budget.")
+    if args.block_hash and args.tile_reduce != "off":
+        parser.error("--block-hash and --tile-reduce are mutually exclusive.")
     if args.reorder != "identity" and args.provider != "persistent":
         parser.error("--reorder is only valid with --provider persistent.")
     return args
@@ -1244,6 +1474,15 @@ def main() -> None:
         "all": "1",
         "hinted": "2",
     }[args.tile_reduce]
+    os.environ["BTORCH_BLOCK_HASH_AGGREGATION"] = str(
+        args.hash_aggregation
+    )
+    os.environ["BTORCH_BLOCK_HASH_CAPACITY"] = str(args.hash_capacity)
+    os.environ["BTORCH_BLOCK_HASH_MAX_PROBE"] = str(args.hash_max_probes)
+    os.environ["BTORCH_BLOCK_HASH_MIN_EDGES"] = str(args.hash_min_edges)
+    os.environ["BTORCH_BLOCK_HASH_USED_SLOTS"] = (
+        "1" if args.hash_used_slots else "0"
+    )
 
     workload = prepare_workload(args, torch.device("cuda"))
     if args.block_stats or args.block_hash:
@@ -1289,8 +1528,10 @@ def main() -> None:
             workload.graph.indices,
             block_hash_enabled=args.block_hash,
             block_edge_budget=args.block_edge_budget,
+            hash_aggregation=args.hash_aggregation,
         )
 
+    wait_for_idle_gpu(args.wait_idle_samples)
     row = benchmark_row(
         workload,
         run,

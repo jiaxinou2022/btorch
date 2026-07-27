@@ -474,7 +474,7 @@ persistent_snn_forward_cuda_impl(
         ? torch::empty({t_steps * batch_size * n_neuron}, options_i)
         : torch::empty({0}, options_i);
 #ifdef ENABLE_BLOCK_STATS
-    constexpr int kBlockStatsColumns = 17;
+    constexpr int kBlockStatsColumns = 23;
     const int64_t block_stats_records =
         static_cast<int64_t>(t_steps) * batch_size * ((n_neuron + 31) / 32);
     auto overflow = spike_block && return_dense
