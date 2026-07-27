@@ -62,6 +62,7 @@ import csv
 import math
 import os
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -86,6 +87,14 @@ from benchmark.benchmark_rsnn_cudagraph_compare import (  # noqa: E402
     make_torch_csr_weight,
     max_normalized_error,
     resolve_dataset_defaults,
+)
+from btorch.backend.persistent.reorder import (  # noqa: E402
+    NeuronPermutation,
+    ReorderConfig,
+    build_neuron_permutation,
+    reorder_events,
+    reorder_graph,
+    reorder_state,
 )
 from btorch.backend.persistent_snn import (  # noqa: E402
     EventCSRGraph,
@@ -146,6 +155,9 @@ class PreparedWorkload:
     x_seq: torch.Tensor
     high_fanout: torch.Tensor
     workspace: PersistentSNNWorkspace
+    permutation: NeuronPermutation
+    reorder_preprocess_ms: float
+    reorder_stats: dict[str, float | int]
 
 
 def make_fixed_input_sequence(
@@ -247,6 +259,52 @@ def csr_to_event_graph(matrix: CSR) -> EventCSRGraph:
     )
 
 
+def summarize_reordered_graph(
+    original: EventCSRGraph,
+    reordered: EventCSRGraph,
+    *,
+    block_size: int = 32,
+) -> dict[str, float | int]:
+    """Summarize static BlockTask cost balance and structural post reuse."""
+
+    def metrics(graph: EventCSRGraph) -> tuple[float, int, float]:
+        indptr = graph.indptr.cpu().to(torch.int64)
+        indices = graph.indices.cpu().to(torch.int64)
+        block_sums = []
+        block_maxima = []
+        edge_total = 0
+        unique_total = 0
+        for start in range(0, graph.shape[0], block_size):
+            end = min(start + block_size, graph.shape[0])
+            edge_start = int(indptr[start])
+            edge_end = int(indptr[end])
+            degrees = indptr[start + 1 : end + 1] - indptr[start:end]
+            block_sums.append(edge_end - edge_start)
+            block_maxima.append(int(degrees.max()) if degrees.numel() else 0)
+            edge_total += edge_end - edge_start
+            unique_total += int(torch.unique(indices[edge_start:edge_end]).numel())
+        sums = torch.tensor(block_sums, dtype=torch.float64)
+        p99 = (
+            float(torch.quantile(sums, 0.99).item())
+            if sums.numel()
+            else 0.0
+        )
+        maximum = max(block_maxima, default=0)
+        reuse = edge_total / unique_total if unique_total else 0.0
+        return p99, maximum, reuse
+
+    old_p99, old_max, old_reuse = metrics(original)
+    new_p99, new_max, new_reuse = metrics(reordered)
+    return {
+        "static_block_edges_p99_before": old_p99,
+        "static_block_edges_p99_after": new_p99,
+        "static_block_max_fanout_before": old_max,
+        "static_block_max_fanout_after": new_max,
+        "static_edges_per_unique_post_before": old_reuse,
+        "static_edges_per_unique_post_after": new_reuse,
+    }
+
+
 def prepare_workload(
     args: argparse.Namespace, device: torch.device
 ) -> PreparedWorkload:
@@ -297,18 +355,47 @@ def prepare_workload(
         )
 
     x_seq = make_fixed_input_sequence(provisional, device)
-    graph = csr_to_event_graph(matrix)
+    original_graph = csr_to_event_graph(matrix)
+    original_events = dense_to_windowed_events(x_seq)
+    original_state = make_empty_state(
+        provisional.batch_size,
+        provisional.n_neuron,
+        device=device,
+        refractory=False,
+    )
+    reorder_config = ReorderConfig(
+        mode=args.reorder,
+        local_window_size=args.reorder_window,
+        extreme_fanout_threshold=args.reorder_extreme_threshold,
+    )
+    torch.cuda.synchronize()
+    preprocess_start = time.perf_counter()
+    permutation = build_neuron_permutation(original_graph, reorder_config)
+    if args.reorder == "identity":
+        graph = original_graph
+        events = original_events
+        state = original_state
+    else:
+        graph = reorder_graph(original_graph, permutation)
+        events = reorder_events(original_events, permutation)
+        state = reorder_state(original_state, permutation)
+    torch.cuda.synchronize()
+    reorder_preprocess_ms = (time.perf_counter() - preprocess_start) * 1000.0
+    reorder_stats = summarize_reordered_graph(original_graph, graph)
+    if args.reorder != "identity":
+        matrix = CSR(
+            graph.indptr.to(torch.long),
+            graph.indices.to(torch.long),
+            graph.weight,
+            graph.shape,
+        )
+        x_seq = x_seq.index_select(-1, permutation.new_to_old)
     return PreparedWorkload(
         case=provisional,
         matrix=matrix,
-        events=dense_to_windowed_events(x_seq),
+        events=events,
         graph=graph,
-        state=make_empty_state(
-            provisional.batch_size,
-            provisional.n_neuron,
-            device=device,
-            refractory=False,
-        ),
+        state=state,
         params=PersistentSNNParams(
             dt=provisional.dt,
             tau_mem=provisional.tau_mem,
@@ -331,6 +418,9 @@ def prepare_workload(
             graph,
             provisional.batch_size,
         ),
+        permutation=permutation,
+        reorder_preprocess_ms=reorder_preprocess_ms,
+        reorder_stats=reorder_stats,
     )
 
 
@@ -576,6 +666,52 @@ def cuda_event_median_ms(
     return float(samples.median().item())
 
 
+def cuda_reorder_io_ms(
+    workload: PreparedWorkload,
+    output: ProviderOutput,
+    *,
+    repeat: int = 30,
+) -> tuple[float, float]:
+    """Measure per-window dynamic input permutation and output restoration."""
+
+    if workload.permutation.config.mode == "identity":
+        return 0.0, 0.0
+
+    def measure(operation: Callable[[], None]) -> float:
+        for _ in range(5):
+            operation()
+        torch.cuda.synchronize()
+        starts = [torch.cuda.Event(enable_timing=True) for _ in range(repeat)]
+        ends = [torch.cuda.Event(enable_timing=True) for _ in range(repeat)]
+        for start, end in zip(starts, ends, strict=True):
+            start.record()
+            operation()
+            end.record()
+        torch.cuda.synchronize()
+        samples = torch.tensor(
+            [
+                start.elapsed_time(end)
+                for start, end in zip(starts, ends, strict=True)
+            ],
+            dtype=torch.float64,
+        )
+        return float(samples.median().item())
+
+    def permute_input() -> None:
+        workload.permutation.old_to_new[
+            workload.events.indices.to(torch.int64)
+        ]
+        workload.state.v.index_select(-1, workload.permutation.new_to_old)
+        workload.state.psc.index_select(-1, workload.permutation.new_to_old)
+
+    def restore_output_tensors() -> None:
+        output[0].index_select(-1, workload.permutation.old_to_new)
+        output[1].index_select(-1, workload.permutation.old_to_new)
+        output[2].index_select(-1, workload.permutation.old_to_new)
+
+    return measure(permute_input), measure(restore_output_tensors)
+
+
 def activity_counts(
     workload: PreparedWorkload,
     run: Callable[[], ProviderOutput],
@@ -777,6 +913,11 @@ def benchmark_row(
     """Run the benchmark and return one flat, CSV-friendly result record."""
 
     latency_ms = cuda_event_median_ms(run, warmup, repeat)
+    sample_output = run()
+    input_permutation_ms, output_restore_ms = cuda_reorder_io_ms(
+        workload,
+        sample_output,
+    )
     active_neurons, unique_active_neurons, active_synapses = activity_counts(
         workload, run
     )
@@ -799,6 +940,17 @@ def benchmark_row(
         "spike_block": spike_block,
         "block_hash": block_hash,
         "block_stats": block_stats is not None,
+        "reorder": workload.permutation.config.mode,
+        "reorder_window": workload.permutation.config.local_window_size,
+        "reorder_extreme_threshold": (
+            workload.permutation.config.extreme_fanout_threshold
+        ),
+        "reorder_preprocess_ms": workload.reorder_preprocess_ms,
+        "input_permutation_ms": input_permutation_ms,
+        "output_restore_ms": output_restore_ms,
+        "end_to_end_time_ms": (
+            latency_ms + input_permutation_ms + output_restore_ms
+        ),
         "grid_blocks": os.environ.get("BTORCH_PERSISTENT_GRID_BLOCKS", "auto"),
         "timing_mode": "instrumented_debug" if block_stats is not None else "normal",
         "total_time_ms": latency_ms,
@@ -826,6 +978,7 @@ def benchmark_row(
         row.update(correctness)
     if block_stats is not None:
         row.update(block_stats)
+    row.update(workload.reorder_stats)
     return row
 
 
@@ -874,6 +1027,37 @@ def parse_args() -> argparse.Namespace:
         "--block-hash",
         action="store_true",
         help="Compile the experimental selective shared-memory BlockTask hash.",
+    )
+    parser.add_argument(
+        "--reorder",
+        choices=(
+            "identity",
+            "global_cost_similar",
+            "global_cost_bucket",
+            "global_cost_balanced",
+            "local_cost_similar",
+            "local_cost_bucket",
+            "global_similarity",
+            "global_cost_similarity",
+            "global_similarity_cost",
+            "local_similarity",
+            "local_cost_similarity",
+            "local_similarity_cost",
+        ),
+        default="identity",
+        help="Physically reorder neurons and CSR before persistent execution.",
+    )
+    parser.add_argument(
+        "--reorder-window",
+        type=int,
+        default=256,
+        help="Neuron window size used by local reorder strategies.",
+    )
+    parser.add_argument(
+        "--reorder-extreme-threshold",
+        type=int,
+        default=256,
+        help="Fanout at which rows sort after ordinary rows.",
     )
     parser.add_argument("--mode", choices=("benchmark", "ncu"), default="benchmark")
     parser.add_argument(
@@ -924,6 +1108,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--t-steps, --batch-size, and --n-neuron must be positive.")
     if args.grid_blocks is not None and args.grid_blocks <= 0:
         parser.error("--grid-blocks must be positive.")
+    if args.reorder_window <= 0:
+        parser.error("--reorder-window must be positive.")
+    if args.reorder_extreme_threshold <= 0:
+        parser.error("--reorder-extreme-threshold must be positive.")
     if not 0.0 <= args.event_rate <= 1.0:
         parser.error("--event-rate must be in [0, 1].")
     if args.fanout_binning and args.provider != "persistent":
@@ -936,6 +1124,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--block-stats requires --spike-block.")
     if args.block_hash and not args.spike_block:
         parser.error("--block-hash requires --spike-block.")
+    if args.reorder != "identity" and args.provider != "persistent":
+        parser.error("--reorder is only valid with --provider persistent.")
     return args
 
 

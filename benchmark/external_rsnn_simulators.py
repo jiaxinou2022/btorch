@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,20 @@ from btorch.sparse import CSR
 
 
 ExternalProvider = Literal["genn", "brian2cuda"]
+MAX_ERROR_LOG_CHARS = 16_000
+DEFAULT_PROVIDER_OPTIONS: dict[ExternalProvider, dict[str, object]] = {
+    "genn": {
+        "optimize_code": True,
+    },
+    "brian2cuda": {
+        "sm_multiplier": 1,
+        "parallel_blocks": 1,
+        "calc_occupancy": True,
+        "extra_threshold_kernel": True,
+        "launch_bounds": False,
+        "syn_launch_bounds": False,
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -39,6 +54,22 @@ class ExternalResult:
     framework_version: str
     build_time_s: float
     timing_method: str
+
+
+def _summarize_log(output: str, max_chars: int = MAX_ERROR_LOG_CHARS) -> str:
+    """Bound compiler diagnostics while retaining their beginning and end."""
+
+    output = output.strip()
+    if len(output) <= max_chars:
+        return output
+    head_chars = max_chars // 4
+    tail_chars = max_chars - head_chars
+    omitted = len(output) - max_chars
+    return (
+        output[:head_chars]
+        + f"\n... {omitted} log characters omitted ...\n"
+        + output[-tail_chars:]
+    )
 
 
 def _source_indices(indptr: np.ndarray) -> np.ndarray:
@@ -60,6 +91,8 @@ def run_external_provider(
     repeat: int,
     check_correctness: bool,
     build_root: Path | None,
+    timeout_s: float = 1800.0,
+    provider_options: dict[str, object] | None = None,
 ) -> ExternalResult:
     """Run one code-generating framework in an isolated process."""
 
@@ -67,6 +100,7 @@ def run_external_provider(
         raise ValueError(f"Unsupported external provider: {provider}")
 
     retained = build_root is not None
+    preserve_work = retained
     if build_root is not None:
         build_root.mkdir(parents=True, exist_ok=True)
     work = Path(
@@ -85,12 +119,17 @@ def run_external_provider(
             indices=matrix.indices.detach().cpu().numpy(),
             values=values.detach().cpu().numpy(),
         )
+        options = {
+            **DEFAULT_PROVIDER_OPTIONS[provider],
+            **(provider_options or {}),
+        }
         request = {
             "provider": provider,
             "case": asdict(case),
             "warmup": warmup,
             "repeat": repeat,
             "check_correctness": check_correctness,
+            "provider_options": options,
             "work": str(work),
         }
         (work / "request.json").write_text(json.dumps(request))
@@ -107,20 +146,59 @@ def run_external_provider(
                 environment["CUDA_PATH"] = str(
                     Path(nvcc).resolve().parents[1]
                 )
-        process = subprocess.run(
-            command,
-            cwd=Path(__file__).resolve().parents[1],
-            env=environment,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        stdout_path = work / "worker.stdout.log"
+        stderr_path = work / "worker.stderr.log"
+        status_path = work / "worker_status.jsonl"
+        start = time.monotonic()
+        last_status = ""
+        with (
+            stdout_path.open("w") as stdout_file,
+            stderr_path.open("w") as stderr_file,
+        ):
+            process = subprocess.Popen(
+                command,
+                cwd=Path(__file__).resolve().parents[1],
+                env=environment,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                text=True,
+                start_new_session=True,
+            )
+            while process.poll() is None:
+                if status_path.exists():
+                    lines = status_path.read_text().splitlines()
+                    if lines:
+                        status = json.loads(lines[-1])
+                        phase = str(status["phase"])
+                        if phase != last_status:
+                            print(
+                                f"[external] provider={provider} "
+                                f"phase={phase}",
+                                flush=True,
+                            )
+                            last_status = phase
+                if time.monotonic() - start > timeout_s:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    try:
+                        process.wait(timeout=5.0)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait()
+                    preserve_work = True
+                    raise TimeoutError(
+                        f"{provider} worker exceeded {timeout_s:g}s; "
+                        f"last phase={last_status or 'worker_starting'}; "
+                        f"logs retained at {work}"
+                    )
+                time.sleep(0.25)
+        stdout = stdout_path.read_text()
+        stderr = stderr_path.read_text()
         if process.returncode != 0:
             detail = "\n".join(
                 output
                 for output in (
-                    process.stdout.strip(),
-                    process.stderr.strip(),
+                    _summarize_log(stdout),
+                    _summarize_log(stderr),
                 )
                 if output
             )
@@ -148,8 +226,20 @@ def run_external_provider(
             timing_method=str(metadata["timing_method"]),
         )
     finally:
-        if not retained:
+        if not preserve_work:
             shutil.rmtree(work, ignore_errors=True)
+
+
+def _record_phase(work: Path, phase: str) -> None:
+    """Append a flushed worker phase record for parent-side diagnostics."""
+
+    record = {
+        "time": time.time(),
+        "phase": phase,
+        "pid": os.getpid(),
+    }
+    with (work / "worker_status.jsonl").open("a") as file:
+        file.write(json.dumps(record) + "\n")
 
 
 def _patch_brian_timer(project: Path) -> None:
@@ -201,6 +291,7 @@ def _make_brian_network(
     project: Path,
     *,
     record: bool,
+    options: dict[str, object],
 ):
     """Generate and compile one single-precision Brian2CUDA network."""
 
@@ -211,8 +302,26 @@ def _make_brian_network(
     b2.device.reinit()
     b2.set_device("cuda_standalone", build_on_run=False)
     b2.prefs.core.default_float_dtype = np.float32
-    b2.prefs.devices.cuda_standalone.calc_occupancy = True
+    b2.prefs.devices.cuda_standalone.calc_occupancy = bool(
+        options["calc_occupancy"]
+    )
     b2.prefs.devices.cuda_standalone.use_atomics = True
+    b2.prefs.devices.cuda_standalone.SM_multiplier = int(
+        options["sm_multiplier"]
+    )
+    parallel_blocks = int(options["parallel_blocks"])
+    b2.prefs.devices.cuda_standalone.parallel_blocks = (
+        None if parallel_blocks == 0 else parallel_blocks
+    )
+    b2.prefs.devices.cuda_standalone.extra_threshold_kernel = bool(
+        options["extra_threshold_kernel"]
+    )
+    b2.prefs.devices.cuda_standalone.launch_bounds = bool(
+        options["launch_bounds"]
+    )
+    b2.prefs.devices.cuda_standalone.syn_launch_bounds = bool(
+        options["syn_launch_bounds"]
+    )
     b2.defaultclock.dt = case.dt * b2.ms
 
     flat_input = np.asarray(arrays["x"], dtype=np.float32).reshape(
@@ -273,6 +382,7 @@ def _make_brian_network(
         profile=False,
         namespace={"stimulus": stimulus},
     )
+    _record_phase(project.parent, f"{project.name}_code_generation")
     b2.device.build(
         directory=str(project),
         compile=False,
@@ -280,7 +390,9 @@ def _make_brian_network(
         with_output=False,
     )
     _patch_brian_timer(project)
+    _record_phase(project.parent, f"{project.name}_compilation")
     _compile_brian_project(project)
+    _record_phase(project.parent, f"{project.name}_build_complete")
     return b2, neurons, monitor
 
 
@@ -293,10 +405,19 @@ def _run_brian_project(
 ) -> list[float]:
     """Run a compiled project repeatedly and read synchronized run times."""
 
-    for _ in range(warmup):
+    work = project.parent
+    for index in range(warmup):
+        _record_phase(
+            work,
+            f"brian2cuda_warmup_{index + 1}_of_{warmup}",
+        )
         b2.device.run(directory=str(project), with_output=False)
     samples = []
-    for _ in range(repeat):
+    for index in range(repeat):
+        _record_phase(
+            work,
+            f"brian2cuda_timing_{index + 1}_of_{repeat}",
+        )
         b2.device.run(directory=str(project), with_output=False)
         samples.append(float(b2.device._last_run_time) * 1e3)
     return samples
@@ -306,6 +427,7 @@ def _brian_correctness(
     arrays: dict[str, np.ndarray],
     case: BenchCase,
     project: Path,
+    options: dict[str, object],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Build a recorded Brian2CUDA run and return its trace and final state."""
 
@@ -314,8 +436,10 @@ def _brian_correctness(
         case,
         project,
         record=True,
+        options=options,
     )
     assert monitor is not None
+    _record_phase(project.parent, "brian2cuda_correctness_run")
     b2.device.run(directory=str(project), with_output=False)
     spikes = np.zeros(
         (case.t_steps, case.batch_size, case.n_neuron),
@@ -346,14 +470,18 @@ def _run_brian2cuda(request: dict, arrays: dict[str, np.ndarray]) -> dict:
 
     case = BenchCase(**request["case"])
     work = Path(request["work"])
+    options = request["provider_options"]
+    _record_phase(work, "brian2cuda_performance_build")
     build_start = time.perf_counter()
     b2, _, _ = _make_brian_network(
         arrays,
         case,
         work / "brian2cuda_performance",
         record=False,
+        options=options,
     )
     build_time = time.perf_counter() - build_start
+    _record_phase(work, "brian2cuda_warmup_and_timing")
     samples = _run_brian_project(
         b2,
         work / "brian2cuda_performance",
@@ -361,11 +489,13 @@ def _run_brian2cuda(request: dict, arrays: dict[str, np.ndarray]) -> dict:
         repeat=request["repeat"],
     )
     if request["check_correctness"]:
+        _record_phase(work, "brian2cuda_correctness_build")
         build_start = time.perf_counter()
         result = _brian_correctness(
             arrays,
             case,
             work / "brian2cuda_correctness",
+            options,
         )
         build_time += time.perf_counter() - build_start
         np.savez(work / "correctness.npz", spikes=result[0], v=result[1], psc=result[2])
@@ -376,7 +506,15 @@ def _run_brian2cuda(request: dict, arrays: dict[str, np.ndarray]) -> dict:
             f"Brian2 {brian2.__version__}"
         ),
         "build_time_s": build_time,
-        "timing_method": "standalone_wall_cuda_device_synchronize",
+        "timing_method": (
+            "standalone_wall_cuda_device_synchronize"
+            f";sm_multiplier={options['sm_multiplier']}"
+            f";parallel_blocks={options['parallel_blocks']}"
+            f";calc_occupancy={options['calc_occupancy']}"
+            f";extra_threshold_kernel={options['extra_threshold_kernel']}"
+            f";launch_bounds={options['launch_bounds']}"
+            f";syn_launch_bounds={options['syn_launch_bounds']}"
+        ),
     }
 
 
@@ -386,11 +524,13 @@ def _create_genn_model(
     project: Path,
     *,
     record: bool,
+    options: dict[str, object],
 ):
     """Build and load a batched sparse PyGeNN model."""
 
     from pygenn import (
         GeNNModel,
+        ParallelismHint,
         create_neuron_model,
         init_postsynaptic,
         init_weight_update,
@@ -426,9 +566,21 @@ def _create_genn_model(
             else "V -= reset_delta;"
         ),
     )
-    model = GeNNModel("float", f"btorch_rsnn_{'record' if record else 'perf'}")
+    # Require the CUDA backend explicitly. PyGeNN CPU-only distributions
+    # otherwise silently select SingleThreadedCPU for batch size one, which
+    # makes whole-connectome runs look like a hung GPU subprocess.
+    model = GeNNModel(
+        "float",
+        f"btorch_rsnn_{'record' if record else 'perf'}",
+        backend="cuda",
+        optimize_code=bool(options["optimize_code"]),
+    )
     model.dt = case.dt
     model.batch_size = case.batch_size
+    # Use GeNN's own CUDA events. PyTorch and GeNN own different CUDA
+    # runtimes in this worker, so torch.cuda.synchronize() is not a valid
+    # completion barrier for GeNN kernels.
+    model.timing_enabled = True
     pop = model.add_neuron_population(
         "neurons",
         case.n_neuron,
@@ -462,26 +614,46 @@ def _create_genn_model(
         _source_indices(arrays["indptr"]).astype(np.uint32),
         np.asarray(arrays["indices"], dtype=np.uint32),
     )
+    # FlyWire has a heavy-tailed out-degree distribution. GeNN's default
+    # postsynaptic parallelism sizes every sparse row to the global maximum
+    # out-degree, wasting almost all threads for this graph. Presynaptic
+    # parallelism assigns one thread to each spiking source and walks only
+    # that source's actual row.
+    synapses.parallelism_hint = ParallelismHint.PRESYNAPTIC
     pop.spike_recording_enabled = record
     build_start = time.perf_counter()
+    _record_phase(project.parent, f"{project.name}_code_generation_and_build")
     model.build(path_to_model=str(project))
     build_time = time.perf_counter() - build_start
+    _record_phase(project.parent, f"{project.name}_load")
     if record:
         model.load(num_recording_timesteps=case.t_steps)
     else:
         model.load()
+    _record_phase(project.parent, f"{project.name}_ready")
     return model, pop, build_time
 
 
 def _genn_simulate(model, case: BenchCase) -> float:
-    """Run one GeNN window and return synchronized elapsed milliseconds."""
+    """Run one GeNN window and return native CUDA kernel time."""
 
-    torch.cuda.synchronize()
-    start = time.perf_counter()
+    start = (
+        model.neuron_update_time
+        + model.presynaptic_update_time
+        + model.postsynaptic_update_time
+        + model.synapse_dynamics_time
+    )
     for _ in range(case.t_steps):
         model.step_time()
-    torch.cuda.synchronize()
-    return (time.perf_counter() - start) * 1e3
+    # Reading GeNN's counters synchronizes its own runtime. A
+    # torch.cuda.synchronize() would only synchronize PyTorch's context.
+    end = (
+        model.neuron_update_time
+        + model.presynaptic_update_time
+        + model.postsynaptic_update_time
+        + model.synapse_dynamics_time
+    )
+    return (end - start) * 1e3
 
 
 def _run_genn(request: dict, arrays: dict[str, np.ndarray]) -> dict:
@@ -491,15 +663,30 @@ def _run_genn(request: dict, arrays: dict[str, np.ndarray]) -> dict:
 
     case = BenchCase(**request["case"])
     work = Path(request["work"])
+    options = request["provider_options"]
+    _record_phase(work, "genn_performance_build")
     model, _, build_time = _create_genn_model(
         arrays,
         case,
         work / "genn_performance",
         record=False,
+        options=options,
     )
     samples = []
     try:
+        _record_phase(work, "genn_warmup_and_timing")
         for index in range(request["warmup"] + request["repeat"]):
+            if index < request["warmup"]:
+                phase = (
+                    f"genn_warmup_{index + 1}_of_"
+                    f"{request['warmup']}"
+                )
+            else:
+                phase = (
+                    f"genn_timing_{index - request['warmup'] + 1}_of_"
+                    f"{request['repeat']}"
+                )
+            _record_phase(work, phase)
             if index:
                 model.unload()
                 model.load()
@@ -510,11 +697,13 @@ def _run_genn(request: dict, arrays: dict[str, np.ndarray]) -> dict:
         model.unload()
 
     if request["check_correctness"]:
+        _record_phase(work, "genn_correctness_build")
         recorded, pop, correctness_build = _create_genn_model(
             arrays,
             case,
             work / "genn_correctness",
             record=True,
+            options=options,
         )
         build_time += correctness_build
         try:
@@ -568,7 +757,11 @@ def _run_genn(request: dict, arrays: dict[str, np.ndarray]) -> dict:
         "latency_samples_ms": samples,
         "framework_version": f"PyGeNN {getattr(pygenn, '__version__', 'unknown')}",
         "build_time_s": build_time,
-        "timing_method": "host_wall_torch_cuda_device_synchronize",
+        "timing_method": (
+            "genn_native_cuda_event_kernel_sum"
+            ";sparse_parallelism=presynaptic"
+            f";optimize_code={options['optimize_code']}"
+        ),
     }
 
 
@@ -576,15 +769,20 @@ def _worker(request_path: Path) -> None:
     """Run an external framework worker and write machine-readable results."""
 
     request = json.loads(request_path.read_text())
-    loaded = np.load(Path(request["work"]) / "case.npz")
+    work = Path(request["work"])
+    _record_phase(work, "worker_loading_case")
+    loaded = np.load(work / "case.npz")
     arrays = {name: loaded[name] for name in loaded.files}
+    _record_phase(work, "worker_dispatch")
     if request["provider"] == "brian2cuda":
         result = _run_brian2cuda(request, arrays)
     elif request["provider"] == "genn":
         result = _run_genn(request, arrays)
     else:
         raise ValueError(request["provider"])
-    (Path(request["work"]) / "result.json").write_text(json.dumps(result))
+    _record_phase(work, "worker_writing_result")
+    (work / "result.json").write_text(json.dumps(result))
+    _record_phase(work, "worker_complete")
 
 
 if __name__ == "__main__":

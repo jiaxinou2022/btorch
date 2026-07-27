@@ -23,14 +23,18 @@ from benchmark.benchmark_rsnn_cudagraph_compare import (
     PROVIDERS,
     DirectCuSparseProvider,
     correctness_metrics,
+    latency_summary,
     load_flybrain_csr,
     make_eager_runner,
     make_torch_csr_weight,
+    median_ms,
     resolve_dataset_defaults,
 )
 from benchmark.external_rsnn_simulators import (
+    _genn_simulate,
     _patch_brian_timer,
     _source_indices,
+    _summarize_log,
 )
 from btorch.sparse import CSR
 
@@ -88,6 +92,26 @@ def test_standard_dense_and_csr_rsnn_baselines_are_equivalent():
     torch.testing.assert_close(dense.spikes, sparse.spikes, atol=0, rtol=0)
     torch.testing.assert_close(dense.v, sparse.v, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(dense.psc, sparse.psc, atol=1e-6, rtol=1e-6)
+
+
+def test_latency_median_averages_two_middle_samples():
+    """Even-sized benchmark samples should use the statistical median."""
+
+    assert median_ms([10.0, 1.0, 4.0, 2.0]) == pytest.approx(3.0)
+
+
+def test_latency_summary_reports_sample_standard_deviation():
+    """CSV summaries should retain conventional sample statistics."""
+
+    summary = latency_summary([1.0, 2.0, 3.0])
+
+    assert summary == {
+        "sample_count": 3,
+        "latency_mean_ms": pytest.approx(2.0),
+        "latency_std_ms": pytest.approx(1.0),
+        "latency_min_ms": pytest.approx(1.0),
+        "latency_max_ms": pytest.approx(3.0),
+    }
 
 
 def test_default_providers_include_external_simulator_comparisons():
@@ -184,6 +208,33 @@ def test_flybrain_is_the_default_dataset(monkeypatch):
     assert roofline_args.weight_scale == pytest.approx(0.275)
 
 
+def test_external_framework_tuning_options_are_explicit(monkeypatch):
+    """Framework tuning choices should be reproducible from the CLI."""
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            comparison.__file__,
+            "--no-genn-optimize-code",
+            "--brian2cuda-sm-multiplier",
+            "2",
+            "--brian2cuda-parallel-blocks",
+            "0",
+            "--no-brian2cuda-calc-occupancy",
+            "--brian2cuda-syn-launch-bounds",
+        ],
+    )
+
+    args = comparison.parse_args()
+
+    assert not args.genn_optimize_code
+    assert args.brian2cuda_sm_multiplier == 2
+    assert args.brian2cuda_parallel_blocks == 0
+    assert not args.brian2cuda_calc_occupancy
+    assert args.brian2cuda_syn_launch_bounds
+
+
 def test_dataset_specific_weight_scale_defaults():
     """Dataset defaults should preserve legacy mouse and uniform behavior."""
 
@@ -228,6 +279,50 @@ def test_brian_timer_patch_synchronizes_both_interval_boundaries(tmp_path: Path)
     assert patched.count("CUDA_SAFE_CALL(cudaDeviceSynchronize());") == 2
     assert patched.index("cudaDeviceSynchronize") < patched.index("start =")
     assert patched.rindex("cudaDeviceSynchronize") < patched.index("current =")
+
+
+def test_external_error_log_summary_is_bounded_and_keeps_both_ends():
+    """Large compiler failures should not flood or stall benchmark output."""
+
+    output = "diagnostic-start\n" + ("x" * 100_000) + "\ndiagnostic-end"
+
+    summary = _summarize_log(output, max_chars=1_000)
+
+    assert "diagnostic-start" in summary
+    assert "diagnostic-end" in summary
+    assert "omitted" in summary
+    assert len(summary) < 1_100
+
+
+def test_genn_timing_uses_native_accumulated_cuda_events():
+    """GeNN timing should use its runtime's events rather than PyTorch CUDA.
+
+    GeNN loads a separate CUDA runtime inside its worker. This fake model
+    checks that a sample is the delta of all four documented kernel timers,
+    which also provides the required GeNN-side completion barrier.
+    """
+
+    class FakeGeNNModel:
+        neuron_update_time = 0.0
+        presynaptic_update_time = 0.0
+        postsynaptic_update_time = 0.0
+        synapse_dynamics_time = 0.0
+
+        def step_time(self):
+            self.neuron_update_time += 1e-3
+            self.presynaptic_update_time += 2e-3
+            self.postsynaptic_update_time += 3e-3
+            self.synapse_dynamics_time += 4e-3
+
+    case = BenchCase(
+        n_neuron=4,
+        batch_size=1,
+        t_steps=5,
+        fanout=1,
+        event_rate=0.1,
+    )
+
+    assert _genn_simulate(FakeGeNNModel(), case) == pytest.approx(50.0)
 
 
 def test_correctness_accepts_small_relative_error_on_large_states():

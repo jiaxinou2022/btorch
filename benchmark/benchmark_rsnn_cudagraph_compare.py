@@ -26,8 +26,10 @@ persistent workspace allocation are outside timing. The direct provider uses
 ``CUSPARSE_SPMM_CSR_ALG1`` otherwise. GeNN and Brian2CUDA run in isolated
 processes so each framework owns a clean CUDA context. Their device-synchronised
 steady-state samples exclude process startup, compilation, initialisation, and
-host/device result transfer. Framework versions, build time, timing method,
-and every raw latency sample are written to the CSV.
+host/device result transfer. GeNN uses its native CUDA-event kernel timers and
+presynaptic sparse parallelism, which avoids pathological empty-lane work on
+the heavy-tailed FlyWire out-degree distribution. Framework versions, build
+time, timing method, and every raw latency sample are written to the CSV.
 
 FlyBrain (FlyWire v783) is the default dataset. Its signed synapse counts are
 scaled by ``--weight-scale``. Dense providers are opt-in for FlyBrain because
@@ -44,7 +46,9 @@ To retain generated sources for artifact review, pass
 ``--external-build-root benchmark/generated``. The external providers are
 optional: ``genn`` requires PyGeNN 5 and ``brian2cuda`` requires Brian2CUDA;
 an unavailable framework is emitted as an error row without stopping the
-remaining comparison.
+remaining comparison. Framework optimization flags are exposed as
+``--genn-*`` and ``--brian2cuda-*`` options and serialized into each external
+provider's ``timing_method`` field for reproducibility.
 """
 
 from __future__ import annotations
@@ -52,6 +56,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import statistics
 import sys
 from pathlib import Path
 from typing import Literal
@@ -580,9 +585,33 @@ def time_samples_ms(fn, *, warmup: int, repeat: int) -> list[float]:
 
 
 def median_ms(samples: list[float]) -> float:
-    """Return the median of non-empty latency samples."""
+    """Return the conventional median of non-empty latency samples."""
 
-    return float(torch.tensor(samples, dtype=torch.float64).median().item())
+    return float(statistics.median(samples))
+
+
+def latency_summary(samples: list[float]) -> dict[str, float | int]:
+    """Summarize raw latency samples with auditable standard statistics."""
+
+    if not samples:
+        return {
+            "sample_count": 0,
+            "latency_mean_ms": float("nan"),
+            "latency_std_ms": float("nan"),
+            "latency_min_ms": float("nan"),
+            "latency_max_ms": float("nan"),
+        }
+    return {
+        "sample_count": len(samples),
+        "latency_mean_ms": float(statistics.mean(samples)),
+        "latency_std_ms": (
+            float(statistics.stdev(samples))
+            if len(samples) > 1
+            else float("nan")
+        ),
+        "latency_min_ms": float(min(samples)),
+        "latency_max_ms": float(max(samples)),
+    }
 
 
 def time_ms(fn, *, warmup: int, repeat: int) -> float:
@@ -662,6 +691,8 @@ def bench_case(
     direct_cusparse_provider: DirectCuSparseProvider,
     persistent_provider: PersistentProvider,
     external_build_root: Path | None = None,
+    external_timeout: float = 1800.0,
+    external_provider_options: dict[str, dict[str, object]] | None = None,
     warmup: int,
     repeat: int,
     check_correctness: bool,
@@ -700,6 +731,10 @@ def bench_case(
                     repeat=repeat,
                     check_correctness=check_correctness,
                     build_root=external_build_root,
+                    timeout_s=external_timeout,
+                    provider_options=(
+                        (external_provider_options or {}).get(provider)
+                    ),
                 )
                 result = external.result
                 samples = external.latency_samples_ms
@@ -784,6 +819,7 @@ def bench_case(
                 "build_time_s": build_time_s,
                 "timing_method": timing_method,
                 "latency_samples_ms": ";".join(f"{x:.9g}" for x in samples),
+                **latency_summary(samples),
                 **metrics,
                 "latency_ms": latency,
                 "speedup_vs_dense_eager": float("nan"),
@@ -873,6 +909,56 @@ def parse_args() -> argparse.Namespace:
             "By default a temporary directory is removed after each case."
         ),
     )
+    parser.add_argument(
+        "--external-timeout",
+        type=float,
+        default=1800.0,
+        help=(
+            "Maximum seconds allowed for one GeNN or Brian2CUDA worker, "
+            "including code generation and compilation (default: 1800)."
+        ),
+    )
+    parser.add_argument(
+        "--genn-optimize-code",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable GeNN release compiler optimization (default: enabled).",
+    )
+    parser.add_argument(
+        "--brian2cuda-sm-multiplier",
+        type=int,
+        default=1,
+        help="Brian2CUDA blocks per streaming multiprocessor (default: 1).",
+    )
+    parser.add_argument(
+        "--brian2cuda-parallel-blocks",
+        type=int,
+        default=1,
+        help=(
+            "Brian2CUDA synaptic parallel blocks; 0 uses the SM count times "
+            "--brian2cuda-sm-multiplier (default: 1)."
+        ),
+    )
+    parser.add_argument(
+        "--brian2cuda-extra-threshold-kernel",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--brian2cuda-calc-occupancy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--brian2cuda-launch-bounds",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--brian2cuda-syn-launch-bounds",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--skip-correctness", action="store_true")
     parser.add_argument("--csv", type=Path, default=None)
     args = parser.parse_args()
@@ -882,6 +968,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--batch-size and every --t-steps value must be positive")
     if args.n_neuron <= 0 or args.fanout < 0:
         parser.error("--n-neuron must be positive and --fanout non-negative")
+    if args.external_timeout <= 0:
+        parser.error("--external-timeout must be positive")
+    if args.brian2cuda_sm_multiplier <= 0:
+        parser.error("--brian2cuda-sm-multiplier must be positive")
+    if args.brian2cuda_parallel_blocks < 0:
+        parser.error("--brian2cuda-parallel-blocks must be non-negative")
     if not 0.0 <= args.event_rate <= 1.0:
         parser.error("--event-rate must be in [0, 1]")
     args.dataset, args.weight_scale = resolve_dataset_defaults(
@@ -922,6 +1014,21 @@ def main() -> None:
     graph_provider = TorchCUDAGraphProvider()
     direct_cusparse_provider = DirectCuSparseProvider()
     persistent_provider = PersistentProvider()
+    external_provider_options = {
+        "genn": {
+            "optimize_code": args.genn_optimize_code,
+        },
+        "brian2cuda": {
+            "sm_multiplier": args.brian2cuda_sm_multiplier,
+            "parallel_blocks": args.brian2cuda_parallel_blocks,
+            "calc_occupancy": args.brian2cuda_calc_occupancy,
+            "extra_threshold_kernel": (
+                args.brian2cuda_extra_threshold_kernel
+            ),
+            "launch_bounds": args.brian2cuda_launch_bounds,
+            "syn_launch_bounds": args.brian2cuda_syn_launch_bounds,
+        },
+    }
     all_rows: list[dict] = []
     for t_steps in args.t_steps:
         if matrix is None:
@@ -961,6 +1068,8 @@ def main() -> None:
             direct_cusparse_provider=direct_cusparse_provider,
             persistent_provider=persistent_provider,
             external_build_root=args.external_build_root,
+            external_timeout=args.external_timeout,
+            external_provider_options=external_provider_options,
             warmup=args.warmup,
             repeat=args.repeat,
             check_correctness=not args.skip_correctness,

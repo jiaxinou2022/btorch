@@ -3,6 +3,11 @@ import math
 import pytest
 import torch
 
+from btorch.backend.persistent.reorder import (
+    ReorderConfig,
+    prepare_reordered_inputs,
+    restore_output,
+)
 from btorch.backend.persistent_snn import (
     EventCSRGraph,
     PersistentSNNParams,
@@ -188,6 +193,72 @@ def test_cuda_persistent_matches_dense_reference():
     torch.testing.assert_close(out.spikes, ref_spikes, atol=0, rtol=0)
     torch.testing.assert_close(out.state.v, ref_v, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(out.state.psc, ref_psc, atol=1e-5, rtol=1e-5)
+
+
+def test_cuda_physical_reorder_restores_original_neuron_order():
+    """A reordered graph and dynamic inputs should preserve CUDA semantics."""
+
+    device = _require_cuda()
+    x_seq = torch.tensor(
+        [
+            [[1.2, 0.0, 0.0, 1.4]],
+            [[0.0, 1.3, 0.0, 0.0]],
+            [[0.7, 0.0, 1.5, 0.0]],
+        ],
+        device=device,
+    )
+    events = _dense_to_events(x_seq)
+    graph, _dense = _graph(device)
+    state = PersistentSNNState(
+        v=torch.zeros(1, 4, device=device),
+        psc=torch.zeros(1, 4, device=device),
+    )
+    params = PersistentSNNParams(window_size=3)
+    baseline = _run_cuda_or_skip(
+        events,
+        graph,
+        state,
+        params,
+        return_mode="both",
+        spike_block=True,
+    )
+    prepared = prepare_reordered_inputs(
+        events,
+        graph,
+        state,
+        ReorderConfig(
+            mode="global_cost_similarity",
+            post_block_size=2,
+            extreme_fanout_threshold=2,
+        ),
+    )
+    reordered = _run_cuda_or_skip(
+        prepared.events,
+        prepared.graph,
+        prepared.state,
+        params,
+        return_mode="both",
+        spike_block=True,
+        workspace=make_persistent_snn_workspace(prepared.graph, 1),
+    )
+    restored = restore_output(reordered, prepared.permutation)
+
+    torch.testing.assert_close(restored.spikes, baseline.spikes, atol=0, rtol=0)
+    torch.testing.assert_close(restored.state.v, baseline.state.v)
+    torch.testing.assert_close(restored.state.psc, baseline.state.psc)
+    assert restored.spike_events is not None
+    assert baseline.spike_events is not None
+    torch.testing.assert_close(
+        restored.spike_events.offsets,
+        baseline.spike_events.offsets,
+    )
+    for bucket in range(restored.spike_events.offsets.numel() - 1):
+        start = int(restored.spike_events.offsets[bucket])
+        end = int(restored.spike_events.offsets[bucket + 1])
+        torch.testing.assert_close(
+            torch.sort(restored.spike_events.indices[start:end]).values,
+            torch.sort(baseline.spike_events.indices[start:end]).values,
+        )
 
 
 @pytest.mark.parametrize("return_mode", ["events", "both"])
