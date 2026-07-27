@@ -325,11 +325,12 @@ def make_persistent_snn_workspace(
         raise ValueError("batch_size must be positive.")
     n_neuron = graph.shape[0]
     edge_count = graph.indices.numel()
-    # This single workspace serves every kernel variant. The spike-block
-    # variant needs one task per 32-cell block plus up to one rounding task per
-    # CSR row when 1024-edge segments are used.
+    # This single workspace serves every kernel variant and every block-v4
+    # compile configuration. Reserve for the smallest supported 128-edge
+    # block budget / long-row segment, plus one rounding task per row and one
+    # per 32-cell block.
     queue_capacity = batch_size * (
-        (n_neuron + 31) // 32 + n_neuron + (edge_count + 1023) // 1024
+        (n_neuron + 31) // 32 + n_neuron + (edge_count + 127) // 128
     )
     int_options = {"device": graph.indptr.device, "dtype": torch.int32}
     return PersistentSNNWorkspace(

@@ -443,6 +443,7 @@ def test_cuda_persistent_fanout_binning_matches_dense_reference(fanouts):
     "fanouts",
     [
         (8, 17),
+        (255, 254, 253),
         (255, 256),
         (257, 2050),
     ],
@@ -450,10 +451,11 @@ def test_cuda_persistent_fanout_binning_matches_dense_reference(fanouts):
 def test_cuda_persistent_spike_block_matches_dense_reference(fanouts):
     """Spike-block tasks should preserve dynamics across the 256-edge split.
 
-    Short rows from the same 32-neuron cell block share one queued task. The
-    8-edge row uses direct relative-lane traversal while the 17-edge row uses
-    a full warp. Rows at or above 256 edges become fixed 1024-edge segment
-    tasks. These cases exercise both paths and the exact boundaries.
+    Short rows from the same 32-neuron cell block share queued logical tasks.
+    The three ordinary rows with 762 total edges exercise block-v4 budget
+    splitting when compiled with a budget below that total. Rows at or above
+    256 edges become long segment tasks. These cases exercise both paths and
+    the exact boundary.
     """
 
     device = _require_cuda()

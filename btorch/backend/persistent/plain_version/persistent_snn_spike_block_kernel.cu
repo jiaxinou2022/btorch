@@ -7,9 +7,23 @@ namespace cg = cooperative_groups;
 
 namespace {
 
+#ifndef BTORCH_BLOCK_EDGE_BUDGET
+#define BTORCH_BLOCK_EDGE_BUDGET 0
+#endif
+
+#ifndef BTORCH_LONG_SEGMENT_SIZE
+#define BTORCH_LONG_SEGMENT_SIZE 1024
+#endif
+
+#ifndef BTORCH_TILE_REDUCE_MODE
+#define BTORCH_TILE_REDUCE_MODE 0
+#endif
+
 constexpr int kFanoutThreshold = 256;
 constexpr int kLaneRowThreshold = 4;
-constexpr int kSegmentSize = 1024;
+constexpr int kBlockEdgeBudget = BTORCH_BLOCK_EDGE_BUDGET;
+constexpr int kSegmentSize = BTORCH_LONG_SEGMENT_SIZE;
+constexpr int kTileReduceMode = BTORCH_TILE_REDUCE_MODE;
 constexpr int kHashSize = 128;
 constexpr int kHashMaxProbe = 8;
 constexpr int kHashMinEdges = 64;
@@ -17,9 +31,29 @@ constexpr int kHashMaxEdges = 96;
 constexpr int kWarpsPerBlock = 8;
 constexpr int kEmptyHashKey = -1;
 constexpr unsigned kFullWarpMask = 0xffffffffu;
+constexpr int kBlockIndexBits = 24;
+constexpr unsigned kBlockIndexMask = (1u << kBlockIndexBits) - 1u;
+
+static_assert(
+    kBlockEdgeBudget == 0
+        || kBlockEdgeBudget == 128
+        || kBlockEdgeBudget == 256
+        || kBlockEdgeBudget == 512
+        || kBlockEdgeBudget == 1024);
+static_assert(
+    kSegmentSize == 128
+        || kSegmentSize == 256
+        || kSegmentSize == 512
+        || kSegmentSize == 1024
+        || kSegmentSize == 2048);
+static_assert(kTileReduceMode >= 0 && kTileReduceMode <= 2);
 
 #ifdef ENABLE_BLOCK_STATS
-constexpr int kBlockStatsColumns = 13;
+constexpr int kBlockStatsColumns = 17;
+constexpr int kV4InputEdgesColumn = 13;
+constexpr int kV4GlobalAtomicsColumn = 14;
+constexpr int kV4ReduceTasksColumn = 15;
+constexpr int kV4ReduceEdgesColumn = 16;
 
 // One diagnostic thread reconstructs one potential 32-neuron task after the
 // persistent launch. This deliberately lives outside the timed/production
@@ -135,6 +169,7 @@ __global__ void persistent_snn_spike_block_kernel(
     int* __restrict__ work_counters,
     int* __restrict__ event_counts,
     int* __restrict__ event_indices_full,
+    int* __restrict__ block_stats,
     bool return_events,
     int t_steps,
     int batch_size,
@@ -204,12 +239,48 @@ __global__ void persistent_snn_spike_block_kernel(
                 const int edge_start = graph_indptr[n];
                 const int edge_end = graph_indptr[n + 1];
                 const int degree = edge_end - edge_start;
-                const bool block_spike = fired && degree < kFanoutThreshold;
+                const bool block_spike =
+                    fired && degree > 0 && degree < kFanoutThreshold;
                 const unsigned warp_active = __activemask();
                 const unsigned spike_mask =
                     __ballot_sync(warp_active, block_spike);
-
-                if (lane == 0 && spike_mask != 0) {
+                if constexpr (kBlockEdgeBudget > 0) {
+                    int inclusive_edges = block_spike ? degree : 0;
+#pragma unroll
+                    for (int offset = 1; offset < 32; offset <<= 1) {
+                        const int value = __shfl_up_sync(
+                            warp_active, inclusive_edges, offset);
+                        if (lane >= offset) {
+                            inclusive_edges += value;
+                        }
+                    }
+                    const int final_lane = 31 - __clz(warp_active);
+                    const int active_edges = __shfl_sync(
+                        warp_active, inclusive_edges, final_lane);
+                    if (lane == 0 && active_edges > 0) {
+                        const int logical_task_count =
+                            (active_edges + kBlockEdgeBudget - 1)
+                            / kBlockEdgeBudget;
+                        const int first_task = atomicAdd(
+                            task_counts + 1, logical_task_count);
+                        const int block_index = n >> 5;
+                        for (int segment = 0;
+                             segment < logical_task_count;
+                             ++segment) {
+                            const int task = first_task + segment;
+                            const int slot = queue_capacity - 1 - task;
+                            const unsigned descriptor =
+                                static_cast<unsigned>(block_index)
+                                | (static_cast<unsigned>(segment)
+                                   << kBlockIndexBits);
+                            task_queue_batch[slot] = b;
+                            task_queue_start[slot] =
+                                static_cast<int>(descriptor);
+                            task_queue_end_or_mask[slot] =
+                                static_cast<int>(spike_mask);
+                        }
+                    }
+                } else if (lane == 0 && spike_mask != 0) {
                     const int task = atomicAdd(task_counts + 1, 1);
                     const int slot = queue_capacity - 1 - task;
                     task_queue_batch[slot] = b;
@@ -277,7 +348,14 @@ __global__ void persistent_snn_spike_block_kernel(
             }
             const int slot = queue_capacity - 1 - task;
             const int b = task_queue_batch[slot];
-            const int block_start = task_queue_start[slot];
+            const unsigned descriptor =
+                static_cast<unsigned>(task_queue_start[slot]);
+            const int block_start = kBlockEdgeBudget > 0
+                ? static_cast<int>(descriptor & kBlockIndexMask) << 5
+                : static_cast<int>(descriptor);
+            const int logical_segment = kBlockEdgeBudget > 0
+                ? static_cast<int>(descriptor >> kBlockIndexBits)
+                : 0;
             const unsigned spike_mask =
                 static_cast<unsigned>(task_queue_end_or_mask[slot]);
             const bool lane_fired =
@@ -290,6 +368,130 @@ __global__ void persistent_snn_spike_block_kernel(
             const int lane_edge_end =
                 lane_fired ? graph_indptr[lane_pre + 1] : 0;
             const int lane_degree = lane_edge_end - lane_edge_start;
+            if constexpr (kBlockEdgeBudget > 0) {
+                int inclusive_end = lane_degree;
+#pragma unroll
+                for (int offset = 1; offset < 32; offset <<= 1) {
+                    const int value = __shfl_up_sync(
+                        kFullWarpMask, inclusive_end, offset);
+                    if (lane >= offset) {
+                        inclusive_end += value;
+                    }
+                }
+                packed_prefix[warp_in_block][lane] = inclusive_end;
+                packed_starts[warp_in_block][lane] = lane_edge_start;
+                __syncwarp();
+
+                const int total_edges = packed_prefix[warp_in_block][31];
+                const int logical_begin =
+                    logical_segment * kBlockEdgeBudget;
+                const int logical_end = min(
+                    total_edges, logical_begin + kBlockEdgeBudget);
+                const int task_edges = logical_end - logical_begin;
+                const bool reduce_task =
+                    kTileReduceMode == 1
+                    || (kTileReduceMode == 2 && task_edges >= 64);
+#ifdef ENABLE_BLOCK_STATS
+                if (lane == 0 && block_stats != nullptr) {
+                    atomicAdd(
+                        block_stats + kV4InputEdgesColumn,
+                        task_edges);
+                    if (reduce_task) {
+                        atomicAdd(
+                            block_stats + kV4ReduceTasksColumn,
+                            1);
+                        atomicAdd(
+                            block_stats + kV4ReduceEdgesColumn,
+                            task_edges);
+                    }
+                }
+#endif
+                for (int edge_base = logical_begin;
+                     edge_base < logical_end;
+                     edge_base += 32) {
+                    const int logical_edge = edge_base + lane;
+                    const bool valid = logical_edge < logical_end;
+                    const int lookup_edge = valid
+                        ? logical_edge
+                        : logical_end - 1;
+                    int low = 0;
+                    int high = 31;
+#pragma unroll
+                    for (int step = 0; step < 5; ++step) {
+                        const int middle = (low + high) >> 1;
+                        if (packed_prefix[warp_in_block][middle]
+                            > lookup_edge) {
+                            high = middle;
+                        } else {
+                            low = middle + 1;
+                        }
+                    }
+
+                    int post = 0;
+                    float weight = 0.0f;
+                    if (valid) {
+                        const int previous_end = low == 0
+                            ? 0
+                            : packed_prefix[warp_in_block][low - 1];
+                        const int edge =
+                            packed_starts[warp_in_block][low]
+                            + logical_edge - previous_end;
+                        post = graph_indices[edge];
+                        weight = graph_weight[edge];
+                    }
+                    const unsigned valid_mask =
+                        __ballot_sync(kFullWarpMask, valid);
+                    if (!reduce_task) {
+#ifdef ENABLE_BLOCK_STATS
+                        if (lane == 0 && block_stats != nullptr) {
+                            atomicAdd(
+                                block_stats + kV4GlobalAtomicsColumn,
+                                __popc(valid_mask));
+                        }
+#endif
+                        if (valid) {
+                            atomicAdd(
+                                psc + b * n_neuron + post,
+                                weight);
+                        }
+                        continue;
+                    }
+
+                    unsigned peers = 0;
+                    if (valid) {
+                        peers = __match_any_sync(valid_mask, post);
+                    }
+                    const bool is_leader =
+                        valid && lane == __ffs(peers) - 1;
+                    const unsigned leader_mask =
+                        __ballot_sync(kFullWarpMask, is_leader);
+#ifdef ENABLE_BLOCK_STATS
+                    if (lane == 0 && block_stats != nullptr) {
+                        atomicAdd(
+                            block_stats + kV4GlobalAtomicsColumn,
+                            __popc(leader_mask));
+                    }
+#endif
+                    if (valid) {
+                        unsigned remaining = peers;
+                        float reduced_weight = 0.0f;
+                        while (remaining != 0) {
+                            const int source = __ffs(remaining) - 1;
+                            reduced_weight += __shfl_sync(
+                                peers, weight, source);
+                            remaining &= remaining - 1;
+                        }
+                        if (is_leader) {
+                            atomicAdd(
+                                psc + b * n_neuron + post,
+                                reduced_weight);
+                        }
+                    }
+                }
+                __syncwarp();
+                continue;
+            }
+
             // Tiny rows stay lane-owned. The remaining medium rows are either
             // consumed as strict adjacent CSR runs or packed into one logical
             // edge stream so scattered masks no longer serialize per row.
@@ -552,6 +754,7 @@ void launch_persistent_snn_spike_block_kernel(
         &work_counters,
         &event_counts,
         &event_indices_full,
+        &block_stats,
         &return_events,
         &t_steps,
         &batch_size,

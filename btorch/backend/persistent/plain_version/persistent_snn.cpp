@@ -12,7 +12,7 @@
 #include <tuple>
 
 constexpr int kThreadsPerBlock = 256;
-constexpr int kEdgesPerTask = 1024;
+constexpr int kMinimumEdgesPerTask = 128;
 
 void launch_persistent_snn_kernel(
     const int* event_offsets,
@@ -426,6 +426,9 @@ persistent_snn_forward_cuda_impl(
         static_cast<int>((event_offsets.numel() - 1) / batch_size);
     TORCH_CHECK(t_steps > 0, "T must be positive.");
     TORCH_CHECK(
+        (n_neuron + 31) / 32 < (1 << 24),
+        "spike-block descriptor supports fewer than 2^24 neuron blocks.");
+    TORCH_CHECK(
         tau_mem > 0.0 && tau_syn > 0.0 && c_m > 0.0,
         "tau_mem, tau_syn, and c_m must be positive.");
 
@@ -439,8 +442,10 @@ persistent_snn_forward_cuda_impl(
     const int64_t edge_count = graph_indices.numel();
     const int64_t tasks_per_batch = spike_block
         ? ((n_neuron + 31) / 32 + n_neuron +
-           (edge_count + kEdgesPerTask - 1) / kEdgesPerTask)
-        : (n_neuron + (edge_count + kEdgesPerTask - 1) / kEdgesPerTask);
+           (edge_count + kMinimumEdgesPerTask - 1) /
+               kMinimumEdgesPerTask)
+        : (n_neuron + (edge_count + kMinimumEdgesPerTask - 1) /
+                          kMinimumEdgesPerTask);
     const int64_t queue_capacity_64 =
         static_cast<int64_t>(batch_size) * tasks_per_batch;
     TORCH_CHECK(
@@ -469,7 +474,7 @@ persistent_snn_forward_cuda_impl(
         ? torch::empty({t_steps * batch_size * n_neuron}, options_i)
         : torch::empty({0}, options_i);
 #ifdef ENABLE_BLOCK_STATS
-    constexpr int kBlockStatsColumns = 13;
+    constexpr int kBlockStatsColumns = 17;
     const int64_t block_stats_records =
         static_cast<int64_t>(t_steps) * batch_size * ((n_neuron + 31) / 32);
     auto overflow = spike_block && return_dense

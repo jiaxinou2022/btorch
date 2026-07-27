@@ -114,7 +114,7 @@ Mode = Literal["benchmark", "ncu"]
 Provider = Literal["persistent", "cusparse_cudagraph"]
 FANOUT_BINNING_THRESHOLD = 256
 LANE_ROW_THRESHOLD = 4
-BLOCK_STATS_COLUMNS = 13
+BLOCK_STATS_COLUMNS = 17
 HASH_CAPACITY = 128
 HASH_MAX_PROBES = 8
 HASH_MIN_EDGES = 64
@@ -759,6 +759,7 @@ def summarize_block_stats(
     graph_indices: torch.Tensor,
     *,
     block_hash_enabled: bool = True,
+    block_edge_budget: int = 0,
 ) -> dict[str, float | int]:
     """Augment macro-collected task records with exact offline post statistics."""
 
@@ -767,6 +768,36 @@ def summarize_block_stats(
             f"block stats must have shape (records, {BLOCK_STATS_COLUMNS})"
         )
     stats = raw_stats.to(device="cpu", dtype=torch.int64)
+    active_task_edges = stats[:, 1]
+    active_task_edges = active_task_edges[active_task_edges > 0]
+    if block_edge_budget > 0 and active_task_edges.numel():
+        full_task_counts = active_task_edges // block_edge_budget
+        full_edges = torch.full(
+            (int(full_task_counts.sum().item()),),
+            block_edge_budget,
+            dtype=torch.int64,
+        )
+        remainders = active_task_edges % block_edge_budget
+        logical_task_edges = torch.cat(
+            [full_edges, remainders[remainders > 0]]
+        )
+    else:
+        logical_task_edges = active_task_edges
+
+    def task_quantile(q: float) -> float:
+        if not logical_task_edges.numel():
+            return 0.0
+        return float(
+            torch.quantile(logical_task_edges.to(torch.float64), q).item()
+        )
+
+    def original_task_quantile(q: float) -> float:
+        if not active_task_edges.numel():
+            return 0.0
+        return float(
+            torch.quantile(active_task_edges.to(torch.float64), q).item()
+        )
+
     indptr = graph_indptr.to(device="cpu", dtype=torch.int64).tolist()
     indices = graph_indices.to(device="cpu", dtype=torch.int64).tolist()
 
@@ -791,6 +822,11 @@ def summarize_block_stats(
         "hash_overflow_tasks": 0,
         "packed_tasks": 0,
         "long_segment_tasks": int(stats[:, 8].sum().item()),
+        "v4_input_edges": int(stats[0, 13].item()) if stats.numel() else 0,
+        "v4_global_atomics": int(stats[0, 14].item()) if stats.numel() else 0,
+        "v4_reduce_tasks": int(stats[0, 15].item()) if stats.numel() else 0,
+        "v4_reduce_edges": int(stats[0, 16].item()) if stats.numel() else 0,
+        "logical_block_task_count": int(logical_task_edges.numel()),
     }
     for record in stats:
         active_rows = int(record[0].item())
@@ -894,6 +930,30 @@ def summarize_block_stats(
         "long_segment_task_ratio": ratio(
             totals["long_segment_tasks"], dispatch_count
         ),
+        "v4_atomic_ratio": ratio(
+            totals["v4_global_atomics"],
+            totals["v4_input_edges"],
+        ),
+        "logical_tasks_per_spike_block": ratio(
+            totals["logical_block_task_count"],
+            task_count,
+        ),
+        "logical_task_edges_p50": task_quantile(0.50),
+        "logical_task_edges_p90": task_quantile(0.90),
+        "logical_task_edges_p99": task_quantile(0.99),
+        "logical_task_edges_max": (
+            int(logical_task_edges.max().item())
+            if logical_task_edges.numel()
+            else 0
+        ),
+        "original_task_edges_p50": original_task_quantile(0.50),
+        "original_task_edges_p90": original_task_quantile(0.90),
+        "original_task_edges_p99": original_task_quantile(0.99),
+        "original_task_edges_max": (
+            int(active_task_edges.max().item())
+            if active_task_edges.numel()
+            else 0
+        ),
     }
     return {**totals, **derived}
 
@@ -940,6 +1000,17 @@ def benchmark_row(
         "spike_block": spike_block,
         "block_hash": block_hash,
         "block_stats": block_stats is not None,
+        "block_edge_budget": int(
+            os.environ.get("BTORCH_BLOCK_EDGE_BUDGET", "0")
+        ),
+        "long_segment_size": int(
+            os.environ.get("BTORCH_LONG_SEGMENT_SIZE", "1024")
+        ),
+        "tile_reduce": {
+            "0": "off",
+            "1": "all",
+            "2": "hinted",
+        }[os.environ.get("BTORCH_TILE_REDUCE_MODE", "0")],
         "reorder": workload.permutation.config.mode,
         "reorder_window": workload.permutation.config.local_window_size,
         "reorder_extreme_threshold": (
@@ -1027,6 +1098,26 @@ def parse_args() -> argparse.Namespace:
         "--block-hash",
         action="store_true",
         help="Compile the experimental selective shared-memory BlockTask hash.",
+    )
+    parser.add_argument(
+        "--block-edge-budget",
+        type=int,
+        choices=(0, 128, 256, 512, 1024),
+        default=0,
+        help="Maximum ordinary logical edges per BlockTask; 0 keeps v3.",
+    )
+    parser.add_argument(
+        "--long-segment-size",
+        type=int,
+        choices=(128, 256, 512, 1024, 2048),
+        default=1024,
+        help="Maximum edges in one extreme-row SegmentTask.",
+    )
+    parser.add_argument(
+        "--tile-reduce",
+        choices=("off", "all", "hinted"),
+        default="off",
+        help="Merge duplicate posts within each 32-edge logical tile.",
     )
     parser.add_argument(
         "--reorder",
@@ -1124,6 +1215,16 @@ def parse_args() -> argparse.Namespace:
         parser.error("--block-stats requires --spike-block.")
     if args.block_hash and not args.spike_block:
         parser.error("--block-hash requires --spike-block.")
+    if args.block_edge_budget and not args.spike_block:
+        parser.error("--block-edge-budget requires --spike-block.")
+    if args.long_segment_size != 1024 and not args.spike_block:
+        parser.error("--long-segment-size requires --spike-block.")
+    if args.tile_reduce != "off" and not args.spike_block:
+        parser.error("--tile-reduce requires --spike-block.")
+    if args.tile_reduce != "off" and args.block_edge_budget == 0:
+        parser.error("--tile-reduce requires a nonzero --block-edge-budget.")
+    if args.block_hash and args.block_edge_budget:
+        parser.error("--block-hash only applies to the unlimited v3 path.")
     if args.reorder != "identity" and args.provider != "persistent":
         parser.error("--reorder is only valid with --provider persistent.")
     return args
@@ -1136,6 +1237,13 @@ def main() -> None:
 
     if args.grid_blocks is not None:
         os.environ["BTORCH_PERSISTENT_GRID_BLOCKS"] = str(args.grid_blocks)
+    os.environ["BTORCH_BLOCK_EDGE_BUDGET"] = str(args.block_edge_budget)
+    os.environ["BTORCH_LONG_SEGMENT_SIZE"] = str(args.long_segment_size)
+    os.environ["BTORCH_TILE_REDUCE_MODE"] = {
+        "off": "0",
+        "all": "1",
+        "hinted": "2",
+    }[args.tile_reduce]
 
     workload = prepare_workload(args, torch.device("cuda"))
     if args.block_stats or args.block_hash:
@@ -1180,6 +1288,7 @@ def main() -> None:
             workload.graph.indptr,
             workload.graph.indices,
             block_hash_enabled=args.block_hash,
+            block_edge_budget=args.block_edge_budget,
         )
 
     row = benchmark_row(

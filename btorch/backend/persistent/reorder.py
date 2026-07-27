@@ -169,6 +169,18 @@ def build_neuron_permutation(
     config = config or ReorderConfig()
     _validate_config(config)
     n_neuron = _validate_recurrent_graph(graph)
+    if config.mode == "identity":
+        identity = torch.arange(
+            n_neuron,
+            device=graph.indptr.device,
+            dtype=torch.int64,
+        )
+        return NeuronPermutation(
+            new_to_old=identity,
+            old_to_new=identity,
+            config=config,
+        )
+
     degree = (graph.indptr[1:] - graph.indptr[:-1]).to("cpu", torch.int64).tolist()
     needs_similarity = "similarity" in config.mode
     dominant = (
@@ -201,9 +213,7 @@ def build_neuron_permutation(
             return extreme(old_id), dominant[old_id], old_id
         return (old_id,)
 
-    if config.mode == "identity":
-        order = list(range(n_neuron))
-    elif config.mode == "global_cost_balanced":
+    if config.mode == "global_cost_balanced":
         ordinary = [
             old_id
             for old_id in range(n_neuron)

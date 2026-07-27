@@ -11,8 +11,8 @@ from benchmark.benchmark_rsnn_roofline import summarize_block_stats
 def test_block_stats_summary_derives_requested_metrics():
     indptr = torch.tensor([0, 2, 4, 4, 5] + [5] * 28, dtype=torch.int32)
     indices = torch.tensor([1, 2, 2, 3, 4], dtype=torch.int32)
-    raw = torch.zeros((2, 13), dtype=torch.int32)
-    raw[0] = torch.tensor(
+    raw = torch.zeros((2, 17), dtype=torch.int32)
+    raw[0, :13] = torch.tensor(
         [2, 4, 1, 4, 2, 4, 1, 1, 0, 0, 0, 0, 0b11]
     )
     raw[1, 8] = 2
@@ -41,8 +41,8 @@ def test_block_stats_summary_derives_requested_metrics():
 def test_block_stats_models_the_selective_hash_path():
     indptr = torch.tensor([0, 32, 64] + [64] * 30, dtype=torch.int32)
     indices = torch.tensor(list(range(32)) * 2, dtype=torch.int32)
-    raw = torch.zeros((1, 13), dtype=torch.int32)
-    raw[0] = torch.tensor(
+    raw = torch.zeros((1, 17), dtype=torch.int32)
+    raw[0, :13] = torch.tensor(
         [2, 64, 1, 64, 32, 64, 0, 1, 0, 0, 0, 0, 0b11]
     )
 
@@ -58,7 +58,7 @@ def test_block_stats_models_the_selective_hash_path():
 
 def test_empty_block_stats_have_zero_ratios():
     summary = summarize_block_stats(
-        torch.zeros((1, 13), dtype=torch.int32),
+        torch.zeros((1, 17), dtype=torch.int32),
         torch.tensor([0, 0], dtype=torch.int32),
         torch.empty(0, dtype=torch.int32),
     )
@@ -67,6 +67,48 @@ def test_empty_block_stats_have_zero_ratios():
     assert summary["post_duplicate_ratio"] == 0.0
     assert summary["atomic_reduction_ratio"] == 0.0
     assert summary["hash_task_ratio"] == 0.0
+    assert summary["v4_atomic_ratio"] == 0.0
+
+
+def test_block_stats_report_v4_kernel_atomic_counters():
+    """The first stats record carries kernel-wide block-v4 counters."""
+
+    raw = torch.zeros((1, 17), dtype=torch.int32)
+    raw[0, 13:] = torch.tensor([128, 80, 1, 128])
+
+    summary = summarize_block_stats(
+        raw,
+        torch.tensor([0, 0], dtype=torch.int32),
+        torch.empty(0, dtype=torch.int32),
+    )
+
+    assert summary["v4_input_edges"] == 128
+    assert summary["v4_global_atomics"] == 80
+    assert summary["v4_reduce_tasks"] == 1
+    assert summary["v4_reduce_edges"] == 128
+    assert summary["v4_atomic_ratio"] == 0.625
+
+
+def test_block_stats_model_v4_edge_budget_task_splitting():
+    """Logical task statistics should reflect the configured edge cap."""
+
+    raw = torch.zeros((1, 17), dtype=torch.int32)
+    raw[0, :13] = torch.tensor(
+        [3, 600, 1, 600, 255, 600, 0, 1, 0, 0, 0, 0, 0b111]
+    )
+
+    summary = summarize_block_stats(
+        raw,
+        torch.tensor([0, 200, 400, 600], dtype=torch.int32),
+        torch.arange(600, dtype=torch.int32),
+        block_edge_budget=256,
+    )
+
+    assert summary["block_task_count"] == 1
+    assert summary["logical_block_task_count"] == 3
+    assert summary["logical_tasks_per_spike_block"] == 3.0
+    assert summary["logical_task_edges_max"] == 256
+    assert summary["logical_task_edges_p50"] == 256.0
 
 
 def test_cusparse_cudagraph_delegates_to_shared_direct_provider(monkeypatch):

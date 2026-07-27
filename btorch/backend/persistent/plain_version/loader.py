@@ -11,7 +11,20 @@ from shutil import which
 from torch.utils.cpp_extension import load as load_extension
 
 
-_loaded_config: tuple[bool, bool] | None = None
+_loaded_config: tuple[bool, bool, int, int, int] | None = None
+
+
+def _block_v4_config() -> tuple[int, int, int]:
+    block_budget = int(os.environ.get("BTORCH_BLOCK_EDGE_BUDGET", "0"))
+    long_segment = int(os.environ.get("BTORCH_LONG_SEGMENT_SIZE", "1024"))
+    tile_reduce = int(os.environ.get("BTORCH_TILE_REDUCE_MODE", "0"))
+    if block_budget not in (0, 128, 256, 512, 1024):
+        raise ValueError("BTORCH_BLOCK_EDGE_BUDGET has an unsupported value.")
+    if long_segment not in (128, 256, 512, 1024, 2048):
+        raise ValueError("BTORCH_LONG_SEGMENT_SIZE has an unsupported value.")
+    if tile_reduce not in (0, 1, 2):
+        raise ValueError("BTORCH_TILE_REDUCE_MODE has an unsupported value.")
+    return block_budget, long_segment, tile_reduce
 
 
 def _host_compiler() -> str | None:
@@ -74,7 +87,14 @@ def load(
     """Build and load the plain persistent SNN CUDA extension."""
 
     global _loaded_config
-    requested_config = (enable_block_stats, enable_block_hash)
+    block_budget, long_segment, tile_reduce = _block_v4_config()
+    requested_config = (
+        enable_block_stats,
+        enable_block_hash,
+        block_budget,
+        long_segment,
+        tile_reduce,
+    )
     if (
         _loaded_config is not None
         and _loaded_config != requested_config
@@ -105,7 +125,21 @@ def load(
         suffixes.append("stats")
     if enable_block_hash:
         suffixes.append("hash")
-    extension_suffix = f"_{'_'.join(suffixes)}" if suffixes else ""
+    suffixes.extend(
+        [
+            f"b{block_budget}",
+            f"s{long_segment}",
+            f"r{tile_reduce}",
+        ]
+    )
+    extension_suffix = f"_{'_'.join(suffixes)}"
+    cuda_cflags.extend(
+        [
+            f"-DBTORCH_BLOCK_EDGE_BUDGET={block_budget}",
+            f"-DBTORCH_LONG_SEGMENT_SIZE={long_segment}",
+            f"-DBTORCH_TILE_REDUCE_MODE={tile_reduce}",
+        ]
+    )
     if enable_block_stats:
         cflags.append("-DENABLE_BLOCK_STATS")
         cuda_cflags.append("-DENABLE_BLOCK_STATS")
