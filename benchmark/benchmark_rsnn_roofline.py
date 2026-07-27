@@ -116,7 +116,7 @@ Mode = Literal["benchmark", "ncu"]
 Provider = Literal["persistent", "cusparse_cudagraph"]
 FANOUT_BINNING_THRESHOLD = 256
 LANE_ROW_THRESHOLD = 4
-BLOCK_STATS_COLUMNS = 23
+BLOCK_STATS_COLUMNS = 44
 HASH_AGGREGATION_SCALES = (32, 64, 128, 256, 512)
 HASH_CAPACITY = 128
 HASH_MAX_PROBES = 8
@@ -844,9 +844,11 @@ def summarize_block_stats(
 ) -> dict[str, float | int]:
     """Augment macro-collected task records with exact offline post statistics."""
 
-    if raw_stats.ndim != 2 or raw_stats.shape[1] != BLOCK_STATS_COLUMNS:
+    supported_columns = (23, BLOCK_STATS_COLUMNS)
+    if raw_stats.ndim != 2 or raw_stats.shape[1] not in supported_columns:
         raise ValueError(
-            f"block stats must have shape (records, {BLOCK_STATS_COLUMNS})"
+            "block stats must have shape "
+            f"(records, one of {supported_columns})"
         )
     stats = raw_stats.to(device="cpu", dtype=torch.int64)
     active_task_edges = stats[:, 1]
@@ -925,6 +927,111 @@ def summarize_block_stats(
         ),
         "kernel_hash_probe_attempts": (
             int(stats[0, 22].item()) if stats.numel() else 0
+        ),
+        "b3_ordinary_tasks": (
+            int(stats[0, 23].item())
+            if stats.numel() and stats.size(1) > 23
+            else 0
+        ),
+        "b3_ordinary_edges": (
+            int(stats[0, 24].item())
+            if stats.numel() and stats.size(1) > 24
+            else 0
+        ),
+        "b3_eligible_tasks": (
+            int(stats[0, 25].item())
+            if stats.numel() and stats.size(1) > 25
+            else 0
+        ),
+        "b3_eligible_edges": (
+            int(stats[0, 26].item())
+            if stats.numel() and stats.size(1) > 26
+            else 0
+        ),
+        "b3_staged_tasks": (
+            int(stats[0, 27].item())
+            if stats.numel() and stats.size(1) > 27
+            else 0
+        ),
+        "b3_staged_edges": (
+            int(stats[0, 28].item())
+            if stats.numel() and stats.size(1) > 28
+            else 0
+        ),
+        "b3_fallback_tasks": (
+            int(stats[0, 29].item())
+            if stats.numel() and stats.size(1) > 29
+            else 0
+        ),
+        "b3_fallback_edges": (
+            int(stats[0, 30].item())
+            if stats.numel() and stats.size(1) > 30
+            else 0
+        ),
+        "b3_edges_256_383": (
+            int(stats[0, 31].item())
+            if stats.numel() and stats.size(1) > 31
+            else 0
+        ),
+        "b3_edges_384_511": (
+            int(stats[0, 32].item())
+            if stats.numel() and stats.size(1) > 32
+            else 0
+        ),
+        "b3_edges_512": (
+            int(stats[0, 33].item())
+            if stats.numel() and stats.size(1) > 33
+            else 0
+        ),
+        "b3_one_chunk_tasks": (
+            int(stats[0, 34].item())
+            if stats.numel() and stats.size(1) > 34
+            else 0
+        ),
+        "b3_two_chunk_tasks": (
+            int(stats[0, 35].item())
+            if stats.numel() and stats.size(1) > 35
+            else 0
+        ),
+        "b3_three_chunk_tasks": (
+            int(stats[0, 36].item())
+            if stats.numel() and stats.size(1) > 36
+            else 0
+        ),
+        "b3_four_chunk_tasks": (
+            int(stats[0, 37].item())
+            if stats.numel() and stats.size(1) > 37
+            else 0
+        ),
+        "b3_max_active_consumers": (
+            int(stats[0, 38].item())
+            if stats.numel() and stats.size(1) > 38
+            else 0
+        ),
+        "b3_active_consumer_samples": (
+            int(stats[0, 39].item())
+            if stats.numel() and stats.size(1) > 39
+            else 0
+        ),
+        "b3_active_consumer_sum": (
+            int(stats[0, 40].item())
+            if stats.numel() and stats.size(1) > 40
+            else 0
+        ),
+        "b3_chunks_produced": (
+            int(stats[0, 41].item())
+            if stats.numel() and stats.size(1) > 41
+            else 0
+        ),
+        "b3_chunks_consumed": (
+            int(stats[0, 42].item())
+            if stats.numel() and stats.size(1) > 42
+            else 0
+        ),
+        "b3_producer_idle_loops": (
+            int(stats[0, 43].item())
+            if stats.numel() and stats.size(1) > 43
+            else 0
         ),
         "logical_block_task_count": int(logical_task_edges.numel()),
     }
@@ -1059,6 +1166,22 @@ def summarize_block_stats(
         "logical_tasks_per_spike_block": ratio(
             totals["logical_block_task_count"],
             task_count,
+        ),
+        "b3_eligible_task_coverage": ratio(
+            totals["b3_eligible_tasks"],
+            totals["b3_ordinary_tasks"],
+        ),
+        "b3_eligible_edge_coverage": ratio(
+            totals["b3_eligible_edges"],
+            totals["b3_ordinary_edges"],
+        ),
+        "b3_staged_edge_coverage": ratio(
+            totals["b3_staged_edges"],
+            totals["b3_ordinary_edges"],
+        ),
+        "b3_average_active_consumers": ratio(
+            totals["b3_active_consumer_sum"],
+            totals["b3_active_consumer_samples"],
         ),
         "logical_task_edges_p50": task_quantile(0.50),
         "logical_task_edges_p90": task_quantile(0.90),

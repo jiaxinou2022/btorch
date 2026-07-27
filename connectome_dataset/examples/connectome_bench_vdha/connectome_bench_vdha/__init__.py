@@ -51,6 +51,22 @@ def _load_lib(precision: str):
     lib.cbn_vdha_prepare.argtypes = [ctypes.c_int] * 3 + [ctypes.c_void_p] * 3 + [ctypes.c_int] + [ctypes.c_void_p] * 2
     lib.cbn_vdha_compute_timed.restype = ctypes.c_int
     lib.cbn_vdha_compute_timed.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_double)]
+    lib.cbn_vdha_prepare_dense.restype = ctypes.c_void_p
+    lib.cbn_vdha_prepare_dense.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    lib.cbn_vdha_compute_dense_device.restype = ctypes.c_int
+    lib.cbn_vdha_compute_dense_device.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
     lib.cbn_vdha_copy_out.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
     lib.cbn_vdha_free.argtypes = [ctypes.c_void_p]
     _LIBS[precision] = lib

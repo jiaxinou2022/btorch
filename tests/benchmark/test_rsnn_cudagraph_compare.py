@@ -36,6 +36,11 @@ from benchmark.external_rsnn_simulators import (
     _source_indices,
     _summarize_log,
 )
+from benchmark.sota_rsnn_cudagraph import (
+    SOTA_CUDAGRAPH_PROVIDERS,
+    prepare_matmul,
+    rsnn_forward,
+)
 from btorch.sparse import CSR
 
 
@@ -94,6 +99,53 @@ def test_standard_dense_and_csr_rsnn_baselines_are_equivalent():
     torch.testing.assert_close(dense.psc, sparse.psc, atol=1e-6, rtol=1e-6)
 
 
+def test_sota_rsnn_loop_uses_dynamic_recurrent_operator():
+    """The SOTA adapter should consume each timestep's computed spikes."""
+
+    case = BenchCase(
+        n_neuron=16,
+        batch_size=2,
+        t_steps=6,
+        fanout=4,
+        event_rate=0.2,
+    )
+    device = torch.device("cpu")
+    x_seq = make_input_sequence(case, device)
+    matrix = make_recurrent_csr(case, device)
+    weight = make_torch_csr_weight(matrix).to_dense()
+    v0 = torch.zeros(case.batch_size, case.n_neuron)
+    psc0 = torch.zeros_like(v0)
+
+    result = rsnn_forward(
+        x_seq,
+        lambda spikes: torch.nn.functional.linear(spikes, weight),
+        v0,
+        psc0,
+        case,
+    )
+    reference = make_eager_runner(x_seq, weight, case, sparse=False)()
+
+    torch.testing.assert_close(result.spikes, reference.spikes)
+    torch.testing.assert_close(result.v, reference.v)
+    torch.testing.assert_close(result.psc, reference.psc)
+
+
+@pytest.mark.parametrize(
+    "provider",
+    [
+        "mh_spgemm_cudagraph",
+        "dtc_spmm_cudagraph",
+        "flashsparse_cudagraph",
+    ],
+)
+def test_host_controlled_sota_wrappers_report_capture_limitation(provider):
+    """Non-capturable public APIs should fail explicitly, never use a fallback."""
+
+    assert provider in SOTA_CUDAGRAPH_PROVIDERS
+    with pytest.raises(NotImplementedError, match="not CUDA Graph capturable"):
+        prepare_matmul(provider, torch.empty(0), object())
+
+
 def test_latency_median_averages_two_middle_samples():
     """Even-sized benchmark samples should use the statistical median."""
 
@@ -124,6 +176,11 @@ def test_default_providers_include_external_simulator_comparisons():
         "torch_csr_cudagraph",
         "cusparse_direct_eager",
         "cusparse_direct_cudagraph",
+        "vdha_cudagraph",
+        "mh_spgemm_cudagraph",
+        "sputnik_cudagraph",
+        "dtc_spmm_cudagraph",
+        "flashsparse_cudagraph",
         "persistent_plain",
         "persistent_binning",
         "persistent_spike_block",

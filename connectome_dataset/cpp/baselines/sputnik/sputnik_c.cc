@@ -55,6 +55,19 @@ int cbn_sputnik_compute(void* handle) {
   return static_cast<int>(cudaDeviceSynchronize());
 }
 
+// Launch with caller-owned device operands on the caller's stream. This is the
+// graph-capturable entry point used by the end-to-end RSNN benchmark: it does
+// not allocate, synchronize, or copy through host memory.
+int cbn_sputnik_compute_device(void* handle, const float* x_device,
+                               float* y_device, void* stream) {
+  auto* h = static_cast<Handle*>(handle);
+  cudaError_t e = sputnik::CudaSpmm(
+      h->m, h->k, h->n, h->nnz, h->row_indices, h->values, h->row_offsets,
+      h->col_indices, x_device, y_device,
+      reinterpret_cast<cudaStream_t>(stream));
+  return static_cast<int>(e);
+}
+
 // Copy the m x n result to host (for oracle validation, off the timed path).
 void cbn_sputnik_copy_out(void* handle, float* y_host) {
   auto* h = static_cast<Handle*>(handle);

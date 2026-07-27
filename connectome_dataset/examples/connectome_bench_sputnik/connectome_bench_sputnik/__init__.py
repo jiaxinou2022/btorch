@@ -41,6 +41,13 @@ def _load_lib():
     lib.cbn_sputnik_prepare.argtypes = [ctypes.c_int] * 4 + [ctypes.c_void_p] * 4
     lib.cbn_sputnik_compute.restype = ctypes.c_int
     lib.cbn_sputnik_compute.argtypes = [ctypes.c_void_p]
+    lib.cbn_sputnik_compute_device.restype = ctypes.c_int
+    lib.cbn_sputnik_compute_device.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
     lib.cbn_sputnik_copy_out.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
     lib.cbn_sputnik_free.argtypes = [ctypes.c_void_p]
     _LIB = lib

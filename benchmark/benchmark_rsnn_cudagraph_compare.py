@@ -11,6 +11,13 @@ three persistent CUDA task schedulers:
 * ``cusparse_direct_eager`` calls cuSPARSE SpMV/SpMM directly from a CUDA
   extension with preallocated descriptors and workspace.
 * ``cusparse_direct_cudagraph`` captures that direct CUDA execution.
+* ``vdha_cudagraph`` and ``sputnik_cudagraph`` use graph-safe, device-pointer
+  launches from the corresponding connectome_dataset SOTA kernels.
+* ``mh_spgemm_cudagraph``, ``dtc_spmm_cudagraph``, and
+  ``flashsparse_cudagraph`` are included with explicit compatibility reporting;
+  their current public wrappers synchronize or perform host-controlled dynamic
+  allocation and therefore cannot be captured without an upstream raw-launch
+  entry point.
 * ``persistent_plain``, ``persistent_binning``, and
   ``persistent_spike_block`` execute one cooperative CUDA kernel per window.
 * ``genn`` uses PyGeNN's generated CUDA backend with sparse connectivity.
@@ -79,6 +86,10 @@ from benchmark.benchmark_persistent_snn import (  # noqa: E402
     make_input_sequence,
     make_recurrent_csr,
 )
+from benchmark.sota_rsnn_cudagraph import (  # noqa: E402
+    SOTA_CUDAGRAPH_PROVIDERS,
+    SotaCUDAGraphProvider,
+)
 from btorch.backend.persistent_snn import (  # noqa: E402
     PersistentSNNParams,
     make_empty_state,
@@ -95,6 +106,11 @@ Provider = Literal[
     "torch_csr_cudagraph",
     "cusparse_direct_eager",
     "cusparse_direct_cudagraph",
+    "vdha_cudagraph",
+    "mh_spgemm_cudagraph",
+    "sputnik_cudagraph",
+    "dtc_spmm_cudagraph",
+    "flashsparse_cudagraph",
     "persistent_plain",
     "persistent_binning",
     "persistent_spike_block",
@@ -109,6 +125,7 @@ PROVIDERS: tuple[Provider, ...] = (
     "torch_csr_cudagraph",
     "cusparse_direct_eager",
     "cusparse_direct_cudagraph",
+    *SOTA_CUDAGRAPH_PROVIDERS,
     "persistent_plain",
     "persistent_binning",
     "persistent_spike_block",
@@ -689,6 +706,7 @@ def bench_case(
     providers: tuple[Provider, ...],
     graph_provider: TorchCUDAGraphProvider,
     direct_cusparse_provider: DirectCuSparseProvider,
+    sota_cudagraph_provider: SotaCUDAGraphProvider,
     persistent_provider: PersistentProvider,
     external_build_root: Path | None = None,
     external_timeout: float = 1800.0,
@@ -770,6 +788,11 @@ def bench_case(
                 run = direct_cusparse_provider.fixed_runner(
                     x_seq, csr_weight, case, use_cudagraph=True
                 )
+            elif provider in SOTA_CUDAGRAPH_PROVIDERS:
+                run = sota_cudagraph_provider.fixed_runner(
+                    provider, x_seq, csr_weight, case
+                )
+                timing_method = "torch_cuda_event_cudagraph_replay"
             elif provider.startswith("persistent_"):
                 run = persistent_provider.fixed_runner(
                     x_seq,
@@ -1013,6 +1036,7 @@ def main() -> None:
 
     graph_provider = TorchCUDAGraphProvider()
     direct_cusparse_provider = DirectCuSparseProvider()
+    sota_cudagraph_provider = SotaCUDAGraphProvider()
     persistent_provider = PersistentProvider()
     external_provider_options = {
         "genn": {
@@ -1066,6 +1090,7 @@ def main() -> None:
             providers=providers,
             graph_provider=graph_provider,
             direct_cusparse_provider=direct_cusparse_provider,
+            sota_cudagraph_provider=sota_cudagraph_provider,
             persistent_provider=persistent_provider,
             external_build_root=args.external_build_root,
             external_timeout=args.external_timeout,
@@ -1090,6 +1115,7 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(all_rows)
         print(f"Saved CSV to {args.csv}")
+    sota_cudagraph_provider.close()
 
 
 if __name__ == "__main__":

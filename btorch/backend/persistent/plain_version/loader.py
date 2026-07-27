@@ -12,7 +12,7 @@ from torch.utils.cpp_extension import load as load_extension
 
 
 _loaded_config: tuple[
-    bool, bool, int, int, int, int, int, int, int, int
+    bool, bool, int, int, int, int, int, int, int, int, int
 ] | None = None
 
 
@@ -46,6 +46,15 @@ def _block_hash_config() -> tuple[int, int, int, int, int]:
     if used_slots not in (0, 1):
         raise ValueError("BTORCH_BLOCK_HASH_USED_SLOTS is unsupported.")
     return aggregation, capacity, max_probe, min_edges, used_slots
+
+
+def _warp_spec_mode() -> int:
+    mode = int(os.environ.get("BTORCH_WARP_SPEC_MODE", "0"))
+    if mode not in (0, 1, 2, 3, 4):
+        raise ValueError(
+            "BTORCH_WARP_SPEC_MODE must be 0, 1, 2, 3, or 4."
+        )
+    return mode
 
 
 def _host_compiler() -> str | None:
@@ -116,6 +125,7 @@ def load(
         hash_min_edges,
         hash_used_slots,
     ) = _block_hash_config()
+    warp_spec_mode = _warp_spec_mode()
     requested_config = (
         enable_block_stats,
         enable_block_hash,
@@ -127,6 +137,7 @@ def load(
         hash_max_probe,
         hash_min_edges,
         hash_used_slots,
+        warp_spec_mode,
     )
     if (
         _loaded_config is not None
@@ -175,6 +186,8 @@ def load(
                 f"hu{hash_used_slots}",
             ]
         )
+    if warp_spec_mode:
+        suffixes.append(f"ws{warp_spec_mode}")
     extension_suffix = f"_{'_'.join(suffixes)}"
     cuda_cflags.extend(
         [
@@ -186,8 +199,10 @@ def load(
             f"-DBTORCH_BLOCK_HASH_MAX_PROBE={hash_max_probe}",
             f"-DBTORCH_BLOCK_HASH_MIN_EDGES={hash_min_edges}",
             f"-DBTORCH_BLOCK_HASH_USED_SLOTS={hash_used_slots}",
+            f"-DBTORCH_WARP_SPEC_MODE={warp_spec_mode}",
         ]
     )
+    cflags.append(f"-DBTORCH_WARP_SPEC_MODE={warp_spec_mode}")
     if enable_block_stats:
         cflags.append("-DENABLE_BLOCK_STATS")
         cuda_cflags.append("-DENABLE_BLOCK_STATS")
@@ -197,6 +212,11 @@ def load(
     if cxx.endswith("g++-12"):
         cuda_cflags.append(f"-ccbin={cxx}")
     here = Path(__file__).resolve().parent
+    spike_block_source = (
+        "persistent_snn_spike_block_kernel.cu"
+        if warp_spec_mode == 0
+        else "persistent_snn_spike_block_warp_spec_kernel.cu"
+    )
     build_directory = Path(
         f"/tmp/btorch_extensions/btorch_persistent_snn_plain{extension_suffix}"
     )
@@ -208,7 +228,7 @@ def load(
                 str(here / "persistent_snn.cpp"),
                 str(here / "persistent_snn_plain_kernel.cu"),
                 str(here / "persistent_snn_binned_kernel.cu"),
-                str(here / "persistent_snn_spike_block_kernel.cu"),
+                str(here / spike_block_source),
             ],
             build_directory=str(build_directory),
             extra_cflags=cflags,
