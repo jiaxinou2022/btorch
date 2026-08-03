@@ -15,6 +15,10 @@
 #define BTORCH_WARP_SPEC_MODE 0
 #endif
 
+#ifndef BTORCH_LONG_WARP_SPEC_ENABLED
+#define BTORCH_LONG_WARP_SPEC_ENABLED 0
+#endif
+
 constexpr int kThreadsPerBlock = 256;
 constexpr int kMinimumEdgesPerTask = 128;
 
@@ -479,7 +483,9 @@ persistent_snn_forward_cuda_impl(
         : torch::empty({0}, options_i);
 #ifdef ENABLE_BLOCK_STATS
     constexpr int kBlockStatsColumns =
-        BTORCH_WARP_SPEC_MODE == 4 ? 44 : 23;
+        BTORCH_LONG_WARP_SPEC_ENABLED
+        ? 64
+        : (BTORCH_WARP_SPEC_MODE == 4 ? 44 : 23);
     const int64_t block_stats_records =
         static_cast<int64_t>(t_steps) * batch_size * ((n_neuron + 31) / 32);
     auto overflow = spike_block && return_dense

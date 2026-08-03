@@ -75,6 +75,57 @@ def test_empty_block_stats_have_zero_ratios():
     assert summary["aggregation_256_covered_edges"] == 0
 
 
+def test_long_segment_stats_summary_derives_pipeline_metrics():
+    """Decode the 64-column long-segment instrumentation record."""
+
+    raw = torch.zeros((1, 64), dtype=torch.int32)
+    raw[0, 23:50] = torch.tensor(
+        [
+            10,
+            4000,
+            6,
+            4,
+            1,
+            2,
+            1,
+            6,
+            8,
+            3600,
+            30,
+            30,
+            4,
+            1,
+            2,
+            3,
+            5,
+            7,
+            420,
+            70,
+            100,
+            200,
+            700,
+            10,
+            10,
+            10,
+            0,
+        ],
+        dtype=torch.int32,
+    )
+
+    summary = summarize_block_stats(
+        raw,
+        torch.tensor([0, 0], dtype=torch.int32),
+        torch.empty(0, dtype=torch.int32),
+    )
+
+    assert summary["long_runtime_edges"] == 4000
+    assert summary["long_pipeline_edge_coverage"] == 0.9
+    assert summary["long_full_segment_ratio"] == 0.6
+    assert summary["long_average_active_consumers"] == 6.0
+    assert summary["long_chunks_produced"] == 30
+    assert summary["long_chunks_consumed"] == 30
+
+
 def test_block_stats_report_v4_kernel_atomic_counters():
     """The first stats record carries kernel-wide block-v4 counters."""
 

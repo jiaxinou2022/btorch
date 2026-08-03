@@ -117,6 +117,7 @@ Provider = Literal["persistent", "cusparse_cudagraph"]
 FANOUT_BINNING_THRESHOLD = 256
 LANE_ROW_THRESHOLD = 4
 BLOCK_STATS_COLUMNS = 44
+LONG_SEGMENT_STATS_COLUMNS = 64
 HASH_AGGREGATION_SCALES = (32, 64, 128, 256, 512)
 HASH_CAPACITY = 128
 HASH_MAX_PROBES = 8
@@ -844,13 +845,25 @@ def summarize_block_stats(
 ) -> dict[str, float | int]:
     """Augment macro-collected task records with exact offline post statistics."""
 
-    supported_columns = (23, BLOCK_STATS_COLUMNS)
+    supported_columns = (
+        23,
+        BLOCK_STATS_COLUMNS,
+        LONG_SEGMENT_STATS_COLUMNS,
+    )
     if raw_stats.ndim != 2 or raw_stats.shape[1] not in supported_columns:
         raise ValueError(
             "block stats must have shape "
             f"(records, one of {supported_columns})"
         )
     stats = raw_stats.to(device="cpu", dtype=torch.int64)
+    is_b3_stats = stats.size(1) == BLOCK_STATS_COLUMNS
+    is_long_segment_stats = stats.size(1) == LONG_SEGMENT_STATS_COLUMNS
+
+    def long_runtime_stat(column: int) -> int:
+        if not is_long_segment_stats or not stats.numel():
+            return 0
+        return int(stats[0, column].item())
+
     active_task_edges = stats[:, 1]
     active_task_edges = active_task_edges[active_task_edges > 0]
     logical_edge_budget = (
@@ -928,109 +941,136 @@ def summarize_block_stats(
         "kernel_hash_probe_attempts": (
             int(stats[0, 22].item()) if stats.numel() else 0
         ),
+        "long_runtime_tasks": long_runtime_stat(23),
+        "long_runtime_edges": long_runtime_stat(24),
+        "long_full_segments": long_runtime_stat(25),
+        "long_partial_segments": long_runtime_stat(26),
+        "long_segments_128_255": long_runtime_stat(27),
+        "long_segments_256_383": long_runtime_stat(28),
+        "long_segments_384_511": long_runtime_stat(29),
+        "long_segments_512": long_runtime_stat(30),
+        "long_pipeline_eligible_tasks": long_runtime_stat(31),
+        "long_pipeline_eligible_edges": long_runtime_stat(32),
+        "long_chunks_produced": long_runtime_stat(33),
+        "long_chunks_consumed": long_runtime_stat(34),
+        "long_producer_idle": long_runtime_stat(35),
+        "long_producer_no_slot": long_runtime_stat(36),
+        "long_producer_no_consumer": long_runtime_stat(37),
+        "long_consumer_task_wait": long_runtime_stat(38),
+        "long_consumer_chunk_wait": long_runtime_stat(39),
+        "long_max_active_consumers": long_runtime_stat(40),
+        "long_active_consumer_cycle_k": long_runtime_stat(41),
+        "long_pipeline_cycle_k": long_runtime_stat(42),
+        "long_path_cycle_k": long_runtime_stat(43),
+        "block_path_cycle_k": long_runtime_stat(44),
+        "update_path_cycle_k": long_runtime_stat(45),
+        "long_slot_use_0": long_runtime_stat(46),
+        "long_slot_use_1": long_runtime_stat(47),
+        "long_slot_use_2": long_runtime_stat(48),
+        "long_slot_use_3": long_runtime_stat(49),
         "b3_ordinary_tasks": (
             int(stats[0, 23].item())
-            if stats.numel() and stats.size(1) > 23
+            if is_b3_stats and stats.size(1) > 23
             else 0
         ),
         "b3_ordinary_edges": (
             int(stats[0, 24].item())
-            if stats.numel() and stats.size(1) > 24
+            if is_b3_stats and stats.size(1) > 24
             else 0
         ),
         "b3_eligible_tasks": (
             int(stats[0, 25].item())
-            if stats.numel() and stats.size(1) > 25
+            if is_b3_stats and stats.size(1) > 25
             else 0
         ),
         "b3_eligible_edges": (
             int(stats[0, 26].item())
-            if stats.numel() and stats.size(1) > 26
+            if is_b3_stats and stats.size(1) > 26
             else 0
         ),
         "b3_staged_tasks": (
             int(stats[0, 27].item())
-            if stats.numel() and stats.size(1) > 27
+            if is_b3_stats and stats.size(1) > 27
             else 0
         ),
         "b3_staged_edges": (
             int(stats[0, 28].item())
-            if stats.numel() and stats.size(1) > 28
+            if is_b3_stats and stats.size(1) > 28
             else 0
         ),
         "b3_fallback_tasks": (
             int(stats[0, 29].item())
-            if stats.numel() and stats.size(1) > 29
+            if is_b3_stats and stats.size(1) > 29
             else 0
         ),
         "b3_fallback_edges": (
             int(stats[0, 30].item())
-            if stats.numel() and stats.size(1) > 30
+            if is_b3_stats and stats.size(1) > 30
             else 0
         ),
         "b3_edges_256_383": (
             int(stats[0, 31].item())
-            if stats.numel() and stats.size(1) > 31
+            if is_b3_stats and stats.size(1) > 31
             else 0
         ),
         "b3_edges_384_511": (
             int(stats[0, 32].item())
-            if stats.numel() and stats.size(1) > 32
+            if is_b3_stats and stats.size(1) > 32
             else 0
         ),
         "b3_edges_512": (
             int(stats[0, 33].item())
-            if stats.numel() and stats.size(1) > 33
+            if is_b3_stats and stats.size(1) > 33
             else 0
         ),
         "b3_one_chunk_tasks": (
             int(stats[0, 34].item())
-            if stats.numel() and stats.size(1) > 34
+            if is_b3_stats and stats.size(1) > 34
             else 0
         ),
         "b3_two_chunk_tasks": (
             int(stats[0, 35].item())
-            if stats.numel() and stats.size(1) > 35
+            if is_b3_stats and stats.size(1) > 35
             else 0
         ),
         "b3_three_chunk_tasks": (
             int(stats[0, 36].item())
-            if stats.numel() and stats.size(1) > 36
+            if is_b3_stats and stats.size(1) > 36
             else 0
         ),
         "b3_four_chunk_tasks": (
             int(stats[0, 37].item())
-            if stats.numel() and stats.size(1) > 37
+            if is_b3_stats and stats.size(1) > 37
             else 0
         ),
         "b3_max_active_consumers": (
             int(stats[0, 38].item())
-            if stats.numel() and stats.size(1) > 38
+            if is_b3_stats and stats.size(1) > 38
             else 0
         ),
         "b3_active_consumer_samples": (
             int(stats[0, 39].item())
-            if stats.numel() and stats.size(1) > 39
+            if is_b3_stats and stats.size(1) > 39
             else 0
         ),
         "b3_active_consumer_sum": (
             int(stats[0, 40].item())
-            if stats.numel() and stats.size(1) > 40
+            if is_b3_stats and stats.size(1) > 40
             else 0
         ),
         "b3_chunks_produced": (
             int(stats[0, 41].item())
-            if stats.numel() and stats.size(1) > 41
+            if is_b3_stats and stats.size(1) > 41
             else 0
         ),
         "b3_chunks_consumed": (
             int(stats[0, 42].item())
-            if stats.numel() and stats.size(1) > 42
+            if is_b3_stats and stats.size(1) > 42
             else 0
         ),
         "b3_producer_idle_loops": (
             int(stats[0, 43].item())
-            if stats.numel() and stats.size(1) > 43
+            if is_b3_stats and stats.size(1) > 43
             else 0
         ),
         "logical_block_task_count": int(logical_task_edges.numel()),
@@ -1111,6 +1151,13 @@ def summarize_block_stats(
 
     task_count = totals["block_task_count"]
     dispatch_count = task_count + totals["long_segment_tasks"]
+    recurrent_edges = totals["active_edges"] + totals["long_runtime_edges"]
+    recurrent_tasks = task_count + totals["long_runtime_tasks"]
+    measured_path_cycles = (
+        totals["long_path_cycle_k"]
+        + totals["block_path_cycle_k"]
+        + totals["update_path_cycle_k"]
+    )
     derived: dict[str, float] = {
         "average_spikes_per_task": ratio(totals["active_rows"], task_count),
         "average_runs_per_task": ratio(totals["active_run_count"], task_count),
@@ -1143,6 +1190,33 @@ def summarize_block_stats(
         ),
         "long_segment_task_ratio": ratio(
             totals["long_segment_tasks"], dispatch_count
+        ),
+        "long_runtime_task_coverage": ratio(
+            totals["long_runtime_tasks"], recurrent_tasks
+        ),
+        "long_runtime_edge_coverage": ratio(
+            totals["long_runtime_edges"], recurrent_edges
+        ),
+        "long_full_segment_ratio": ratio(
+            totals["long_full_segments"], totals["long_runtime_tasks"]
+        ),
+        "long_average_edges_per_segment": ratio(
+            totals["long_runtime_edges"], totals["long_runtime_tasks"]
+        ),
+        "long_pipeline_task_coverage": ratio(
+            totals["long_pipeline_eligible_tasks"],
+            totals["long_runtime_tasks"],
+        ),
+        "long_pipeline_edge_coverage": ratio(
+            totals["long_pipeline_eligible_edges"],
+            totals["long_runtime_edges"],
+        ),
+        "long_path_cycle_share": ratio(
+            totals["long_path_cycle_k"], measured_path_cycles
+        ),
+        "long_average_active_consumers": ratio(
+            totals["long_active_consumer_cycle_k"],
+            totals["long_pipeline_cycle_k"],
         ),
         "v4_atomic_ratio": ratio(
             totals["v4_global_atomics"],
@@ -1260,6 +1334,20 @@ def benchmark_row(
         ),
         "long_segment_size": int(
             os.environ.get("BTORCH_LONG_SEGMENT_SIZE", "1024")
+        ),
+        "long_warp_spec_mode": (
+            int(os.environ["BTORCH_LONG_WARP_SPEC_MODE"])
+            if "BTORCH_LONG_WARP_SPEC_MODE" in os.environ
+            else -1
+        ),
+        "long_warp_spec_chunk": int(
+            os.environ.get("BTORCH_LONG_WARP_SPEC_CHUNK", "128")
+        ),
+        "long_warp_spec_stages": int(
+            os.environ.get("BTORCH_LONG_WARP_SPEC_STAGES", "3")
+        ),
+        "long_warp_spec_threshold": int(
+            os.environ.get("BTORCH_LONG_WARP_SPEC_THRESHOLD", "256")
         ),
         "tile_reduce": {
             "0": "off",

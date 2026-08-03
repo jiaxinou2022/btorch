@@ -11,9 +11,7 @@ from shutil import which
 from torch.utils.cpp_extension import load as load_extension
 
 
-_loaded_config: tuple[
-    bool, bool, int, int, int, int, int, int, int, int, int
-] | None = None
+_loaded_config: tuple[object, ...] | None = None
 
 
 def _block_v4_config() -> tuple[int, int, int]:
@@ -55,6 +53,28 @@ def _warp_spec_mode() -> int:
             "BTORCH_WARP_SPEC_MODE must be 0, 1, 2, 3, or 4."
         )
     return mode
+
+
+def _long_warp_spec_config() -> tuple[bool, int, int, int, int]:
+    enabled = "BTORCH_LONG_WARP_SPEC_MODE" in os.environ
+    mode = int(os.environ.get("BTORCH_LONG_WARP_SPEC_MODE", "0"))
+    chunk = int(os.environ.get("BTORCH_LONG_WARP_SPEC_CHUNK", "128"))
+    stages = int(os.environ.get("BTORCH_LONG_WARP_SPEC_STAGES", "3"))
+    threshold = int(
+        os.environ.get("BTORCH_LONG_WARP_SPEC_THRESHOLD", "256")
+    )
+    if mode not in (0, 1, 2, 3):
+        raise ValueError(
+            "BTORCH_LONG_WARP_SPEC_MODE must be 0, 1, 2, or 3; "
+            "S4/S5 remain gated on the S3 experiment."
+        )
+    if chunk not in (64, 128, 256):
+        raise ValueError("BTORCH_LONG_WARP_SPEC_CHUNK is unsupported.")
+    if stages not in (2, 3, 4):
+        raise ValueError("BTORCH_LONG_WARP_SPEC_STAGES is unsupported.")
+    if threshold not in (128, 256, 384, 512):
+        raise ValueError("BTORCH_LONG_WARP_SPEC_THRESHOLD is unsupported.")
+    return enabled, mode, chunk, stages, threshold
 
 
 def _host_compiler() -> str | None:
@@ -126,6 +146,18 @@ def load(
         hash_used_slots,
     ) = _block_hash_config()
     warp_spec_mode = _warp_spec_mode()
+    (
+        long_warp_spec_enabled,
+        long_warp_spec_mode,
+        long_warp_spec_chunk,
+        long_warp_spec_stages,
+        long_warp_spec_threshold,
+    ) = _long_warp_spec_config()
+    if long_warp_spec_enabled and warp_spec_mode:
+        raise ValueError(
+            "Block and long-segment warp specialization modes cannot "
+            "be enabled together."
+        )
     requested_config = (
         enable_block_stats,
         enable_block_hash,
@@ -138,6 +170,11 @@ def load(
         hash_min_edges,
         hash_used_slots,
         warp_spec_mode,
+        long_warp_spec_enabled,
+        long_warp_spec_mode,
+        long_warp_spec_chunk,
+        long_warp_spec_stages,
+        long_warp_spec_threshold,
     )
     if (
         _loaded_config is not None
@@ -188,6 +225,15 @@ def load(
         )
     if warp_spec_mode:
         suffixes.append(f"ws{warp_spec_mode}")
+    if long_warp_spec_enabled:
+        suffixes.extend(
+            [
+                f"lws{long_warp_spec_mode}",
+                f"lc{long_warp_spec_chunk}",
+                f"ls{long_warp_spec_stages}",
+                f"lt{long_warp_spec_threshold}",
+            ]
+        )
     extension_suffix = f"_{'_'.join(suffixes)}"
     cuda_cflags.extend(
         [
@@ -200,9 +246,17 @@ def load(
             f"-DBTORCH_BLOCK_HASH_MIN_EDGES={hash_min_edges}",
             f"-DBTORCH_BLOCK_HASH_USED_SLOTS={hash_used_slots}",
             f"-DBTORCH_WARP_SPEC_MODE={warp_spec_mode}",
+            f"-DBTORCH_LONG_WARP_SPEC_MODE={long_warp_spec_mode}",
+            f"-DBTORCH_LONG_WARP_SPEC_CHUNK={long_warp_spec_chunk}",
+            f"-DBTORCH_LONG_WARP_SPEC_STAGES={long_warp_spec_stages}",
+            f"-DBTORCH_LONG_WARP_SPEC_THRESHOLD={long_warp_spec_threshold}",
         ]
     )
     cflags.append(f"-DBTORCH_WARP_SPEC_MODE={warp_spec_mode}")
+    cflags.append(
+        f"-DBTORCH_LONG_WARP_SPEC_ENABLED="
+        f"{int(long_warp_spec_enabled)}"
+    )
     if enable_block_stats:
         cflags.append("-DENABLE_BLOCK_STATS")
         cuda_cflags.append("-DENABLE_BLOCK_STATS")
@@ -212,11 +266,16 @@ def load(
     if cxx.endswith("g++-12"):
         cuda_cflags.append(f"-ccbin={cxx}")
     here = Path(__file__).resolve().parent
-    spike_block_source = (
-        "persistent_snn_spike_block_kernel.cu"
-        if warp_spec_mode == 0
-        else "persistent_snn_spike_block_warp_spec_kernel.cu"
-    )
+    if long_warp_spec_enabled:
+        spike_block_source = (
+            "persistent_snn_spike_block_segment_warp_spec_kernel.cu"
+        )
+    elif warp_spec_mode == 0:
+        spike_block_source = "persistent_snn_spike_block_kernel.cu"
+    else:
+        spike_block_source = (
+            "persistent_snn_spike_block_warp_spec_kernel.cu"
+        )
     build_directory = Path(
         f"/tmp/btorch_extensions/btorch_persistent_snn_plain{extension_suffix}"
     )

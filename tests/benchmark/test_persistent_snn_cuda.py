@@ -486,6 +486,51 @@ def test_cuda_persistent_spike_block_matches_dense_reference(fanouts):
     torch.testing.assert_close(out.state.psc, ref_psc, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.parametrize(
+    "fanouts",
+    [
+        # Splitting these rows at 512 edges creates final SegmentTasks at every
+        # boundary required by the long-segment transport protocol.
+        (513, 639, 640, 641, 767, 768, 895, 896, 1023, 1024),
+        # Exercise producer drain both below and above the seven-consumer
+        # ownership boundary.
+        (512,),
+        (512, 512),
+        (512,) * 7,
+        (512,) * 8,
+    ],
+)
+def test_cuda_persistent_spike_block_long_segment_boundaries(fanouts):
+    """Preserve every long-segment boundary and producer drain case."""
+
+    device = _require_cuda()
+    graph, dense = _fanout_bucket_graph(device, fanouts)
+    n_neuron = graph.shape[0]
+    x_seq = torch.zeros(1, 1, n_neuron, device=device, dtype=torch.float32)
+    x_seq[0, 0, : len(fanouts)] = 1.2
+    state = PersistentSNNState(
+        v=torch.zeros(1, n_neuron, device=device),
+        psc=torch.zeros(1, n_neuron, device=device),
+    )
+    params = PersistentSNNParams(window_size=1)
+
+    out = _run_cuda_or_skip(
+        _dense_to_events(x_seq),
+        graph,
+        state,
+        params,
+        return_mode="both",
+        spike_block=True,
+    )
+    ref_spikes, ref_v, ref_psc = _reference(x_seq, dense, state, params)
+
+    assert out.spikes is not None
+    assert out.spike_events is not None
+    torch.testing.assert_close(out.spikes, ref_spikes, atol=0, rtol=0)
+    torch.testing.assert_close(out.state.v, ref_v, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out.state.psc, ref_psc, atol=1e-5, rtol=1e-5)
+
+
 def test_cuda_persistent_spike_block_merges_duplicate_posts():
     """Block and segment tasks should sum duplicate posts correctly.
 

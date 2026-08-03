@@ -202,6 +202,11 @@ std::shared_ptr<Plan> get_plan(int64_t plan_id) {
     return iterator->second;
 }
 
+int64_t get_workspace_bytes(int64_t plan_id) {
+    auto plan = get_plan(plan_id);
+    return plan->workspace.numel() * plan->workspace.element_size();
+}
+
 void run(
     int64_t plan_id,
     torch::Tensor input,
@@ -297,5 +302,9 @@ void run(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.def("prepare", &prepare, "Prepare direct cuSPARSE RSNN descriptors");
+    module.def(
+        "workspace_bytes",
+        &get_workspace_bytes,
+        "Return direct cuSPARSE workspace bytes");
     module.def("run", &run, "Run direct cuSPARSE RSNN forward");
 }

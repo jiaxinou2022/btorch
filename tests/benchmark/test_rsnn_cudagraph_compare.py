@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,7 @@ import torch
 
 import benchmark.benchmark_rsnn_cudagraph_compare as comparison
 import benchmark.benchmark_rsnn_roofline as roofline
+import benchmark.sota_rsnn_cudagraph as sota_adapters
 from benchmark.benchmark_persistent_snn import (
     BenchCase,
     RSNNResult,
@@ -22,13 +24,17 @@ from benchmark.benchmark_rsnn_cudagraph_compare import (
     FLYBRAIN_DEFAULT_PROVIDERS,
     PROVIDERS,
     DirectCuSparseProvider,
+    comparable_rows,
     correctness_metrics,
     latency_summary,
     load_flybrain_csr,
     make_eager_runner,
     make_torch_csr_weight,
     median_ms,
+    pad_csr_neurons,
+    provider_supports,
     resolve_dataset_defaults,
+    time_samples_ms,
 )
 from benchmark.external_rsnn_simulators import (
     _genn_simulate,
@@ -36,9 +42,16 @@ from benchmark.external_rsnn_simulators import (
     _source_indices,
     _summarize_log,
 )
+from benchmark.provider_common import BenchmarkRunner, PreparedMetadata
 from benchmark.sota_rsnn_cudagraph import (
+    CUDA_SPMSPV_PROVIDERS,
     SOTA_CUDAGRAPH_PROVIDERS,
+    SOTA_EAGER_PROVIDERS,
+    SPMSPV_EAGER_PROVIDERS,
+    prepare_eager_matmul,
     prepare_matmul,
+    prepare_sputnik_operator,
+    prepare_vdha_dense_operator,
     rsnn_forward,
 )
 from btorch.sparse import CSR
@@ -89,9 +102,7 @@ def test_standard_dense_and_csr_rsnn_baselines_are_equivalent():
     matrix = make_recurrent_csr(case, device)
     csr_weight = make_torch_csr_weight(matrix)
 
-    dense = make_eager_runner(
-        x_seq, csr_weight.to_dense(), case, sparse=False
-    )()
+    dense = make_eager_runner(x_seq, csr_weight.to_dense(), case, sparse=False)()
     sparse = make_eager_runner(x_seq, csr_weight, case, sparse=True)()
 
     torch.testing.assert_close(dense.spikes, sparse.spikes, atol=0, rtol=0)
@@ -130,20 +141,483 @@ def test_sota_rsnn_loop_uses_dynamic_recurrent_operator():
     torch.testing.assert_close(result.psc, reference.psc)
 
 
+def test_non_capturable_sota_wrappers_use_named_eager_fallbacks():
+    """Host-controlled providers should never be mislabeled as CUDA Graphs."""
+
+    assert SOTA_CUDAGRAPH_PROVIDERS == (
+        "vdha_cudagraph",
+        "sputnik_cudagraph",
+    )
+    assert SOTA_EAGER_PROVIDERS[:4] == (
+        "mh_spgemm_eager",
+        "dtc_spmm_eager",
+        "flashsparse_eager",
+        "torch_csr_host_e2e",
+    )
+    assert SOTA_EAGER_PROVIDERS[4:] == SPMSPV_EAGER_PROVIDERS
+    assert set(CUDA_SPMSPV_PROVIDERS.values()) == {
+        "vdha",
+        "vdha_pipe",
+        "tilespmspv",
+        "sortspmspv",
+        "globalatomic",
+        "blockatomic",
+        "blocksort",
+        "naivespmspv",
+        "holaspmspv",
+    }
+
+
+def test_sputnik_batch_one_adapter_reuses_zero_copy_buffers(monkeypatch):
+    """Sputnik B=1 should view the input and reuse one prepared output."""
+
+    calls = []
+
+    class FakeSputnikLibrary:
+        def cbn_sputnik_prepare(self, *args):
+            return 1
+
+        def cbn_sputnik_compute_device(self, handle, rhs, output, stream):
+            calls.append((rhs.value, output.value))
+            return 0
+
+        def cbn_sputnik_free(self, handle):
+            return None
+
+    fake_module = types.SimpleNamespace(_load_lib=lambda: FakeSputnikLibrary())
+    monkeypatch.setitem(sys.modules, "connectome_bench_sputnik", fake_module)
+    monkeypatch.setattr(sota_adapters, "_stream_pointer", lambda: None)
+    weight = torch.eye(4).to_sparse_csr()
+    case = BenchCase(
+        n_neuron=4,
+        batch_size=1,
+        t_steps=1,
+        fanout=1,
+        event_rate=0.1,
+    )
+    matmul, release = prepare_matmul("sputnik_cudagraph", weight, case)
+    spikes = torch.ones(1, 4)
+
+    first = matmul(spikes)
+    second = matmul(spikes)
+    release()
+
+    assert getattr(matmul, "_btorch_transform_mode") == "zero_copy_view"
+    assert first.data_ptr() == second.data_ptr()
+    assert calls[0][0] == spikes.data_ptr()
+    assert calls[1][0] == spikes.data_ptr()
+    assert calls[0][1] == calls[1][1] == first.data_ptr()
+
+
+def test_vdha_dense_adapter_reuses_preallocated_output(monkeypatch):
+    """VDHA dense-input calls should reuse the prepared device output."""
+
+    output_pointers = []
+
+    class FakeVdhaLibrary:
+        def cbn_vdha_prepare_dense(self, *args):
+            return 1
+
+        def cbn_vdha_compute_dense_device(self, handle, spikes, output, stream):
+            output_pointers.append(output.value)
+            return 0
+
+        def cbn_vdha_free(self, handle):
+            return None
+
+    fake_module = types.SimpleNamespace(_load_lib=lambda dtype: FakeVdhaLibrary())
+    monkeypatch.setitem(sys.modules, "connectome_bench_vdha", fake_module)
+    monkeypatch.setattr(sota_adapters, "_stream_pointer", lambda: None)
+    weight = torch.eye(4).to_sparse_csr()
+    case = BenchCase(
+        n_neuron=4,
+        batch_size=1,
+        t_steps=1,
+        fanout=1,
+        event_rate=0.1,
+    )
+    matmul, release = prepare_matmul("vdha_cudagraph", weight, case)
+    spikes = torch.ones(1, 4)
+
+    first = matmul(spikes)
+    second = matmul(spikes)
+    release()
+
+    assert first.data_ptr() == second.data_ptr()
+    assert output_pointers == [first.data_ptr(), first.data_ptr()]
+
+
+def test_structured_sputnik_operator_has_distinct_native_entry(monkeypatch):
+    """Native NB and adapted BN traces should use separate output buffers."""
+
+    calls = []
+
+    class FakeSputnikLibrary:
+        def cbn_sputnik_prepare(self, *args):
+            return 1
+
+        def cbn_sputnik_compute_device(self, handle, rhs, output, stream):
+            calls.append((rhs.value, output.value))
+            return 0
+
+        def cbn_sputnik_free(self, handle):
+            return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "connectome_bench_sputnik",
+        types.SimpleNamespace(_load_lib=lambda: FakeSputnikLibrary()),
+    )
+    monkeypatch.setattr(sota_adapters, "_stream_pointer", lambda: None)
+    weight = torch.eye(4).to_sparse_csr()
+    case = BenchCase(
+        n_neuron=4,
+        batch_size=1,
+        t_steps=2,
+        fanout=1,
+        event_rate=0.1,
+    )
+    spikes = torch.ones(2, 1, 4)
+
+    prepared = prepare_sputnik_operator(weight, spikes, case)
+    prepared.native_run()
+    prepared.adapted_run()
+
+    assert prepared.metadata.native_available
+    assert prepared.transform_run is None
+    assert prepared.native_output is not None
+    assert prepared.native_output.data_ptr() != prepared.adapted_output.data_ptr()
+    assert len(calls) == 4
+    prepared.release()
+
+
+def test_structured_vdha_dense_does_not_invent_native_curve(monkeypatch):
+    """Dense VDHA has one valid dynamic path until a sparse device ABI exists."""
+
+    class FakeVdhaLibrary:
+        def cbn_vdha_prepare_dense(self, *args):
+            return 1
+
+        def cbn_vdha_compute_dense_device(self, *args):
+            return 0
+
+        def cbn_vdha_free(self, handle):
+            return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "connectome_bench_vdha",
+        types.SimpleNamespace(_load_lib=lambda dtype: FakeVdhaLibrary()),
+    )
+    monkeypatch.setattr(sota_adapters, "_stream_pointer", lambda: None)
+    weight = torch.eye(4).to_sparse_csr()
+    case = BenchCase(
+        n_neuron=4,
+        batch_size=1,
+        t_steps=2,
+        fanout=1,
+        event_rate=0.1,
+    )
+
+    prepared = prepare_vdha_dense_operator(
+        weight,
+        torch.ones(2, 1, 4),
+        case,
+    )
+
+    assert prepared.native_run is None
+    assert prepared.native_output is None
+    assert not prepared.metadata.native_available
+    assert prepared.metadata.native_status == "not_distinct_from_adapter"
+    prepared.release()
+
+
+def test_split_spmspv_adapter_reuses_matrix_and_accepts_empty_spikes(
+    monkeypatch,
+):
+    """The RSNN adapter should preprocess A once and update only sparse x."""
+
+    from connectome_dataset.benchmarks.cuda import kernels
+
+    calls = {"prepare": 0, "step": [], "free": 0}
+
+    class FakePreparedKernel:
+        def __init__(self, spec, matrix, *, precision):
+            calls["prepare"] += 1
+            assert spec.provider == "vdha"
+            assert precision == "fp32"
+            assert matrix.shape == (4, 4)
+
+        def step(self, indices, values):
+            calls["step"].append((indices.copy(), values.copy()))
+            output = np.zeros(4, dtype=np.float32)
+            output[indices] = values
+            return output
+
+        def free(self):
+            calls["free"] += 1
+
+    monkeypatch.setattr(kernels, "PreparedKernel", FakePreparedKernel)
+    monkeypatch.setattr(kernels, "supports_preprocess", lambda spec, p: True)
+    weight = torch.eye(4).to_sparse_csr()
+    case = BenchCase(
+        n_neuron=4,
+        batch_size=1,
+        t_steps=2,
+        fanout=1,
+        event_rate=0.1,
+    )
+
+    matmul = prepare_eager_matmul("vdha_spmspv_eager", weight, case)
+    nonempty = matmul(torch.tensor([[0.0, 1.0, 0.0, 1.0]]))
+    empty = matmul(torch.zeros(1, 4))
+    getattr(matmul, "_btorch_release")()
+
+    torch.testing.assert_close(nonempty, torch.tensor([[0.0, 1.0, 0.0, 1.0]]))
+    torch.testing.assert_close(empty, torch.zeros(1, 4))
+    assert calls["prepare"] == 1
+    assert calls["step"][0][0].tolist() == [1, 3]
+    assert calls["step"][1][0].size == 0
+    assert calls["free"] == 1
+
+
+def test_adaptive_spmspv_freezes_lazy_handles_after_priming(monkeypatch, tmp_path):
+    """Timed selector execution must not preprocess a newly selected kernel."""
+
+    from connectome_dataset.benchmarks.cuda import adaptive, kernels
+
+    class FakeSelector:
+        def predict(self, features):
+            return "globalatomic" if features["nnz_x"] <= 1 else "naivespmspv"
+
+    class FakePreparedKernel:
+        freed = []
+
+        def __init__(self, spec, matrix, *, precision):
+            self.provider = spec.provider
+
+        def step(self, indices, values):
+            return np.zeros(4, dtype=np.float32)
+
+        def free(self):
+            self.freed.append(self.provider)
+
+    monkeypatch.setattr(
+        adaptive.AdaptiveSelector,
+        "load",
+        classmethod(lambda cls, path: FakeSelector()),
+    )
+    monkeypatch.setattr(kernels, "PreparedKernel", FakePreparedKernel)
+    monkeypatch.setattr(kernels, "supports_preprocess", lambda spec, p: True)
+    model = tmp_path / "selector.joblib"
+    model.write_bytes(b"fake")
+    weight = torch.eye(4).to_sparse_csr()
+    case = BenchCase(
+        n_neuron=4,
+        batch_size=1,
+        t_steps=1,
+        fanout=1,
+        event_rate=0.1,
+    )
+    matmul = prepare_eager_matmul(
+        "adaptive_spmspv_eager",
+        weight,
+        case,
+        selector_model_paths={"adaptive_spmspv_eager": model},
+    )
+
+    matmul(torch.tensor([[1.0, 0.0, 0.0, 0.0]]))
+    getattr(matmul, "_btorch_freeze_after_prime")()
+    matmul(torch.tensor([[0.0, 1.0, 0.0, 0.0]]))
+    with pytest.raises(RuntimeError, match="unprimed kernel"):
+        matmul(torch.tensor([[1.0, 1.0, 0.0, 0.0]]))
+    getattr(matmul, "_btorch_release")()
+
+    assert FakePreparedKernel.freed == ["globalatomic"]
+
+
 @pytest.mark.parametrize(
-    "provider",
+    ("provider", "module_name"),
     [
-        "mh_spgemm_cudagraph",
-        "dtc_spmm_cudagraph",
-        "flashsparse_cudagraph",
+        (
+            "dtc_spmm_eager",
+            "connectome_dataset.benchmarks.torch.dtc.spmm",
+        ),
+        (
+            "flashsparse_eager",
+            "connectome_dataset.benchmarks.torch.flashsparse.spmm",
+        ),
     ],
 )
-def test_host_controlled_sota_wrappers_report_capture_limitation(provider):
-    """Non-capturable public APIs should fail explicitly, never use a fallback."""
+def test_dtc_and_flashsparse_preprocess_once_per_runner(
+    monkeypatch, provider, module_name
+):
+    """A timestep must reuse one prepared sparse plan."""
 
-    assert provider in SOTA_CUDAGRAPH_PROVIDERS
-    with pytest.raises(NotImplementedError, match="not CUDA Graph capturable"):
-        prepare_matmul(provider, torch.empty(0), object())
+    module = __import__(module_name, fromlist=["spmm"])
+    calls = {"prepare": 0, "run": 0}
+
+    def fake_make_dynamic_fn(matrix, **kwargs):
+        calls["prepare"] += 1
+        assert matrix.nnz == 4
+        assert kwargs["batch_size"] == 32
+
+        def dynamic_run(rhs):
+            calls["run"] += 1
+            return rhs.clone(), 0.0
+
+        return dynamic_run
+
+    monkeypatch.setattr(module, "make_dynamic_fn", fake_make_dynamic_fn, raising=False)
+    row = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int64)
+    col = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+    weight = torch.sparse_csr_tensor(
+        row,
+        col,
+        torch.ones(4),
+        size=(4, 4),
+    )
+    case = BenchCase(
+        n_neuron=4,
+        batch_size=32,
+        t_steps=5,
+        fanout=1,
+        event_rate=0.1,
+    )
+
+    matmul = prepare_eager_matmul(provider, weight, case)
+    for _ in range(case.t_steps):
+        output = matmul(torch.ones(case.batch_size, case.n_neuron))
+
+    assert calls == {"prepare": 1, "run": case.t_steps}
+    assert output.shape == (case.batch_size, case.n_neuron)
+
+
+def test_sota_capabilities_reject_unsupported_batch_one_providers():
+    """Fixed-width providers should be skipped without changing the workload."""
+
+    case = BenchCase(
+        n_neuron=4096,
+        batch_size=1,
+        t_steps=32,
+        fanout=32,
+        event_rate=0.01,
+    )
+
+    for provider in (
+        "torch_csr_cudagraph",
+        "vdha_cudagraph",
+        "sputnik_cudagraph",
+        "torch_csr_host_e2e",
+        *SPMSPV_EAGER_PROVIDERS,
+    ):
+        assert provider_supports(provider, case) == (True, "")
+
+    for provider in (
+        "mh_spgemm_eager",
+        "dtc_spmm_eager",
+        "flashsparse_eager",
+    ):
+        supported, reason = provider_supports(provider, case)
+        assert not supported
+        assert "batch_size=1" in reason
+
+
+def test_csr_neuron_padding_adds_only_isolated_rows():
+    """Neuron padding should preserve every edge and avoid batch padding."""
+
+    matrix = CSR.from_edges(
+        row=torch.tensor([0, 2]),
+        col=torch.tensor([1, 0]),
+        data=torch.tensor([0.5, -0.25]),
+        shape=(3, 3),
+    )
+
+    padded, info = pad_csr_neurons(matrix, n_alignment=4)
+
+    assert info.logical_n == 3
+    assert info.physical_n == 4
+    assert info.padding_ratio == pytest.approx(4 / 3)
+    assert padded.shape == (4, 4)
+    assert padded.indptr.tolist() == [0, 1, 1, 2, 2]
+    torch.testing.assert_close(padded.indices, matrix.indices)
+    torch.testing.assert_close(padded.data, matrix.data)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_before_sample_reset_policy_resets_every_timed_inference():
+    """Stateful timing must reset outside every measured CUDA interval."""
+
+    state = torch.ones(1, device="cuda")
+    resets = 0
+
+    def reset():
+        nonlocal resets
+        resets += 1
+        state.zero_()
+
+    def run():
+        state.add_(1)
+        return RSNNResult(
+            spikes=state.view(1, 1, 1),
+            v=state.view(1, 1),
+            psc=state.view(1, 1),
+        )
+
+    metadata = PreparedMetadata(
+        logical_shape=(1, 1, 1),
+        physical_shape=(1, 1, 1),
+        input_layout="BN",
+        operator_layout="BN",
+        index_dtype="none",
+        value_dtype="torch.float32",
+        compute_dtype="torch.float32",
+        workspace_bytes=0,
+        persistent_bytes=state.numel() * state.element_size(),
+        padding_ratio=1.0,
+        execution_class="device_native",
+        timing_scope="gpu_execution",
+    )
+    runner = BenchmarkRunner(
+        run_fn=run,
+        reset_fn=reset,
+        metadata=metadata,
+        reset_policy="before_sample",
+    )
+
+    samples = time_samples_ms(runner, warmup=2, repeat=3)
+
+    assert len(samples) == 3
+    # One reset starts each phase, and every warmup/timed sample gets its own
+    # reset. Those reset kernels are enqueued before the CUDA start event.
+    assert resets == 2 + 2 + 3
+    torch.testing.assert_close(state, torch.ones_like(state))
+
+
+def test_comparison_group_isolates_adapted_and_host_execution():
+    """Speedups must not cross execution-class or timing-scope boundaries."""
+
+    baseline = {
+        "dataset": "uniform",
+        "logical_n": 4096,
+        "logical_batch": 1,
+        "t_steps": 32,
+        "timing_scope": "gpu_execution",
+        "execution_class": "device_native",
+        "benchmark_mode": "full_rsnn",
+        "state_semantics": "independent_inference",
+    }
+
+    assert comparable_rows(dict(baseline), baseline)
+    for field, value in (
+        ("execution_class", "device_adapted"),
+        ("timing_scope", "public_wrapper_e2e"),
+        ("logical_batch", 32),
+        ("state_semantics", "continuous_samples"),
+    ):
+        candidate = dict(baseline)
+        candidate[field] = value
+        assert not comparable_rows(candidate, baseline)
 
 
 def test_latency_median_averages_two_middle_samples():
@@ -177,10 +651,12 @@ def test_default_providers_include_external_simulator_comparisons():
         "cusparse_direct_eager",
         "cusparse_direct_cudagraph",
         "vdha_cudagraph",
-        "mh_spgemm_cudagraph",
         "sputnik_cudagraph",
-        "dtc_spmm_cudagraph",
-        "flashsparse_cudagraph",
+        "mh_spgemm_eager",
+        "dtc_spmm_eager",
+        "flashsparse_eager",
+        "torch_csr_host_e2e",
+        *SPMSPV_EAGER_PROVIDERS,
         "persistent_plain",
         "persistent_binning",
         "persistent_spike_block",
@@ -261,6 +737,9 @@ def test_flybrain_is_the_default_dataset(monkeypatch):
 
     assert comparison_args.dataset == "flybrain"
     assert comparison_args.weight_scale == pytest.approx(0.275)
+    assert comparison_args.eager_warmup == 0
+    assert comparison_args.eager_repeat == 1
+    assert not comparison_args.continuous_state
     assert roofline_args.dataset == "flybrain"
     assert roofline_args.weight_scale == pytest.approx(0.275)
 
@@ -424,6 +903,27 @@ def test_correctness_rejects_material_error_near_zero():
     assert metrics["status"] == "correctness_failed"
 
 
+def test_spike_equivalence_retains_state_errors_as_diagnostics():
+    """Approximate recurrent kernels should be judged by spike trajectories."""
+
+    reference = RSNNResult(
+        spikes=torch.zeros(2, 1, 2),
+        v=torch.zeros(1, 2),
+        psc=torch.zeros(1, 2),
+    )
+    result = RSNNResult(
+        spikes=reference.spikes.clone(),
+        v=torch.tensor([[10.0, -10.0]]),
+        psc=torch.tensor([[5.0, -5.0]]),
+    )
+
+    metrics = correctness_metrics(result, reference, strict_state=False)
+
+    assert metrics["status"] == "passed_spike_equivalent"
+    assert metrics["v_max_normalized_error"] > 1.0
+    assert metrics["psc_max_normalized_error"] > 1.0
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("batch_size", [1, 3])
 @pytest.mark.parametrize("use_cudagraph", [False, True])
@@ -444,9 +944,7 @@ def test_direct_cusparse_matches_dense_baseline(batch_size, use_cudagraph):
     x_seq = make_input_sequence(case, device)
     matrix = make_recurrent_csr(case, device)
     csr_weight = make_torch_csr_weight(matrix)
-    reference = make_eager_runner(
-        x_seq, csr_weight.to_dense(), case, sparse=False
-    )()
+    reference = make_eager_runner(x_seq, csr_weight.to_dense(), case, sparse=False)()
     run = DirectCuSparseProvider().fixed_runner(
         x_seq,
         csr_weight,

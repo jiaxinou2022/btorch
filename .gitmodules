@@ -1,0 +1,3 @@
+[submodule "libs/dataset"]
+	path = libs/dataset
+	url = https://github.com/Criticality-Cognitive-Computation-Lab/connectome_dataset
