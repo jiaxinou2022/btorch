@@ -44,6 +44,7 @@ from benchmark.external_rsnn_simulators import (
 )
 from benchmark.provider_common import BenchmarkRunner, PreparedMetadata
 from benchmark.sota_rsnn_cudagraph import (
+    CUDA_SPMSPV_CUDAGRAPH_PROVIDERS,
     CUDA_SPMSPV_PROVIDERS,
     SOTA_CUDAGRAPH_PROVIDERS,
     SOTA_EAGER_PROVIDERS,
@@ -147,7 +148,17 @@ def test_non_capturable_sota_wrappers_use_named_eager_fallbacks():
     assert SOTA_CUDAGRAPH_PROVIDERS == (
         "vdha_cudagraph",
         "sputnik_cudagraph",
+        *CUDA_SPMSPV_CUDAGRAPH_PROVIDERS,
     )
+    assert set(CUDA_SPMSPV_CUDAGRAPH_PROVIDERS.values()) == {
+        "tilespmspv",
+        "sortspmspv",
+        "globalatomic",
+        "blockatomic",
+        "blocksort",
+        "naivespmspv",
+        "holaspmspv",
+    }
     assert SOTA_EAGER_PROVIDERS[:4] == (
         "mh_spgemm_eager",
         "dtc_spmm_eager",
@@ -379,6 +390,55 @@ def test_split_spmspv_adapter_reuses_matrix_and_accepts_empty_spikes(
     assert calls["step"][0][0].tolist() == [1, 3]
     assert calls["step"][1][0].size == 0
     assert calls["free"] == 1
+
+
+def test_split_spmspv_graph_adapter_uses_stable_device_pointers(monkeypatch):
+    """Graph adapters should pass only stable tensors and the current stream."""
+
+    from connectome_dataset.benchmarks.cuda import kernels
+
+    calls = []
+
+    class FakePreparedKernel:
+        def __init__(self, spec, matrix, *, precision):
+            assert spec.provider == "tilespmspv"
+            assert matrix.shape == (4, 4)
+            assert precision == "fp32"
+
+        def step_device(self, x_pointer, output_pointer, stream_pointer):
+            calls.append((x_pointer, output_pointer, stream_pointer))
+
+        def free(self):
+            return None
+
+    monkeypatch.setattr(kernels, "PreparedKernel", FakePreparedKernel)
+    monkeypatch.setattr(kernels, "supports_device_compute", lambda spec, p: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda: types.SimpleNamespace(cuda_stream=123),
+    )
+    weight = torch.eye(4).to_sparse_csr()
+    case = BenchCase(
+        n_neuron=4,
+        batch_size=1,
+        t_steps=2,
+        fanout=1,
+        event_rate=0.1,
+    )
+    matmul, release = prepare_matmul("tilespmspv_cudagraph", weight, case)
+    spikes = torch.ones(1, 4)
+
+    first = matmul(spikes)
+    second = matmul(spikes)
+    release()
+
+    assert first.data_ptr() == second.data_ptr()
+    assert calls == [
+        (spikes.data_ptr(), first.data_ptr(), 123),
+        (spikes.data_ptr(), first.data_ptr(), 123),
+    ]
+    assert getattr(matmul, "_btorch_spike_representation") == "dense_device"
 
 
 def test_adaptive_spmspv_freezes_lazy_handles_after_priming(monkeypatch, tmp_path):
@@ -652,6 +712,7 @@ def test_default_providers_include_external_simulator_comparisons():
         "cusparse_direct_cudagraph",
         "vdha_cudagraph",
         "sputnik_cudagraph",
+        *CUDA_SPMSPV_CUDAGRAPH_PROVIDERS,
         "mh_spgemm_eager",
         "dtc_spmm_eager",
         "flashsparse_eager",

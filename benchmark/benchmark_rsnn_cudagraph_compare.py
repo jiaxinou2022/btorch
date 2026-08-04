@@ -13,10 +13,10 @@ three persistent CUDA task schedulers:
 * ``cusparse_direct_cudagraph`` captures that direct CUDA execution.
 * ``vdha_cudagraph`` and ``sputnik_cudagraph`` use graph-safe, device-pointer
   launches from the corresponding connectome_dataset SOTA kernels.
-* Split-ABI CUDA SpMSpV kernels, Triton push SpMSpV, Finch, and the adaptive
-  selectors run as host-controlled eager recurrent operators. Connectivity
-  preprocessing is hoisted out of the recurrent window while each timestep
-  consumes the actual closed-loop spike vector.
+* In-tree CUDA SpMSpV kernels expose full-window CUDA Graph variants that
+  consume dense device spikes without host conversion. Their split-ABI eager
+  variants remain available for end-to-end adapter comparisons. Triton, Finch,
+  and the adaptive selectors remain host-controlled recurrent operators.
 * ``torch_csr_host_e2e`` runs the CSR reference through the same synchronized
   wall-clock harness as the host-controlled providers.
 * ``mh_spgemm_eager``, ``dtc_spmm_eager``, and ``flashsparse_eager`` also use
@@ -104,6 +104,7 @@ from benchmark.provider_common import (  # noqa: E402
     time_cuda_callable,
 )
 from benchmark.sota_rsnn_cudagraph import (  # noqa: E402
+    CUDA_SPMSPV_CUDAGRAPH_PROVIDERS,
     SOTA_CUDAGRAPH_PROVIDERS,
     SOTA_EAGER_PROVIDERS,
     SOTA_PROVIDERS,
@@ -129,6 +130,13 @@ Provider = Literal[
     "cusparse_direct_cudagraph",
     "vdha_cudagraph",
     "sputnik_cudagraph",
+    "tilespmspv_cudagraph",
+    "sortspmspv_cudagraph",
+    "globalatomic_cudagraph",
+    "blockatomic_cudagraph",
+    "blocksort_cudagraph",
+    "naivespmspv_cudagraph",
+    "holaspmspv_cudagraph",
     "mh_spgemm_eager",
     "dtc_spmm_eager",
     "flashsparse_eager",
@@ -319,6 +327,10 @@ def crop_result(result: RSNNResult, logical_n: int) -> RSNNResult:
 
 PROVIDER_CAPABILITIES: dict[Provider, ProviderCapability] = {
     "vdha_cudagraph": ProviderCapability(batch_sizes=frozenset({1})),
+    **{
+        provider: ProviderCapability(batch_sizes=frozenset({1}))
+        for provider in CUDA_SPMSPV_CUDAGRAPH_PROVIDERS
+    },
     **{
         provider: ProviderCapability(batch_sizes=frozenset({1}))
         for provider in SPMSPV_EAGER_PROVIDERS
@@ -1724,6 +1736,7 @@ def bench_case(
                 "speedup_vs_cusparse_direct_cudagraph": float("nan"),
                 "speedup_vs_genn": float("nan"),
                 "speedup_vs_brian2cuda": float("nan"),
+                "speedup_vs_same_eager": float("nan"),
             }
         )
 
@@ -1753,6 +1766,27 @@ def bench_case(
             baseline_latency = float(baseline_row["latency_ms"])
             if comparable_rows(row, baseline_row) and math.isfinite(baseline_latency):
                 row[column] = baseline_latency / latency
+
+        eager_provider = {
+            graph_provider: f"{kernel_name}_eager"
+            for graph_provider, kernel_name in CUDA_SPMSPV_CUDAGRAPH_PROVIDERS.items()
+        }.get(str(row["provider"]))
+        eager_row = row_by_provider.get(eager_provider) if eager_provider else None
+        if eager_row is not None:
+            eager_latency = float(eager_row["latency_ms"])
+            same_workload = all(
+                row[field] == eager_row[field]
+                for field in (
+                    "dataset",
+                    "logical_n",
+                    "logical_batch",
+                    "t_steps",
+                    "benchmark_mode",
+                    "state_semantics",
+                )
+            )
+            if same_workload and math.isfinite(eager_latency):
+                row["speedup_vs_same_eager"] = eager_latency / latency
     return rows
 
 
@@ -2082,7 +2116,8 @@ def main() -> None:
                     f"activity={row['measured_activity']:.4%} "
                     f"latency={row['latency_ms']:.4f} ms "
                     "vs_direct_graph="
-                    f"{row['speedup_vs_cusparse_direct_cudagraph']:.3f}x"
+                    f"{row['speedup_vs_cusparse_direct_cudagraph']:.3f}x "
+                    f"vs_same_eager={row['speedup_vs_same_eager']:.3f}x"
                 )
             all_rows.extend(rows)
             sota_eager_provider.close()

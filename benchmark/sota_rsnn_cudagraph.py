@@ -1,11 +1,10 @@
 """CUDA Graph adapters for connectome_dataset sparse kernels.
 
-The microbenchmark providers in ``connectome_dataset`` accept host operands and
-often synchronize to return their own timing. RSNN graph capture instead needs
-an allocation-free device-pointer launch on the current CUDA stream. This
-module implements that contract for kernels whose C ABI exposes it and reports
-an explicit incompatibility for providers that still use a host-controlled
-pipeline.
+The microbenchmark providers in ``connectome_dataset`` also expose host operand
+paths that synchronize around their own timing. RSNN graph capture instead
+uses their allocation-free dense-device entry points on the current CUDA
+stream. Host-controlled fallbacks remain available for providers without this
+contract and for adapter-overhead comparisons.
 """
 
 from __future__ import annotations
@@ -30,9 +29,19 @@ from benchmark.provider_common import (
 )
 
 
+CUDA_SPMSPV_CUDAGRAPH_PROVIDERS = {
+    "tilespmspv_cudagraph": "tilespmspv",
+    "sortspmspv_cudagraph": "sortspmspv",
+    "globalatomic_cudagraph": "globalatomic",
+    "blockatomic_cudagraph": "blockatomic",
+    "blocksort_cudagraph": "blocksort",
+    "naivespmspv_cudagraph": "naivespmspv",
+    "holaspmspv_cudagraph": "holaspmspv",
+}
 SOTA_CUDAGRAPH_PROVIDERS = (
     "vdha_cudagraph",
     "sputnik_cudagraph",
+    *CUDA_SPMSPV_CUDAGRAPH_PROVIDERS,
 )
 SOTA_EAGER_PROVIDERS = (
     "mh_spgemm_eager",
@@ -246,6 +255,8 @@ def prepare_matmul(
         return _sputnik_matmul(weight, case)
     if provider == "vdha_cudagraph":
         return _vdha_matmul(weight, case)
+    if provider in CUDA_SPMSPV_CUDAGRAPH_PROVIDERS:
+        return _prepare_cuda_spmspv_device_matmul(provider, weight, case)
     raise ValueError(f"Unknown SOTA CUDA Graph provider: {provider}")
 
 
@@ -447,6 +458,11 @@ class SotaCUDAGraphProvider:
         if cached is not None:
             return cached
 
+        # Whole-connectome native handles duplicate matrix storage. Only one
+        # provider is measured at a time, so release the previous captured
+        # runner before preparing the next one.
+        self._drop_cached()
+
         matmul, release = prepare_matmul(provider, weight, case)
         self._release.append(release)
         static_x = x_seq.clone()
@@ -482,8 +498,12 @@ class SotaCUDAGraphProvider:
             logical_shape=tuple(static_x.shape),
             physical_shape=tuple(static_x.shape),
             input_layout="BN",
-            operator_layout=(
-                "NB" if provider == "sputnik_cudagraph" else "dense_vector"
+            operator_layout=str(
+                getattr(
+                    matmul,
+                    "_btorch_operator_layout",
+                    "NB" if provider == "sputnik_cudagraph" else "dense_vector",
+                )
             ),
             index_dtype=str(weight.crow_indices().dtype),
             value_dtype=str(weight.values().dtype),
@@ -509,8 +529,12 @@ class SotaCUDAGraphProvider:
             layout_transform_in_timing=(
                 provider == "sputnik_cudagraph" and case.batch_size != 1
             ),
-            spike_representation=(
-                "dense" if provider == "vdha_cudagraph" else "dense_matrix"
+            spike_representation=str(
+                getattr(
+                    matmul,
+                    "_btorch_spike_representation",
+                    "dense" if provider == "vdha_cudagraph" else "dense_matrix",
+                )
             ),
             input_contiguous=bool(input_audit["contiguous"]),
             input_address_mod=int(input_audit["address_alignment"]),
@@ -525,6 +549,11 @@ class SotaCUDAGraphProvider:
 
     def close(self) -> None:
         """Release native handles after captured graphs are discarded."""
+
+        self._drop_cached()
+
+    def _drop_cached(self) -> None:
+        """Discard captured graphs before releasing their native handles."""
 
         self._runners.clear()
         while self._release:
@@ -619,6 +648,51 @@ def _prepare_cuda_spmspv_matmul(
         operator_layout=f"spmspv_{spec.matrix_format}",
         spike_representation="host_sparse_indices",
     )
+
+
+def _prepare_cuda_spmspv_device_matmul(
+    provider: str,
+    weight: torch.Tensor,
+    case: BenchCase,
+) -> tuple[Callable[[torch.Tensor], torch.Tensor], Callable[[], None]]:
+    """Prepare one graph-safe dense-device SpMSpV recurrent operator."""
+
+    _require_batch_one(provider, case)
+    from connectome_dataset.benchmarks.cuda.kernels import (
+        KERNELS_BY_NAME,
+        PreparedKernel,
+        supports_device_compute,
+    )
+
+    kernel_name = CUDA_SPMSPV_CUDAGRAPH_PROVIDERS[provider]
+    spec = KERNELS_BY_NAME[kernel_name]
+    if not supports_device_compute(spec, "fp32"):
+        raise OSError(
+            f"{kernel_name} graph-safe dense-device ABI is unavailable; "
+            "rebuild its shared library"
+        )
+    prepared = PreparedKernel(spec, _scipy_weight(weight), precision="fp32")
+    output = torch.empty(
+        case.n_neuron,
+        device=weight.device,
+        dtype=weight.dtype,
+    )
+
+    def matmul(spikes: torch.Tensor) -> torch.Tensor:
+        prepared.step_device(
+            spikes.reshape(-1).data_ptr(),
+            output.data_ptr(),
+            torch.cuda.current_stream().cuda_stream,
+        )
+        return output.unsqueeze(0)
+
+    matmul._btorch_buffers = (output,)  # type: ignore[attr-defined]
+    matmul._btorch_transform_mode = "none"  # type: ignore[attr-defined]
+    matmul._btorch_operator_layout = (  # type: ignore[attr-defined]
+        f"spmspv_{spec.matrix_format}_dense_device"
+    )
+    matmul._btorch_spike_representation = "dense_device"  # type: ignore[attr-defined]
+    return matmul, prepared.free
 
 
 def _prepare_triton_spmspv_matmul(
