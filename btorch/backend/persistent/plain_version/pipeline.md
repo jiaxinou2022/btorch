@@ -1557,6 +1557,98 @@ event_indices
 
 ---
 
+# 14. 性能测量
+
+## 14.1 首先记录阶段时间
+
+原版：
+
+```text
+T_update
+T_grid_sync_middle
+T_propagation
+T_grid_sync_end
+```
+
+流水化版：
+
+```text
+T_pipeline_total
+T_update_finish
+T_last_task_finish
+T_grid_sync_end
+```
+
+关键指标：
+
+```text
+pipeline overlap =
+    T_update +
+    T_propagation -
+    T_pipeline_total
+```
+
+以及：
+
+```text
+propagation tail =
+    T_last_task_finish -
+    T_update_finish
+```
+
+## 14.2 需要关注的 NCU 指标
+
+重点观察：
+
+* UPDATE blocks 与 propagation blocks 的 SM 利用情况；
+* propagation block 的 atomic throughput；
+* queue head/tail 原子竞争；
+* task ready 自旋造成的指令开销；
+* active warp 数；
+* Long Scoreboard；
+* global atomic stall；
+* pipeline 尾部是否仍有大量 UPDATE block 空闲；
+* 固定角色划分是否导致低 firing rate 下资源浪费。
+
+## 14.3 预期收益条件
+
+该方案最可能在以下情况下有效：
+
+```text
+UPDATE 时间不可忽略
+且
+传播任务在 UPDATE 尚未完成时已经持续产生
+且
+传播 blocks 有足够独立资源执行
+```
+
+若 propagation 完全占据内存或 atomic 子系统，重叠后可能出现资源争用，使：
+
+```text
+T_pipeline_total
+```
+
+并不能接近：
+
+```text
+max(T_update, T_propagation)
+```
+
+因此实验需要同时比较：
+
+```text
+串行双缓冲版
+流水化双缓冲版
+```
+
+从而区分：
+
+* PSC 状态拆分本身的成本；
+* task descriptor 改造的影响；
+* 真正 overlap 带来的收益或资源竞争。
+
+---
+
 # 15. 本轮暂不实现的内容
 
 以下内容留到第一版结果明确后：

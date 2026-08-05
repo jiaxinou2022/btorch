@@ -8,8 +8,11 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <mutex>
 #include <tuple>
+#include <unordered_map>
 
 #ifndef BTORCH_WARP_SPEC_MODE
 #define BTORCH_WARP_SPEC_MODE 0
@@ -42,9 +45,10 @@ void launch_persistent_snn_kernel(
     int* spike_queue_neuron,
     uint32_t* spike_queue_state,
     int* queue_tail,
-    int* queue_head,
+    int* next_ticket,
     int* update_done_blocks,
     int* propagation_done_tasks,
+    unsigned long long* debug_counters,
 #else
     int* spike_queue_batch,
     int* spike_queue_edge_start,
@@ -63,6 +67,9 @@ void launch_persistent_snn_kernel(
     int n_neuron,
 #ifdef BTORCH_PERSISTENT_PIPELINE
     int update_block_count,
+    int consumer_warps_per_block,
+    int ticket_chunk,
+    uint32_t forward_epoch_base,
 #else
     int queue_capacity,
 #endif
@@ -311,6 +318,99 @@ int requested_cooperative_grid_dim(int maximum_grid_dim) {
     return static_cast<int>(requested);
 }
 
+#ifdef BTORCH_PERSISTENT_PIPELINE
+int pipeline_update_block_count(int grid_dim) {
+    const char* value = std::getenv("BTORCH_PIPELINE_ROLE_RATIO");
+    if (value == nullptr || value[0] == '\0') {
+        value = "3:1";
+    }
+
+    TORCH_CHECK(
+        std::strcmp(value, "7:1") == 0 ||
+            std::strcmp(value, "3:1") == 0 ||
+            std::strcmp(value, "2:1") == 0 ||
+            std::strcmp(value, "1:1") == 0,
+        "BTORCH_PIPELINE_ROLE_RATIO must be 7:1, 3:1, 2:1, or 1:1, got '",
+        value,
+        "'.");
+    int update_blocks = 0;
+    if (std::strcmp(value, "7:1") == 0) {
+        update_blocks = (grid_dim * 7) / 8;
+    } else if (std::strcmp(value, "3:1") == 0) {
+        update_blocks = (grid_dim * 3) / 4;
+    } else if (std::strcmp(value, "2:1") == 0) {
+        update_blocks = (grid_dim * 2) / 3;
+    } else if (std::strcmp(value, "1:1") == 0) {
+        update_blocks = grid_dim / 2;
+    }
+    return std::min(grid_dim - 1, std::max(1, update_blocks));
+}
+
+bool pipeline_debug_counters_enabled() {
+    const char* value = std::getenv("BTORCH_PIPELINE_DEBUG_COUNTERS");
+    if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) {
+        return false;
+    }
+    TORCH_CHECK(
+        std::strcmp(value, "1") == 0,
+        "BTORCH_PIPELINE_DEBUG_COUNTERS must be 0 or 1, got '",
+        value,
+        "'.");
+    return true;
+}
+
+int pipeline_consumer_warps_per_block() {
+    const char* value = std::getenv("BTORCH_PIPELINE_CONSUMER_WARPS");
+    if (value == nullptr || value[0] == '\0') {
+        return 2;
+    }
+    errno = 0;
+    char* end = nullptr;
+    const long warps = std::strtol(value, &end, 10);
+    TORCH_CHECK(
+        errno == 0 && end != value && *end == '\0' &&
+            (warps == 1 || warps == 2 || warps == 4 || warps == 8),
+        "BTORCH_PIPELINE_CONSUMER_WARPS must be 1, 2, 4, or 8, got '",
+        value,
+        "'.");
+    return static_cast<int>(warps);
+}
+
+int pipeline_ticket_chunk() {
+    const char* value = std::getenv("BTORCH_PIPELINE_TICKET_CHUNK");
+    if (value == nullptr || value[0] == '\0') {
+        return 1;
+    }
+    errno = 0;
+    char* end = nullptr;
+    const long chunk = std::strtol(value, &end, 10);
+    TORCH_CHECK(
+        errno == 0 && end != value && *end == '\0' &&
+            (chunk == 1 || chunk == 2 || chunk == 4),
+        "BTORCH_PIPELINE_TICKET_CHUNK must be 1, 2, or 4, got '",
+        value,
+        "'.");
+    return static_cast<int>(chunk);
+}
+
+std::tuple<uint32_t, bool> pipeline_forward_epoch(
+    const void* queue_state, int t_steps) {
+    constexpr uint64_t kEpochCount = 0xffffu;
+    static std::mutex epoch_mutex;
+    static std::unordered_map<const void*, uint64_t> next_epoch;
+    std::lock_guard<std::mutex> lock(epoch_mutex);
+
+    uint64_t& sequence = next_epoch[queue_state];
+    const uint32_t epoch_base =
+        static_cast<uint32_t>(sequence % kEpochCount);
+    const bool must_clear =
+        sequence == 0 || epoch_base == 0 ||
+        epoch_base + t_steps > kEpochCount;
+    sequence += static_cast<uint64_t>(t_steps);
+    return {epoch_base, must_clear};
+}
+#endif
+
 std::tuple<
     torch::Tensor,
     torch::Tensor,
@@ -528,6 +628,14 @@ persistent_snn_forward_cuda_impl(
 #else
     auto overflow = torch::empty({0}, options_i);
 #endif
+#ifdef BTORCH_PERSISTENT_PIPELINE
+    const bool pipeline_debug_counters =
+        !fanout_binning && !spike_block &&
+        pipeline_debug_counters_enabled();
+    if (pipeline_debug_counters) {
+        overflow = torch::zeros({4}, options_i.dtype(torch::kInt64));
+    }
+#endif
 
     const int maximum_grid_dim = spike_block
         ? cooperative_grid_dim_spike_block(
@@ -619,11 +727,19 @@ persistent_snn_forward_cuda_impl(
             "persistent SNN pipeline requires at least two cooperative "
             "blocks.");
         const int update_block_count =
-            std::min(grid_dim - 1, std::max(1, (grid_dim * 3) / 4));
+            pipeline_update_block_count(grid_dim);
+        const int consumer_warps_per_block =
+            pipeline_consumer_warps_per_block();
+        const int ticket_chunk = pipeline_ticket_chunk();
+        const auto [forward_epoch_base, must_clear_queue_state] =
+            pipeline_forward_epoch(
+                spike_queue_edge_start.data_ptr<int>(), t_steps);
         auto recurrent_delta_0 = torch::zeros_like(psc_out);
         auto recurrent_delta_1 = torch::zeros_like(psc_out);
         auto pipeline_done_counters = torch::zeros({2}, options_i);
-        spike_queue_edge_start.zero_();
+        if (must_clear_queue_state) {
+            spike_queue_edge_start.zero_();
+        }
         launch_persistent_snn_kernel(
             event_offsets.data_ptr<int>(),
             event_indices.data_ptr<int>(),
@@ -645,6 +761,10 @@ persistent_snn_forward_cuda_impl(
             work_counter.data_ptr<int>(),
             pipeline_done_counters.data_ptr<int>(),
             pipeline_done_counters.data_ptr<int>() + 1,
+            pipeline_debug_counters
+                ? reinterpret_cast<unsigned long long*>(
+                      overflow.data_ptr<int64_t>())
+                : nullptr,
             return_events ? event_counts.data_ptr<int>() : nullptr,
             return_events ? event_indices_full.data_ptr<int>() : nullptr,
             return_dense,
@@ -652,6 +772,9 @@ persistent_snn_forward_cuda_impl(
             t_steps,
             n_neuron,
             update_block_count,
+            consumer_warps_per_block,
+            ticket_chunk,
+            forward_epoch_base,
             static_cast<float>(dt),
             static_cast<float>(tau_mem),
             static_cast<float>(tau_syn),

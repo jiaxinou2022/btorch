@@ -1298,6 +1298,7 @@ def benchmark_row(
     spike_block: bool,
     block_hash: bool,
     block_stats: dict[str, float | int] | None = None,
+    pipeline_stats: dict[str, int] | None = None,
 ) -> dict:
     """Run the benchmark and return one flat, CSV-friendly result record."""
 
@@ -1314,6 +1315,25 @@ def benchmark_row(
     row = {
         "dataset": case.dataset,
         "provider": provider,
+        "pipeline": (
+            os.environ.get("BTORCH_PERSISTENT_PIPELINE", "0") == "1"
+        ),
+        "pipeline_role_ratio": (
+            os.environ.get("BTORCH_PIPELINE_ROLE_RATIO", "3:1")
+            if os.environ.get("BTORCH_PERSISTENT_PIPELINE", "0") == "1"
+            else ""
+        ),
+        "pipeline_debug_counters": pipeline_stats is not None,
+        "pipeline_consumer_warps": (
+            int(os.environ.get("BTORCH_PIPELINE_CONSUMER_WARPS", "2"))
+            if os.environ.get("BTORCH_PERSISTENT_PIPELINE", "0") == "1"
+            else ""
+        ),
+        "pipeline_ticket_chunk": (
+            int(os.environ.get("BTORCH_PIPELINE_TICKET_CHUNK", "1"))
+            if os.environ.get("BTORCH_PERSISTENT_PIPELINE", "0") == "1"
+            else ""
+        ),
         "direct_cusparse_primitive": (
             "SpMV" if provider == "cusparse_cudagraph" and case.batch_size == 1
             else "SpMM" if provider == "cusparse_cudagraph" else ""
@@ -1381,7 +1401,11 @@ def benchmark_row(
             latency_ms + input_permutation_ms + output_restore_ms
         ),
         "grid_blocks": os.environ.get("BTORCH_PERSISTENT_GRID_BLOCKS", "auto"),
-        "timing_mode": "instrumented_debug" if block_stats is not None else "normal",
+        "timing_mode": (
+            "instrumented_debug"
+            if block_stats is not None or pipeline_stats is not None
+            else "normal"
+        ),
         "total_time_ms": latency_ms,
         "timestep_count": case.t_steps,
         "time_per_timestep_us": latency_ms * 1000.0 / case.t_steps,
@@ -1404,6 +1428,8 @@ def benchmark_row(
         row.update(correctness)
     if block_stats is not None:
         row.update(block_stats)
+    if pipeline_stats is not None:
+        row.update(pipeline_stats)
     row.update(workload.reorder_stats)
     return row
 
@@ -1742,6 +1768,37 @@ def main() -> None:
             hash_aggregation=args.hash_aggregation,
         )
 
+    pipeline_stats = None
+    if os.environ.get("BTORCH_PIPELINE_DEBUG_COUNTERS", "0") == "1":
+        if (
+            os.environ.get("BTORCH_PERSISTENT_PIPELINE", "0") != "1"
+            or args.provider != "persistent"
+            or args.fanout_binning
+            or args.spike_block
+        ):
+            raise RuntimeError(
+                "Pipeline debug counters require the plain pipeline provider."
+            )
+        raw_output = run_prepared_operator(
+            workload,
+            fanout_binning=False,
+            spike_block=False,
+        )
+        raw_stats = raw_output[5]
+        if raw_stats.numel() != 4:
+            raise RuntimeError(
+                "Pipeline debug build returned an invalid counter tensor."
+            )
+        wait_tail, wait_ready, invalid_final, processed_tasks = (
+            int(value) for value in raw_stats.cpu().tolist()
+        )
+        pipeline_stats = {
+            "pipeline_ticket_wait_tail": wait_tail,
+            "pipeline_ticket_wait_ready": wait_ready,
+            "pipeline_invalid_final_tickets": invalid_final,
+            "pipeline_processed_tasks": processed_tasks,
+        }
+
     wait_for_idle_gpu(args.wait_idle_samples)
     row = benchmark_row(
         workload,
@@ -1754,6 +1811,7 @@ def main() -> None:
         args.spike_block,
         args.block_hash,
         block_stats,
+        pipeline_stats,
     )
     for key, value in row.items():
         print(f"{key}: {value}")

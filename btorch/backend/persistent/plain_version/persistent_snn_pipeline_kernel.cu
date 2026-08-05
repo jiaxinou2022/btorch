@@ -1,4 +1,5 @@
 #include <cooperative_groups.h>
+#include <cuda/atomic>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -9,6 +10,28 @@ namespace {
 
 constexpr int kEdgesPerTask = 1024;
 constexpr uint32_t kFragmentMask = 0xffffu;
+constexpr uint32_t kEpochCount = 0xffffu;
+constexpr int kInitialBackoffCycles = 32;
+constexpr int kMaximumBackoffCycles = 1024;
+
+enum PipelineDebugCounter : int {
+    kTicketWaitTail = 0,
+    kTicketWaitReady = 1,
+    kInvalidFinalTickets = 2,
+    kProcessedTasks = 3,
+};
+
+template <typename T>
+__device__ __forceinline__ T device_load_acquire(T* ptr) {
+    cuda::atomic_ref<T, cuda::thread_scope_device> ref(*ptr);
+    return ref.load(cuda::memory_order_acquire);
+}
+
+__device__ __forceinline__ void state_store_release(
+    uint32_t* ptr, uint32_t state) {
+    cuda::atomic_ref<uint32_t, cuda::thread_scope_device> ref(*ptr);
+    ref.store(state, cuda::memory_order_release);
+}
 
 template <bool ReturnDense>
 __global__ void persistent_snn_kernel(
@@ -28,15 +51,19 @@ __global__ void persistent_snn_kernel(
     int* __restrict__ spike_queue_neuron,
     uint32_t* __restrict__ spike_queue_state,
     int* __restrict__ queue_tail,
-    int* __restrict__ queue_head,
+    int* __restrict__ next_ticket,
     int* __restrict__ update_done_blocks,
     int* __restrict__ propagation_done_tasks,
+    unsigned long long* __restrict__ debug_counters,
     int* __restrict__ event_counts,
     int* __restrict__ event_indices_full,
     bool return_events,
     int t_steps,
     int n_neuron,
     int update_block_count,
+    int consumer_warps_per_block,
+    int ticket_chunk,
+    uint32_t forward_epoch_base,
     float dt,
     float tau_mem,
     float tau_syn,
@@ -58,10 +85,12 @@ __global__ void persistent_snn_kernel(
             (t & 1) ? recurrent_delta_1 : recurrent_delta_0;
         float* delta_write =
             (t & 1) ? recurrent_delta_0 : recurrent_delta_1;
+        const uint32_t expected_epoch =
+            (forward_epoch_base + static_cast<uint32_t>(t)) % kEpochCount + 1;
 
         if (global_tid == 0) {
             *queue_tail = 0;
-            *queue_head = 0;
+            *next_ticket = 0;
             *update_done_blocks = 0;
             *propagation_done_tasks = 0;
         }
@@ -109,19 +138,13 @@ __global__ void persistent_snn_kernel(
                             atomicAdd(queue_tail, fragment_count);
                         for (int fragment = 0; fragment < fragment_count;
                              ++fragment) {
-                            spike_queue_neuron[first_task + fragment] = n;
-                        }
-                        __threadfence();
-
-                        const uint32_t epoch =
-                            static_cast<uint32_t>(t + 1);
-                        for (int fragment = 0; fragment < fragment_count;
-                             ++fragment) {
                             const int task = first_task + fragment;
+                            spike_queue_neuron[task] = n;
                             const uint32_t state =
-                                (epoch << 16) |
+                                (expected_epoch << 16) |
                                 static_cast<uint32_t>(fragment + 1);
-                            atomicExch(spike_queue_state + task, state);
+                            state_store_release(
+                                spike_queue_state + task, state);
                         }
                     }
 
@@ -136,38 +159,87 @@ __global__ void persistent_snn_kernel(
 
             __syncthreads();
             if (threadIdx.x == 0) {
-                __threadfence();
                 atomicAdd(update_done_blocks, 1);
             }
-        } else {
-            while (true) {
-                int task = -1;
+            __syncthreads();
+        }
+
+        const int warp_in_block = threadIdx.x >> 5;
+        const bool active_consumer =
+            warp_in_block < consumer_warps_per_block;
+        if (active_consumer) {
+            int backoff_cycles = kInitialBackoffCycles;
+            bool terminate_consumer = false;
+            while (!terminate_consumer) {
+                int first_task = -1;
                 if (lane == 0) {
-                    while (true) {
-                        const int head = atomicAdd(queue_head, 0);
-                        const int tail = atomicAdd(queue_tail, 0);
-                        if (head >= tail) {
-                            break;
-                        }
-                        if (atomicCAS(queue_head, head, head + 1) == head) {
-                            task = head;
-                            break;
-                        }
-                    }
+                    first_task = atomicAdd(next_ticket, ticket_chunk);
                 }
-                task = __shfl_sync(0xffffffffu, task, 0);
+                first_task =
+                    __shfl_sync(0xffffffffu, first_task, 0);
 
-                if (task >= 0) {
+                for (int ticket_offset = 0;
+                     ticket_offset < ticket_chunk;
+                     ++ticket_offset) {
+                    const int task = first_task + ticket_offset;
                     uint32_t state = 0;
-                    if (lane == 0) {
-                        const uint32_t expected_epoch =
-                            static_cast<uint32_t>(t + 1);
-                        do {
-                            state = atomicAdd(spike_queue_state + task, 0u);
-                        } while ((state >> 16) != expected_epoch);
-                    }
-                    state = __shfl_sync(0xffffffffu, state, 0);
+                    bool ready = false;
+                    bool invalid_final = false;
 
+                    while (true) {
+                        if (lane == 0) {
+                            const int tail = device_load_acquire(queue_tail);
+                            if (task < tail) {
+                                state = device_load_acquire(
+                                    spike_queue_state + task);
+                                ready =
+                                    (state >> 16) == expected_epoch;
+                                if (!ready && debug_counters != nullptr) {
+                                    atomicAdd(
+                                        debug_counters + kTicketWaitReady,
+                                        1ull);
+                                }
+                            } else {
+                                const int update_done = device_load_acquire(
+                                    update_done_blocks);
+                                invalid_final =
+                                    update_done == update_block_count;
+                                if (invalid_final) {
+                                    if (debug_counters != nullptr) {
+                                        atomicAdd(
+                                            debug_counters +
+                                                kInvalidFinalTickets,
+                                            1ull);
+                                    }
+                                } else if (debug_counters != nullptr) {
+                                    atomicAdd(
+                                        debug_counters + kTicketWaitTail,
+                                        1ull);
+                                }
+                            }
+
+                            if (!ready && !invalid_final) {
+                                __nanosleep(backoff_cycles);
+                                backoff_cycles = min(
+                                    backoff_cycles << 1,
+                                    kMaximumBackoffCycles);
+                            }
+                        }
+                        state = __shfl_sync(0xffffffffu, state, 0);
+                        ready = __shfl_sync(0xffffffffu, ready, 0);
+                        invalid_final = __shfl_sync(
+                            0xffffffffu, invalid_final, 0);
+                        if (ready || invalid_final) {
+                            break;
+                        }
+                    }
+
+                    if (invalid_final) {
+                        terminate_consumer = true;
+                        break;
+                    }
+
+                    backoff_cycles = kInitialBackoffCycles;
                     const int fragment =
                         static_cast<int>(state & kFragmentMask) - 1;
                     const int neuron = spike_queue_neuron[task];
@@ -184,26 +256,19 @@ __global__ void persistent_snn_kernel(
                     }
                     __syncwarp();
                     if (lane == 0) {
-                        __threadfence();
                         atomicAdd(propagation_done_tasks, 1);
+                        if (debug_counters != nullptr) {
+                            atomicAdd(
+                                debug_counters + kProcessedTasks, 1ull);
+                        }
                     }
-                    continue;
-                }
-
-                bool should_exit = false;
-                if (lane == 0 &&
-                    atomicAdd(update_done_blocks, 0) == update_block_count) {
-                    const int tail = atomicAdd(queue_tail, 0);
-                    const int done = atomicAdd(propagation_done_tasks, 0);
-                    should_exit = done >= tail;
-                }
-                should_exit =
-                    __shfl_sync(0xffffffffu, should_exit, 0);
-                if (should_exit) {
-                    break;
                 }
             }
         }
+
+        // Non-consumer warps wait here until this block's ticket holders have
+        // processed every valid task assigned to them.
+        __syncthreads();
 
         // The next timestep cannot consume delta_write until every propagation
         // warp has completed all of its recurrent-current atomic additions.
@@ -249,9 +314,10 @@ void launch_persistent_snn_kernel(
     int* spike_queue_neuron,
     uint32_t* spike_queue_state,
     int* queue_tail,
-    int* queue_head,
+    int* next_ticket,
     int* update_done_blocks,
     int* propagation_done_tasks,
+    unsigned long long* debug_counters,
     int* event_counts,
     int* event_indices_full,
     bool return_dense,
@@ -259,6 +325,9 @@ void launch_persistent_snn_kernel(
     int t_steps,
     int n_neuron,
     int update_block_count,
+    int consumer_warps_per_block,
+    int ticket_chunk,
+    uint32_t forward_epoch_base,
     float dt,
     float tau_mem,
     float tau_syn,
@@ -285,15 +354,19 @@ void launch_persistent_snn_kernel(
         &spike_queue_neuron,
         &spike_queue_state,
         &queue_tail,
-        &queue_head,
+        &next_ticket,
         &update_done_blocks,
         &propagation_done_tasks,
+        &debug_counters,
         &event_counts,
         &event_indices_full,
         &return_events,
         &t_steps,
         &n_neuron,
         &update_block_count,
+        &consumer_warps_per_block,
+        &ticket_chunk,
+        &forward_epoch_base,
         &dt,
         &tau_mem,
         &tau_syn,

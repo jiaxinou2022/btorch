@@ -21,6 +21,38 @@ def _pipeline_enabled() -> bool:
     return bool(value)
 
 
+def _pipeline_role_ratio() -> str:
+    value = os.environ.get("BTORCH_PIPELINE_ROLE_RATIO", "3:1")
+    if value not in ("7:1", "3:1", "2:1", "1:1"):
+        raise ValueError(
+            "BTORCH_PIPELINE_ROLE_RATIO must be 7:1, 3:1, 2:1, or 1:1."
+        )
+    return value
+
+
+def _pipeline_debug_counters() -> bool:
+    value = int(os.environ.get("BTORCH_PIPELINE_DEBUG_COUNTERS", "0"))
+    if value not in (0, 1):
+        raise ValueError("BTORCH_PIPELINE_DEBUG_COUNTERS must be 0 or 1.")
+    return bool(value)
+
+
+def _pipeline_consumer_warps() -> int:
+    value = int(os.environ.get("BTORCH_PIPELINE_CONSUMER_WARPS", "2"))
+    if value not in (1, 2, 4, 8):
+        raise ValueError(
+            "BTORCH_PIPELINE_CONSUMER_WARPS must be 1, 2, 4, or 8."
+        )
+    return value
+
+
+def _pipeline_ticket_chunk() -> int:
+    value = int(os.environ.get("BTORCH_PIPELINE_TICKET_CHUNK", "1"))
+    if value not in (1, 2, 4):
+        raise ValueError("BTORCH_PIPELINE_TICKET_CHUNK must be 1, 2, or 4.")
+    return value
+
+
 def _block_v4_config() -> tuple[int, int, int]:
     block_budget = int(os.environ.get("BTORCH_BLOCK_EDGE_BUDGET", "0"))
     long_segment = int(os.environ.get("BTORCH_LONG_SEGMENT_SIZE", "1024"))
@@ -144,7 +176,14 @@ def load(
     """Build and load the plain persistent SNN CUDA extension.
 
     Set ``BTORCH_PERSISTENT_PIPELINE=1`` before the first load in a process
-    to use the batch-one UPDATE--propagation pipeline kernel.
+    to use the batch-one UPDATE--propagation pipeline kernel. Set
+    ``BTORCH_PIPELINE_ROLE_RATIO`` to ``7:1``, ``3:1``, ``2:1``, or ``1:1``
+    to select the initial UPDATE:PROPAGATION block ratio; UPDATE blocks become
+    propagation helpers after finishing their neurons. Set
+    ``BTORCH_PIPELINE_DEBUG_COUNTERS=1`` to return queue polling diagnostics in
+    the sixth output tensor. ``BTORCH_PIPELINE_CONSUMER_WARPS`` selects 1, 2,
+    4, or 8 ticket consumers per block, and ``BTORCH_PIPELINE_TICKET_CHUNK``
+    selects 1, 2, or 4 tasks per ticket allocation.
     """
 
     global _loaded_config
@@ -170,8 +209,22 @@ def load(
             "be enabled together."
         )
     pipeline_enabled = _pipeline_enabled()
+    pipeline_role_ratio = _pipeline_role_ratio() if pipeline_enabled else "3:1"
+    pipeline_debug_counters = (
+        _pipeline_debug_counters() if pipeline_enabled else False
+    )
+    pipeline_consumer_warps = (
+        _pipeline_consumer_warps() if pipeline_enabled else 2
+    )
+    pipeline_ticket_chunk = (
+        _pipeline_ticket_chunk() if pipeline_enabled else 1
+    )
     requested_config = (
         pipeline_enabled,
+        pipeline_role_ratio,
+        pipeline_debug_counters,
+        pipeline_consumer_warps,
+        pipeline_ticket_chunk,
         enable_block_stats,
         enable_block_hash,
         block_budget,
