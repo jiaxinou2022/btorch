@@ -14,6 +14,13 @@ from torch.utils.cpp_extension import load as load_extension
 _loaded_config: tuple[object, ...] | None = None
 
 
+def _pipeline_enabled() -> bool:
+    value = int(os.environ.get("BTORCH_PERSISTENT_PIPELINE", "0"))
+    if value not in (0, 1):
+        raise ValueError("BTORCH_PERSISTENT_PIPELINE must be 0 or 1.")
+    return bool(value)
+
+
 def _block_v4_config() -> tuple[int, int, int]:
     block_budget = int(os.environ.get("BTORCH_BLOCK_EDGE_BUDGET", "0"))
     long_segment = int(os.environ.get("BTORCH_LONG_SEGMENT_SIZE", "1024"))
@@ -134,7 +141,11 @@ def _detect_cuda_arch_list() -> str:
 def load(
     *, enable_block_stats: bool = False, enable_block_hash: bool = False
 ):
-    """Build and load the plain persistent SNN CUDA extension."""
+    """Build and load the plain persistent SNN CUDA extension.
+
+    Set ``BTORCH_PERSISTENT_PIPELINE=1`` before the first load in a process
+    to use the batch-one UPDATE--propagation pipeline kernel.
+    """
 
     global _loaded_config
     block_budget, long_segment, tile_reduce = _block_v4_config()
@@ -158,7 +169,9 @@ def load(
             "Block and long-segment warp specialization modes cannot "
             "be enabled together."
         )
+    pipeline_enabled = _pipeline_enabled()
     requested_config = (
+        pipeline_enabled,
         enable_block_stats,
         enable_block_hash,
         block_budget,
@@ -234,6 +247,8 @@ def load(
                 f"lt{long_warp_spec_threshold}",
             ]
         )
+    if pipeline_enabled:
+        suffixes.append("pipeline")
     extension_suffix = f"_{'_'.join(suffixes)}"
     cuda_cflags.extend(
         [
@@ -257,6 +272,9 @@ def load(
         f"-DBTORCH_LONG_WARP_SPEC_ENABLED="
         f"{int(long_warp_spec_enabled)}"
     )
+    if pipeline_enabled:
+        cflags.append("-DBTORCH_PERSISTENT_PIPELINE")
+        cuda_cflags.append("-DBTORCH_PERSISTENT_PIPELINE")
     if enable_block_stats:
         cflags.append("-DENABLE_BLOCK_STATS")
         cuda_cflags.append("-DENABLE_BLOCK_STATS")
@@ -285,7 +303,14 @@ def load(
             name=f"btorch_persistent_snn_plain{extension_suffix}",
             sources=[
                 str(here / "persistent_snn.cpp"),
-                str(here / "persistent_snn_plain_kernel.cu"),
+                str(
+                    here
+                    / (
+                        "persistent_snn_pipeline_kernel.cu"
+                        if pipeline_enabled
+                        else "persistent_snn_plain_kernel.cu"
+                    )
+                ),
                 str(here / "persistent_snn_binned_kernel.cu"),
                 str(here / spike_block_source),
             ],

@@ -32,21 +32,40 @@ void launch_persistent_snn_kernel(
     const float* graph_weight,
     float* v,
     float* psc,
+#ifdef BTORCH_PERSISTENT_PIPELINE
+    float* recurrent_delta_0,
+    float* recurrent_delta_1,
+#endif
     float* dense_spikes,
     float* input_current,
+#ifdef BTORCH_PERSISTENT_PIPELINE
+    int* spike_queue_neuron,
+    uint32_t* spike_queue_state,
+    int* queue_tail,
+    int* queue_head,
+    int* update_done_blocks,
+    int* propagation_done_tasks,
+#else
     int* spike_queue_batch,
     int* spike_queue_edge_start,
     int* spike_queue_edge_end,
     int* spike_count,
     int* work_counter,
+#endif
     int* event_counts,
     int* event_indices_full,
     bool return_dense,
     bool return_events,
     int t_steps,
+#ifndef BTORCH_PERSISTENT_PIPELINE
     int batch_size,
+#endif
     int n_neuron,
+#ifdef BTORCH_PERSISTENT_PIPELINE
+    int update_block_count,
+#else
     int queue_capacity,
+#endif
     float dt,
     float tau_mem,
     float tau_syn,
@@ -399,6 +418,13 @@ persistent_snn_forward_cuda_impl(
     const auto batch_size = static_cast<int>(v.size(0));
     const auto n_neuron = static_cast<int>(v.size(1));
     TORCH_CHECK(batch_size > 0 && n_neuron > 0, "B and N must be positive.");
+#ifdef BTORCH_PERSISTENT_PIPELINE
+    if (!fanout_binning && !spike_block) {
+        TORCH_CHECK(
+            batch_size == 1,
+            "persistent SNN pipeline requires batch_size == 1.");
+    }
+#endif
     TORCH_CHECK(
         graph_indptr.numel() == n_neuron + 1,
         "graph_indptr must have shape (N + 1,).");
@@ -433,6 +459,13 @@ persistent_snn_forward_cuda_impl(
     const auto t_steps =
         static_cast<int>((event_offsets.numel() - 1) / batch_size);
     TORCH_CHECK(t_steps > 0, "T must be positive.");
+#ifdef BTORCH_PERSISTENT_PIPELINE
+    if (!fanout_binning && !spike_block) {
+        TORCH_CHECK(
+            t_steps < (1 << 16),
+            "persistent SNN pipeline supports fewer than 2^16 timesteps.");
+    }
+#endif
     TORCH_CHECK(
         (n_neuron + 31) / 32 < (1 << 24),
         "spike-block descriptor supports fewer than 2^24 neuron blocks.");
@@ -580,6 +613,59 @@ persistent_snn_forward_cuda_impl(
             kThreadsPerBlock,
             stream);
     } else {
+#ifdef BTORCH_PERSISTENT_PIPELINE
+        TORCH_CHECK(
+            grid_dim >= 2,
+            "persistent SNN pipeline requires at least two cooperative "
+            "blocks.");
+        const int update_block_count =
+            std::min(grid_dim - 1, std::max(1, (grid_dim * 3) / 4));
+        auto recurrent_delta_0 = torch::zeros_like(psc_out);
+        auto recurrent_delta_1 = torch::zeros_like(psc_out);
+        auto pipeline_done_counters = torch::zeros({2}, options_i);
+        spike_queue_edge_start.zero_();
+        launch_persistent_snn_kernel(
+            event_offsets.data_ptr<int>(),
+            event_indices.data_ptr<int>(),
+            has_event_values ? event_values.data_ptr<float>() : nullptr,
+            has_event_values,
+            graph_indptr.data_ptr<int>(),
+            graph_indices.data_ptr<int>(),
+            graph_weight.data_ptr<float>(),
+            v_out.data_ptr<float>(),
+            psc_out.data_ptr<float>(),
+            recurrent_delta_0.data_ptr<float>(),
+            recurrent_delta_1.data_ptr<float>(),
+            return_dense ? dense_spikes.data_ptr<float>() : nullptr,
+            input_current.data_ptr<float>(),
+            spike_queue_batch.data_ptr<int>(),
+            reinterpret_cast<uint32_t*>(
+                spike_queue_edge_start.data_ptr<int>()),
+            spike_count.data_ptr<int>(),
+            work_counter.data_ptr<int>(),
+            pipeline_done_counters.data_ptr<int>(),
+            pipeline_done_counters.data_ptr<int>() + 1,
+            return_events ? event_counts.data_ptr<int>() : nullptr,
+            return_events ? event_indices_full.data_ptr<int>() : nullptr,
+            return_dense,
+            return_events,
+            t_steps,
+            n_neuron,
+            update_block_count,
+            static_cast<float>(dt),
+            static_cast<float>(tau_mem),
+            static_cast<float>(tau_syn),
+            static_cast<float>(v_threshold),
+            static_cast<float>(v_reset),
+            static_cast<float>(c_m),
+            grid_dim,
+            kThreadsPerBlock,
+            stream);
+        // The split PSC representation carries the last timestep's newly
+        // generated recurrent current in the write delta. Fold it back into
+        // psc_out so state remains compatible across separate forward calls.
+        psc_out.add_((t_steps & 1) ? recurrent_delta_1 : recurrent_delta_0);
+#else
         launch_persistent_snn_kernel(
             event_offsets.data_ptr<int>(),
             event_indices.data_ptr<int>(),
@@ -614,6 +700,7 @@ persistent_snn_forward_cuda_impl(
             grid_dim,
             kThreadsPerBlock,
             stream);
+#endif
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
