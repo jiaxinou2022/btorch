@@ -30,6 +30,8 @@ from benchmark.provider_common import (
 
 
 CUDA_SPMSPV_CUDAGRAPH_PROVIDERS = {
+    "vdha_cudagraph": "vdha",
+    "vdha_pipe_cudagraph": "vdha_pipe",
     "tilespmspv_cudagraph": "tilespmspv",
     "sortspmspv_cudagraph": "sortspmspv",
     "globalatomic_cudagraph": "globalatomic",
@@ -39,7 +41,6 @@ CUDA_SPMSPV_CUDAGRAPH_PROVIDERS = {
     "holaspmspv_cudagraph": "holaspmspv",
 }
 SOTA_CUDAGRAPH_PROVIDERS = (
-    "vdha_cudagraph",
     "sputnik_cudagraph",
     *CUDA_SPMSPV_CUDAGRAPH_PROVIDERS,
 )
@@ -253,8 +254,6 @@ def prepare_matmul(
 
     if provider == "sputnik_cudagraph":
         return _sputnik_matmul(weight, case)
-    if provider == "vdha_cudagraph":
-        return _vdha_matmul(weight, case)
     if provider in CUDA_SPMSPV_CUDAGRAPH_PROVIDERS:
         return _prepare_cuda_spmspv_device_matmul(provider, weight, case)
     raise ValueError(f"Unknown SOTA CUDA Graph provider: {provider}")

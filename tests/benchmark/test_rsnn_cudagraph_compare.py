@@ -146,11 +146,12 @@ def test_non_capturable_sota_wrappers_use_named_eager_fallbacks():
     """Host-controlled providers should never be mislabeled as CUDA Graphs."""
 
     assert SOTA_CUDAGRAPH_PROVIDERS == (
-        "vdha_cudagraph",
         "sputnik_cudagraph",
         *CUDA_SPMSPV_CUDAGRAPH_PROVIDERS,
     )
     assert set(CUDA_SPMSPV_CUDAGRAPH_PROVIDERS.values()) == {
+        "vdha",
+        "vdha_pipe",
         "tilespmspv",
         "sortspmspv",
         "globalatomic",
@@ -220,25 +221,32 @@ def test_sputnik_batch_one_adapter_reuses_zero_copy_buffers(monkeypatch):
     assert calls[0][1] == calls[1][1] == first.data_ptr()
 
 
-def test_vdha_dense_adapter_reuses_preallocated_output(monkeypatch):
-    """VDHA dense-input calls should reuse the prepared device output."""
+def test_vdha_graph_adapter_reuses_preallocated_output(monkeypatch):
+    """In-tree VDHA graph calls should reuse one prepared device output."""
+
+    from connectome_dataset.benchmarks.cuda import kernels
 
     output_pointers = []
 
-    class FakeVdhaLibrary:
-        def cbn_vdha_prepare_dense(self, *args):
-            return 1
+    class FakePreparedKernel:
+        def __init__(self, spec, matrix, *, precision):
+            assert spec.provider == "vdha"
+            assert matrix.shape == (4, 4)
+            assert precision == "fp32"
 
-        def cbn_vdha_compute_dense_device(self, handle, spikes, output, stream):
-            output_pointers.append(output.value)
-            return 0
+        def step_device(self, x_pointer, output_pointer, stream_pointer):
+            output_pointers.append(output_pointer)
 
-        def cbn_vdha_free(self, handle):
+        def free(self):
             return None
 
-    fake_module = types.SimpleNamespace(_load_lib=lambda dtype: FakeVdhaLibrary())
-    monkeypatch.setitem(sys.modules, "connectome_bench_vdha", fake_module)
-    monkeypatch.setattr(sota_adapters, "_stream_pointer", lambda: None)
+    monkeypatch.setattr(kernels, "PreparedKernel", FakePreparedKernel)
+    monkeypatch.setattr(kernels, "supports_device_compute", lambda spec, p: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda: types.SimpleNamespace(cuda_stream=123),
+    )
     weight = torch.eye(4).to_sparse_csr()
     case = BenchCase(
         n_neuron=4,
@@ -566,8 +574,8 @@ def test_sota_capabilities_reject_unsupported_batch_one_providers():
 
     for provider in (
         "torch_csr_cudagraph",
-        "vdha_cudagraph",
         "sputnik_cudagraph",
+        *CUDA_SPMSPV_CUDAGRAPH_PROVIDERS,
         "torch_csr_host_e2e",
         *SPMSPV_EAGER_PROVIDERS,
     ):
@@ -710,7 +718,6 @@ def test_default_providers_include_external_simulator_comparisons():
         "torch_csr_cudagraph",
         "cusparse_direct_eager",
         "cusparse_direct_cudagraph",
-        "vdha_cudagraph",
         "sputnik_cudagraph",
         *CUDA_SPMSPV_CUDAGRAPH_PROVIDERS,
         "mh_spgemm_eager",

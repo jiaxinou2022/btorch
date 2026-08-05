@@ -11,8 +11,9 @@ three persistent CUDA task schedulers:
 * ``cusparse_direct_eager`` calls cuSPARSE SpMV/SpMM directly from a CUDA
   extension with preallocated descriptors and workspace.
 * ``cusparse_direct_cudagraph`` captures that direct CUDA execution.
-* ``vdha_cudagraph`` and ``sputnik_cudagraph`` use graph-safe, device-pointer
-  launches from the corresponding connectome_dataset SOTA kernels.
+* ``vdha_cudagraph``, ``vdha_pipe_cudagraph``, and ``sputnik_cudagraph`` use
+  graph-safe, device-pointer launches from the corresponding
+  connectome_dataset SOTA kernels.
 * In-tree CUDA SpMSpV kernels expose full-window CUDA Graph variants that
   consume dense device spikes without host conversion. Their split-ABI eager
   variants remain available for end-to-end adapter comparisons. Triton, Finch,
@@ -129,6 +130,7 @@ Provider = Literal[
     "cusparse_direct_eager",
     "cusparse_direct_cudagraph",
     "vdha_cudagraph",
+    "vdha_pipe_cudagraph",
     "sputnik_cudagraph",
     "tilespmspv_cudagraph",
     "sortspmspv_cudagraph",
@@ -326,7 +328,6 @@ def crop_result(result: RSNNResult, logical_n: int) -> RSNNResult:
 
 
 PROVIDER_CAPABILITIES: dict[Provider, ProviderCapability] = {
-    "vdha_cudagraph": ProviderCapability(batch_sizes=frozenset({1})),
     **{
         provider: ProviderCapability(batch_sizes=frozenset({1}))
         for provider in CUDA_SPMSPV_CUDAGRAPH_PROVIDERS
@@ -1771,6 +1772,10 @@ def bench_case(
             graph_provider: f"{kernel_name}_eager"
             for graph_provider, kernel_name in CUDA_SPMSPV_CUDAGRAPH_PROVIDERS.items()
         }.get(str(row["provider"]))
+        eager_provider = {
+            "vdha_eager": "vdha_spmspv_eager",
+            "vdha_pipe_eager": "vdha_pipe_spmspv_eager",
+        }.get(eager_provider, eager_provider)
         eager_row = row_by_provider.get(eager_provider) if eager_provider else None
         if eager_row is not None:
             eager_latency = float(eager_row["latency_ms"])
