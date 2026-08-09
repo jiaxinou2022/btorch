@@ -9,6 +9,24 @@ namespace {
 
 constexpr int kEdgesPerTask = 1024;
 
+#ifdef ENABLE_PIPELINE_TIMING
+constexpr int kPipelineTimingColumns = 5;
+
+enum PipelineTimestamp : int {
+    kTimestampBegin = 0,
+    kTimestampFirstPublish = 1,
+    kTimestampFirstConsume = 2,
+    kTimestampUpdateDone = 3,
+    kTimestampPipelineDone = 4,
+};
+
+__device__ __forceinline__ unsigned long long global_timestamp_ns() {
+    unsigned long long timestamp;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(timestamp));
+    return timestamp;
+}
+#endif
+
 template <bool ReturnDense>
 __global__ void persistent_snn_kernel(
     const int* __restrict__ event_offsets,
@@ -27,6 +45,7 @@ __global__ void persistent_snn_kernel(
     int* __restrict__ spike_queue_edge_end,
     int* __restrict__ spike_count,
     int* __restrict__ work_counter,
+    unsigned long long* __restrict__ timing_stats,
     int* __restrict__ event_counts,
     int* __restrict__ event_indices_full,
     bool return_events,
@@ -63,6 +82,12 @@ __global__ void persistent_snn_kernel(
                 }
             }
         }
+#ifdef ENABLE_PIPELINE_TIMING
+        if (global_tid == 0) {
+            timing_stats[t * kPipelineTimingColumns + kTimestampBegin] =
+                global_timestamp_ns();
+        }
+#endif
         grid.sync();
 
         for (int b = 0; b < batch_size; ++b) {
@@ -114,6 +139,19 @@ __global__ void persistent_snn_kernel(
             }
         }
         grid.sync();
+#ifdef ENABLE_PIPELINE_TIMING
+        if (global_tid == 0) {
+            const unsigned long long timestamp = global_timestamp_ns();
+            timing_stats[
+                t * kPipelineTimingColumns + kTimestampFirstPublish] =
+                timestamp;
+            timing_stats[
+                t * kPipelineTimingColumns + kTimestampFirstConsume] =
+                timestamp;
+            timing_stats[t * kPipelineTimingColumns + kTimestampUpdateDone] =
+                timestamp;
+        }
+#endif
 
         // Long rows were already split into bounded edge ranges when queued.
         // One warp claims one task at a time so skewed row lengths remain
@@ -138,6 +176,13 @@ __global__ void persistent_snn_kernel(
             }
         }
         grid.sync();
+#ifdef ENABLE_PIPELINE_TIMING
+        if (global_tid == 0) {
+            timing_stats[
+                t * kPipelineTimingColumns + kTimestampPipelineDone] =
+                global_timestamp_ns();
+        }
+#endif
     }
 }
 
@@ -179,6 +224,7 @@ void launch_persistent_snn_kernel(
     int* spike_queue_edge_end,
     int* spike_count,
     int* work_counter,
+    unsigned long long* timing_stats,
     int* event_counts,
     int* event_indices_full,
     bool return_dense,
@@ -213,6 +259,7 @@ void launch_persistent_snn_kernel(
         &spike_queue_edge_end,
         &spike_count,
         &work_counter,
+        &timing_stats,
         &event_counts,
         &event_indices_full,
         &return_events,

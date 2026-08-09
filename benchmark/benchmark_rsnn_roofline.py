@@ -30,6 +30,18 @@ Switch to the direct cuSPARSE CUDA Graph baseline::
     micromamba run -n ml-py312 python \
         benchmark/benchmark_rsnn_roofline.py --provider cusparse_cudagraph
 
+Split host-side pipeline costs with CUDA Events::
+
+    BTORCH_PERSISTENT_PIPELINE=1 micromamba run -n ml-py312 python \
+        benchmark/benchmark_rsnn_roofline.py --dataset flybrain \
+        --pipeline-component-timing --pipeline-delta-mode preallocated
+
+Collect opt-in UPDATE--propagation overlap timestamps::
+
+    BTORCH_PERSISTENT_PIPELINE=1 micromamba run -n ml-py312 python \
+        benchmark/benchmark_rsnn_roofline.py --dataset flybrain \
+        --pipeline-timing
+
 Capture one representative persistent launch with Nsight Compute::
 
     ncu --set roofline --profile-from-start off \
@@ -116,6 +128,7 @@ Mode = Literal["benchmark", "ncu"]
 Provider = Literal["persistent", "cusparse_cudagraph"]
 FANOUT_BINNING_THRESHOLD = 256
 LANE_ROW_THRESHOLD = 4
+PIPELINE_EDGES_PER_TASK = 1024
 BLOCK_STATS_COLUMNS = 44
 LONG_SEGMENT_STATS_COLUMNS = 64
 HASH_AGGREGATION_SCALES = (32, 64, 128, 256, 512)
@@ -159,6 +172,8 @@ class PreparedWorkload:
     x_seq: torch.Tensor
     high_fanout: torch.Tensor
     workspace: PersistentSNNWorkspace
+    pipeline_delta_0: torch.Tensor
+    pipeline_delta_1: torch.Tensor
     permutation: NeuronPermutation
     reorder_preprocess_ms: float
     reorder_stats: dict[str, float | int]
@@ -422,6 +437,8 @@ def prepare_workload(
             graph,
             provisional.batch_size,
         ),
+        pipeline_delta_0=torch.empty_like(state.psc),
+        pipeline_delta_1=torch.empty_like(state.psc),
         permutation=permutation,
         reorder_preprocess_ms=reorder_preprocess_ms,
         reorder_stats=reorder_stats,
@@ -495,6 +512,18 @@ def run_prepared_operator(
         return torch.ops.btorch_cuda.persistent_snn_forward_spike_block(
             *op_args,
             *op_tail,
+        )
+    preallocated_delta = (
+        os.environ.get("BTORCH_PIPELINE_PREALLOCATED_DELTA", "0") == "1"
+    )
+    fold_psc = os.environ.get("BTORCH_PIPELINE_FOLD_PSC", "1") == "1"
+    if preallocated_delta or not fold_psc:
+        return torch.ops.btorch_cuda.persistent_snn_forward(
+            *op_args,
+            *op_tail,
+            workload.pipeline_delta_0 if preallocated_delta else None,
+            workload.pipeline_delta_1 if preallocated_delta else None,
+            fold_psc,
         )
     return torch.ops.btorch_cuda.persistent_snn_forward(*op_args, *op_tail)
 
@@ -1298,7 +1327,7 @@ def benchmark_row(
     spike_block: bool,
     block_hash: bool,
     block_stats: dict[str, float | int] | None = None,
-    pipeline_stats: dict[str, int] | None = None,
+    pipeline_stats: dict[str, float | int] | None = None,
 ) -> dict:
     """Run the benchmark and return one flat, CSV-friendly result record."""
 
@@ -1319,18 +1348,61 @@ def benchmark_row(
             os.environ.get("BTORCH_PERSISTENT_PIPELINE", "0") == "1"
         ),
         "pipeline_role_ratio": (
-            os.environ.get("BTORCH_PIPELINE_ROLE_RATIO", "3:1")
+            os.environ.get("BTORCH_PIPELINE_ROLE_RATIO", "7:1")
             if os.environ.get("BTORCH_PERSISTENT_PIPELINE", "0") == "1"
             else ""
         ),
-        "pipeline_debug_counters": pipeline_stats is not None,
-        "pipeline_consumer_warps": (
-            int(os.environ.get("BTORCH_PIPELINE_CONSUMER_WARPS", "2"))
+        "pipeline_debug_counters": (
+            os.environ.get("BTORCH_PIPELINE_DEBUG_COUNTERS", "0") == "1"
+        ),
+        "pipeline_timing": (
+            os.environ.get("BTORCH_PIPELINE_TIMING", "0") == "1"
+        ),
+        "pipeline_component_timing": (
+            os.environ.get("BTORCH_PIPELINE_COMPONENT_TIMING", "0") == "1"
+        ),
+        "pipeline_delta_mode": (
+            "preallocated"
+            if os.environ.get(
+                "BTORCH_PIPELINE_PREALLOCATED_DELTA", "0"
+            ) == "1"
+            else "allocate"
+        ),
+        "pipeline_fold_psc": (
+            os.environ.get("BTORCH_PIPELINE_FOLD_PSC", "1") == "1"
+        ),
+        "pipeline_dedicated_warps": (
+            int(os.environ.get("BTORCH_PIPELINE_DEDICATED_WARPS", "1"))
+            if os.environ.get("BTORCH_PERSISTENT_PIPELINE", "0") == "1"
+            else ""
+        ),
+        "pipeline_helper_warps": (
+            int(os.environ.get("BTORCH_PIPELINE_HELPER_WARPS", "1"))
             if os.environ.get("BTORCH_PERSISTENT_PIPELINE", "0") == "1"
             else ""
         ),
         "pipeline_ticket_chunk": (
             int(os.environ.get("BTORCH_PIPELINE_TICKET_CHUNK", "1"))
+            if os.environ.get("BTORCH_PERSISTENT_PIPELINE", "0") == "1"
+            else ""
+        ),
+        "pipeline_static_waves": (
+            int(os.environ.get("BTORCH_PIPELINE_STATIC_WAVES", "0"))
+            if os.environ.get("BTORCH_PERSISTENT_PIPELINE", "0") == "1"
+            else ""
+        ),
+        "pipeline_binned_threshold": (
+            int(os.environ.get("BTORCH_PIPELINE_BINNED_THRESHOLD", "512"))
+            if os.environ.get("BTORCH_PERSISTENT_PIPELINE", "0") == "1"
+            else ""
+        ),
+        "pipeline_low_subwarp_size": (
+            int(os.environ.get("BTORCH_PIPELINE_LOW_SUBWARP_SIZE", "8"))
+            if os.environ.get("BTORCH_PERSISTENT_PIPELINE", "0") == "1"
+            else ""
+        ),
+        "pipeline_high_low_ratio": (
+            int(os.environ.get("BTORCH_PIPELINE_HIGH_LOW_RATIO", "2"))
             if os.environ.get("BTORCH_PERSISTENT_PIPELINE", "0") == "1"
             else ""
         ),
@@ -1606,6 +1678,61 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--mode", choices=("benchmark", "ncu"), default="benchmark")
     parser.add_argument(
+        "--pipeline-component-timing",
+        action="store_true",
+        help="Return CUDA Event timings for forward components.",
+    )
+    parser.add_argument(
+        "--pipeline-timing",
+        action="store_true",
+        help="Build pipeline timestamp instrumentation for overlap analysis.",
+    )
+    parser.add_argument(
+        "--pipeline-delta-mode",
+        choices=("allocate", "preallocated"),
+        default="allocate",
+        help="Allocate delta buffers per forward or reuse benchmark buffers.",
+    )
+    parser.add_argument(
+        "--pipeline-fold-psc",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include the compatibility PSC fold after the pipeline kernel.",
+    )
+    parser.add_argument(
+        "--pipeline-serial-update-us",
+        type=float,
+        default=None,
+        help="Serial UPDATE reference used for overlap exchange metrics.",
+    )
+    parser.add_argument(
+        "--pipeline-serial-propagation-us",
+        type=float,
+        default=None,
+        help="Serial propagation reference used for exchange metrics.",
+    )
+    parser.add_argument(
+        "--pipeline-binned-threshold",
+        type=int,
+        choices=(0, 128, 256, 512),
+        default=None,
+        help="Route smaller fired rows to packed LOW subwarps.",
+    )
+    parser.add_argument(
+        "--pipeline-low-subwarp-size",
+        type=int,
+        choices=(4, 8, 16),
+        default=None,
+        help="Select lanes per LOW neuron in the binned pipeline.",
+    )
+    parser.add_argument(
+        "--pipeline-high-low-ratio",
+        type=int,
+        choices=(1, 2, 4),
+        default=None,
+        help="Select HIGH tasks processed before each LOW group.",
+    )
+    parser.add_argument(
         "--grid-blocks",
         type=int,
         default=None,
@@ -1668,6 +1795,30 @@ def parse_args() -> argparse.Namespace:
         parser.error("--reorder-window must be positive.")
     if args.reorder_extreme_threshold <= 0:
         parser.error("--reorder-extreme-threshold must be positive.")
+    if args.pipeline_timing and args.pipeline_component_timing:
+        parser.error(
+            "--pipeline-timing and --pipeline-component-timing are mutually "
+            "exclusive."
+        )
+    if (
+        args.pipeline_binned_threshold not in (None, 0)
+        and os.environ.get("BTORCH_PERSISTENT_PIPELINE", "0") != "1"
+    ):
+        parser.error(
+            "--pipeline-binned-threshold requires BTORCH_PERSISTENT_PIPELINE=1."
+        )
+    if not args.pipeline_fold_psc and not args.skip_correctness:
+        parser.error("--no-pipeline-fold-psc requires --skip-correctness.")
+    serial_references = (
+        args.pipeline_serial_update_us,
+        args.pipeline_serial_propagation_us,
+    )
+    if any(value is not None for value in serial_references) and not all(
+        value is not None and value > 0 for value in serial_references
+    ):
+        parser.error(
+            "Both serial pipeline references must be provided and positive."
+        )
     if not 0.0 <= args.event_rate <= 1.0:
         parser.error("--event-rate must be in [0, 1].")
     if args.fanout_binning and args.provider != "persistent":
@@ -1704,6 +1855,36 @@ def main() -> None:
 
     if args.grid_blocks is not None:
         os.environ["BTORCH_PERSISTENT_GRID_BLOCKS"] = str(args.grid_blocks)
+    if args.pipeline_component_timing:
+        os.environ["BTORCH_PIPELINE_COMPONENT_TIMING"] = "1"
+    if args.pipeline_timing:
+        os.environ["BTORCH_PIPELINE_TIMING"] = "1"
+    if args.pipeline_binned_threshold is not None:
+        os.environ["BTORCH_PIPELINE_BINNED_THRESHOLD"] = str(
+            args.pipeline_binned_threshold
+        )
+    if args.pipeline_low_subwarp_size is not None:
+        os.environ["BTORCH_PIPELINE_LOW_SUBWARP_SIZE"] = str(
+            args.pipeline_low_subwarp_size
+        )
+    if args.pipeline_high_low_ratio is not None:
+        os.environ["BTORCH_PIPELINE_HIGH_LOW_RATIO"] = str(
+            args.pipeline_high_low_ratio
+        )
+    os.environ["BTORCH_PIPELINE_PREALLOCATED_DELTA"] = (
+        "1" if args.pipeline_delta_mode == "preallocated" else "0"
+    )
+    os.environ["BTORCH_PIPELINE_FOLD_PSC"] = (
+        "1" if args.pipeline_fold_psc else "0"
+    )
+    if (
+        args.pipeline_delta_mode == "preallocated"
+        or not args.pipeline_fold_psc
+    ) and os.environ.get("BTORCH_PERSISTENT_PIPELINE", "0") != "1":
+        raise RuntimeError(
+            "Preallocated delta and split-state options require "
+            "BTORCH_PERSISTENT_PIPELINE=1."
+        )
     os.environ["BTORCH_BLOCK_EDGE_BUDGET"] = str(args.block_edge_budget)
     os.environ["BTORCH_LONG_SEGMENT_SIZE"] = str(args.long_segment_size)
     os.environ["BTORCH_TILE_REDUCE_MODE"] = {
@@ -1785,19 +1966,257 @@ def main() -> None:
             spike_block=False,
         )
         raw_stats = raw_output[5]
-        if raw_stats.numel() != 4:
+        if raw_stats.numel() != 14:
             raise RuntimeError(
                 "Pipeline debug build returned an invalid counter tensor."
             )
-        wait_tail, wait_ready, invalid_final, processed_tasks = (
+        (
+            wait_tail,
+            wait_ready,
+            invalid_final,
+            processed_tasks,
+            high_tasks,
+            low_tasks,
+            high_processed,
+            low_processed,
+            high_claims,
+            low_group_claims,
+            low_partial_group_claims,
+            queue_overflow,
+            high_edges,
+            low_edges,
+        ) = (
             int(value) for value in raw_stats.cpu().tolist()
         )
+        dense_spikes = raw_output[0]
+        fanout = (
+            workload.graph.indptr[1:] - workload.graph.indptr[:-1]
+        ).to(torch.int64)
+        threshold = int(
+            os.environ.get("BTORCH_PIPELINE_BINNED_THRESHOLD", "512")
+        )
+        high_neuron = (threshold == 0) | (fanout >= threshold)
+        high_tasks_per_neuron = torch.where(
+            high_neuron,
+            (fanout + PIPELINE_EDGES_PER_TASK - 1)
+            // PIPELINE_EDGES_PER_TASK,
+            0,
+        )
+        low_tasks_per_neuron = (~high_neuron & (fanout > 0)).to(torch.int64)
+        spike_mask = (dense_spikes != 0).to(torch.int64)
+        expected_high_tasks = int(
+            (spike_mask * high_tasks_per_neuron).sum().item()
+        )
+        expected_low_tasks = int(
+            (spike_mask * low_tasks_per_neuron).sum().item()
+        )
+        expected_high_edges = int(
+            (spike_mask * torch.where(high_neuron, fanout, 0)).sum().item()
+        )
+        expected_low_edges = int(
+            (spike_mask * torch.where(high_neuron, 0, fanout)).sum().item()
+        )
+        expected_tasks = expected_high_tasks + expected_low_tasks
+        if (
+            processed_tasks != expected_tasks
+            or high_tasks != expected_high_tasks
+            or low_tasks != expected_low_tasks
+            or high_processed != high_tasks
+            or low_processed != low_tasks
+            or high_edges != expected_high_edges
+            or low_edges != expected_low_edges
+            or queue_overflow != 0
+        ):
+            raise AssertionError(
+                "Pipeline binned counters do not match expected work: "
+                f"processed={processed_tasks}/{expected_tasks}, "
+                f"high={high_processed}/{high_tasks}/{expected_high_tasks}, "
+                f"low={low_processed}/{low_tasks}/{expected_low_tasks}, "
+                f"edges={high_edges + low_edges}/"
+                f"{expected_high_edges + expected_low_edges}, "
+                f"overflow={queue_overflow}."
+            )
         pipeline_stats = {
             "pipeline_ticket_wait_tail": wait_tail,
             "pipeline_ticket_wait_ready": wait_ready,
             "pipeline_invalid_final_tickets": invalid_final,
             "pipeline_processed_tasks": processed_tasks,
+            "pipeline_expected_tasks": expected_tasks,
+            "pipeline_high_tasks": high_tasks,
+            "pipeline_low_tasks": low_tasks,
+            "pipeline_high_processed": high_processed,
+            "pipeline_low_processed": low_processed,
+            "pipeline_high_edges": high_edges,
+            "pipeline_low_edges": low_edges,
+            "pipeline_high_claims": high_claims,
+            "pipeline_low_group_claims": low_group_claims,
+            "pipeline_low_partial_group_claims": (
+                low_partial_group_claims
+            ),
+            "pipeline_low_tasks_per_claim": (
+                low_processed / low_group_claims
+                if low_group_claims
+                else 0.0
+            ),
+            "pipeline_queue_overflow": queue_overflow,
         }
+
+    if os.environ.get("BTORCH_PIPELINE_TIMING", "0") == "1":
+        if (
+            args.provider != "persistent"
+            or args.fanout_binning
+            or args.spike_block
+        ):
+            raise RuntimeError(
+                "Pipeline timing requires the plain pipeline provider."
+            )
+        raw_output = run_prepared_operator(
+            workload,
+            fanout_binning=False,
+            spike_block=False,
+        )
+        timing_output = raw_output[5].to(torch.float64).cpu()
+        expected_columns = (
+            9
+            if os.environ.get("BTORCH_PERSISTENT_PIPELINE", "0") == "1"
+            else 5
+        )
+        if timing_output.shape != (
+            workload.case.t_steps,
+            expected_columns,
+        ):
+            raise RuntimeError(
+                "Pipeline timing build returned an invalid timestamp tensor."
+            )
+        timestamps = timing_output[:, :5]
+        begin, first_publish, first_consume, update_done, pipeline_done = (
+            timestamps[:, column] for column in range(5)
+        )
+
+        def median_us(delta: torch.Tensor, valid: torch.Tensor) -> float:
+            values = delta[valid] / 1000.0
+            return float(values.median().item()) if values.numel() else 0.0
+
+        has_tasks = (first_publish > 0) & (first_consume > 0)
+        complete = (update_done >= begin) & (pipeline_done >= update_done)
+        pipeline_stats = {
+            "pipeline_timing_valid_steps": int(complete.sum().item()),
+            "pipeline_timing_active_steps": int(has_tasks.sum().item()),
+            "pipeline_update_us_p50": median_us(
+                update_done - begin, complete
+            ),
+            "pipeline_publish_delay_us_p50": median_us(
+                first_publish - begin, has_tasks
+            ),
+            "pipeline_startup_us_p50": median_us(
+                first_consume - first_publish, has_tasks
+            ),
+            "pipeline_overlap_window_us_p50": median_us(
+                update_done - first_consume, has_tasks
+            ),
+            "pipeline_tail_us_p50": median_us(
+                pipeline_done - update_done, complete
+            ),
+            "pipeline_duration_us_p50": median_us(
+                pipeline_done - begin, complete
+            ),
+        }
+        if expected_columns == 9:
+            publication = timing_output[:, 5:]
+            q25, q50, q75, q100 = (
+                publication[:, column] for column in range(4)
+            )
+            published = q100 > 0
+
+            def publication_ratio(milestone: torch.Tensor) -> float:
+                values = milestone[published] / q100[published]
+                return (
+                    float(values.median().item())
+                    if values.numel()
+                    else 0.0
+                )
+
+            pipeline_stats.update(
+                {
+                    "pipeline_publication_q25_ratio_p50": (
+                        publication_ratio(q25)
+                    ),
+                    "pipeline_publication_q50_ratio_p50": (
+                        publication_ratio(q50)
+                    ),
+                    "pipeline_publication_q75_ratio_p50": (
+                        publication_ratio(q75)
+                    ),
+                    "pipeline_publication_tasks_p50": (
+                        float(q100[published].median().item())
+                        if published.any()
+                        else 0.0
+                    ),
+                }
+            )
+        if args.pipeline_serial_update_us is not None:
+            update_slowdown = (
+                pipeline_stats["pipeline_update_us_p50"]
+                - args.pipeline_serial_update_us
+            )
+            propagation_hidden = (
+                args.pipeline_serial_propagation_us
+                - pipeline_stats["pipeline_tail_us_p50"]
+            )
+            pipeline_stats.update(
+                {
+                    "pipeline_update_slowdown_us": update_slowdown,
+                    "pipeline_propagation_hidden_us": propagation_hidden,
+                    "pipeline_net_overlap_gain_us": (
+                        propagation_hidden - update_slowdown
+                    ),
+                    "pipeline_exchange_ratio": (
+                        propagation_hidden / update_slowdown
+                        if update_slowdown > 0
+                        else 0.0
+                    ),
+                }
+            )
+
+    if os.environ.get("BTORCH_PIPELINE_COMPONENT_TIMING", "0") == "1":
+        if (
+            args.provider != "persistent"
+            or args.fanout_binning
+            or args.spike_block
+        ):
+            raise RuntimeError(
+                "Component timing requires the plain persistent provider."
+            )
+        component_samples = []
+        for _ in range(args.repeat):
+            raw_output = run_prepared_operator(
+                workload,
+                fanout_binning=False,
+                spike_block=False,
+            )
+            raw_stats = raw_output[5]
+            if raw_stats.numel() != 6:
+                raise RuntimeError(
+                    "Component timing returned an invalid statistics tensor."
+                )
+            component_samples.append(raw_stats.to(torch.float64).cpu())
+        component_median = torch.stack(component_samples).median(dim=0).values
+        component_names = (
+            "clone",
+            "delta_init",
+            "queue_clear",
+            "kernel",
+            "psc_fold",
+            "forward_gpu",
+        )
+        if pipeline_stats is None:
+            pipeline_stats = {}
+        pipeline_stats.update(
+            {
+                f"component_{name}_ms": float(component_median[index].item())
+                for index, name in enumerate(component_names)
+            }
+        )
 
     wait_for_idle_gpu(args.wait_idle_samples)
     row = benchmark_row(

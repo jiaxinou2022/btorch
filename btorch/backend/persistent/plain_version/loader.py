@@ -22,7 +22,7 @@ def _pipeline_enabled() -> bool:
 
 
 def _pipeline_role_ratio() -> str:
-    value = os.environ.get("BTORCH_PIPELINE_ROLE_RATIO", "3:1")
+    value = os.environ.get("BTORCH_PIPELINE_ROLE_RATIO", "7:1")
     if value not in ("7:1", "3:1", "2:1", "1:1"):
         raise ValueError(
             "BTORCH_PIPELINE_ROLE_RATIO must be 7:1, 3:1, 2:1, or 1:1."
@@ -37,12 +37,24 @@ def _pipeline_debug_counters() -> bool:
     return bool(value)
 
 
-def _pipeline_consumer_warps() -> int:
-    value = int(os.environ.get("BTORCH_PIPELINE_CONSUMER_WARPS", "2"))
+def _pipeline_timing() -> bool:
+    value = int(os.environ.get("BTORCH_PIPELINE_TIMING", "0"))
+    if value not in (0, 1):
+        raise ValueError("BTORCH_PIPELINE_TIMING must be 0 or 1.")
+    return bool(value)
+
+
+def _pipeline_component_timing() -> bool:
+    value = int(os.environ.get("BTORCH_PIPELINE_COMPONENT_TIMING", "0"))
+    if value not in (0, 1):
+        raise ValueError("BTORCH_PIPELINE_COMPONENT_TIMING must be 0 or 1.")
+    return bool(value)
+
+
+def _pipeline_consumer_warps(name: str, default: int) -> int:
+    value = int(os.environ.get(name, str(default)))
     if value not in (1, 2, 4, 8):
-        raise ValueError(
-            "BTORCH_PIPELINE_CONSUMER_WARPS must be 1, 2, 4, or 8."
-        )
+        raise ValueError(f"{name} must be 1, 2, 4, or 8.")
     return value
 
 
@@ -50,6 +62,42 @@ def _pipeline_ticket_chunk() -> int:
     value = int(os.environ.get("BTORCH_PIPELINE_TICKET_CHUNK", "1"))
     if value not in (1, 2, 4):
         raise ValueError("BTORCH_PIPELINE_TICKET_CHUNK must be 1, 2, or 4.")
+    return value
+
+
+def _pipeline_static_waves() -> int:
+    value = int(os.environ.get("BTORCH_PIPELINE_STATIC_WAVES", "0"))
+    if value not in (0, 1, 2, 4):
+        raise ValueError(
+            "BTORCH_PIPELINE_STATIC_WAVES must be 0, 1, 2, or 4."
+        )
+    return value
+
+
+def _pipeline_binned_threshold() -> int:
+    value = int(os.environ.get("BTORCH_PIPELINE_BINNED_THRESHOLD", "512"))
+    if value not in (0, 128, 256, 512):
+        raise ValueError(
+            "BTORCH_PIPELINE_BINNED_THRESHOLD must be 0, 128, 256, or 512."
+        )
+    return value
+
+
+def _pipeline_low_subwarp_size() -> int:
+    value = int(os.environ.get("BTORCH_PIPELINE_LOW_SUBWARP_SIZE", "8"))
+    if value not in (4, 8, 16):
+        raise ValueError(
+            "BTORCH_PIPELINE_LOW_SUBWARP_SIZE must be 4, 8, or 16."
+        )
+    return value
+
+
+def _pipeline_high_low_ratio() -> int:
+    value = int(os.environ.get("BTORCH_PIPELINE_HIGH_LOW_RATIO", "2"))
+    if value not in (1, 2, 4):
+        raise ValueError(
+            "BTORCH_PIPELINE_HIGH_LOW_RATIO must be 1, 2, or 4."
+        )
     return value
 
 
@@ -181,9 +229,23 @@ def load(
     to select the initial UPDATE:PROPAGATION block ratio; UPDATE blocks become
     propagation helpers after finishing their neurons. Set
     ``BTORCH_PIPELINE_DEBUG_COUNTERS=1`` to return queue polling diagnostics in
-    the sixth output tensor. ``BTORCH_PIPELINE_CONSUMER_WARPS`` selects 1, 2,
-    4, or 8 ticket consumers per block, and ``BTORCH_PIPELINE_TICKET_CHUNK``
-    selects 1, 2, or 4 tasks per ticket allocation.
+    the sixth output tensor. ``BTORCH_PIPELINE_DEDICATED_WARPS`` and
+    ``BTORCH_PIPELINE_HELPER_WARPS`` select 1, 2, 4, or 8 ticket consumers for
+    dedicated propagation blocks and completed UPDATE blocks, respectively.
+    ``BTORCH_PIPELINE_TICKET_CHUNK`` selects 1, 2, or 4 tasks per ticket
+    allocation. ``BTORCH_PIPELINE_STATIC_WAVES`` selects 0, 1, 2, or 4
+    deterministic startup claims per dedicated warp. The RTX 5090 FlyBrain
+    scan defaults to a 7:1 role ratio, one dedicated warp, one helper warp,
+    one task per allocation, zero static waves, a 512-edge HIGH threshold,
+    eight LOW lanes, and a 2:1 HIGH/LOW schedule.
+    ``BTORCH_PIPELINE_BINNED_THRESHOLD`` selects 0 (disabled), 128, 256, or
+    512 edges for the two-ended HIGH/LOW pipeline queue, and
+    ``BTORCH_PIPELINE_LOW_SUBWARP_SIZE`` selects 4, 8, or 16 lanes per LOW
+    neuron. ``BTORCH_PIPELINE_HIGH_LOW_RATIO`` selects 1, 2, or 4 HIGH tasks
+    per LOW group.
+    ``BTORCH_PIPELINE_TIMING=1`` builds opt-in overlap
+    timestamps, while ``BTORCH_PIPELINE_COMPONENT_TIMING=1`` enables host-side
+    CUDA Event component timings. Instrumentation modes are mutually exclusive.
     """
 
     global _loaded_config
@@ -209,22 +271,67 @@ def load(
             "be enabled together."
         )
     pipeline_enabled = _pipeline_enabled()
-    pipeline_role_ratio = _pipeline_role_ratio() if pipeline_enabled else "3:1"
+    pipeline_role_ratio = _pipeline_role_ratio() if pipeline_enabled else "7:1"
     pipeline_debug_counters = (
         _pipeline_debug_counters() if pipeline_enabled else False
     )
-    pipeline_consumer_warps = (
-        _pipeline_consumer_warps() if pipeline_enabled else 2
+    pipeline_timing = _pipeline_timing()
+    pipeline_component_timing = _pipeline_component_timing()
+    if sum(
+        (
+            pipeline_debug_counters,
+            pipeline_timing,
+            pipeline_component_timing,
+        )
+    ) > 1:
+        raise ValueError(
+            "Pipeline debug counters, overlap timing, and component timing "
+            "are mutually exclusive."
+        )
+    pipeline_dedicated_warps = (
+        _pipeline_consumer_warps("BTORCH_PIPELINE_DEDICATED_WARPS", 1)
+        if pipeline_enabled
+        else 1
+    )
+    pipeline_helper_warps = (
+        _pipeline_consumer_warps("BTORCH_PIPELINE_HELPER_WARPS", 1)
+        if pipeline_enabled
+        else 1
     )
     pipeline_ticket_chunk = (
         _pipeline_ticket_chunk() if pipeline_enabled else 1
     )
+    pipeline_static_waves = (
+        _pipeline_static_waves() if pipeline_enabled else 0
+    )
+    pipeline_binned_threshold = (
+        _pipeline_binned_threshold() if pipeline_enabled else 512
+    )
+    pipeline_low_subwarp_size = (
+        _pipeline_low_subwarp_size() if pipeline_enabled else 8
+    )
+    pipeline_high_low_ratio = (
+        _pipeline_high_low_ratio() if pipeline_enabled else 2
+    )
+    if pipeline_binned_threshold and (
+        pipeline_ticket_chunk != 1 or pipeline_static_waves != 0
+    ):
+        raise ValueError(
+            "Pipeline binning requires ticket chunk 1 and static waves 0."
+        )
     requested_config = (
         pipeline_enabled,
         pipeline_role_ratio,
         pipeline_debug_counters,
-        pipeline_consumer_warps,
+        pipeline_timing,
+        pipeline_component_timing,
+        pipeline_dedicated_warps,
+        pipeline_helper_warps,
         pipeline_ticket_chunk,
+        pipeline_static_waves,
+        pipeline_binned_threshold,
+        pipeline_low_subwarp_size,
+        pipeline_high_low_ratio,
         enable_block_stats,
         enable_block_hash,
         block_budget,
@@ -302,6 +409,10 @@ def load(
         )
     if pipeline_enabled:
         suffixes.append("pipeline")
+        suffixes.append(f"lsw{pipeline_low_subwarp_size}")
+        suffixes.append(f"hl{pipeline_high_low_ratio}")
+    if pipeline_timing:
+        suffixes.append("pipeline_timing")
     extension_suffix = f"_{'_'.join(suffixes)}"
     cuda_cflags.extend(
         [
@@ -328,6 +439,17 @@ def load(
     if pipeline_enabled:
         cflags.append("-DBTORCH_PERSISTENT_PIPELINE")
         cuda_cflags.append("-DBTORCH_PERSISTENT_PIPELINE")
+        cuda_cflags.append(
+            f"-DBTORCH_PIPELINE_LOW_SUBWARP_SIZE="
+            f"{pipeline_low_subwarp_size}"
+        )
+        cuda_cflags.append(
+            f"-DBTORCH_PIPELINE_HIGH_LOW_RATIO="
+            f"{pipeline_high_low_ratio}"
+        )
+    if pipeline_timing:
+        cflags.append("-DENABLE_PIPELINE_TIMING")
+        cuda_cflags.append("-DENABLE_PIPELINE_TIMING")
     if enable_block_stats:
         cflags.append("-DENABLE_BLOCK_STATS")
         cuda_cflags.append("-DENABLE_BLOCK_STATS")

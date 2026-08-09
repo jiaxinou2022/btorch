@@ -5,14 +5,17 @@
 #include <torch/library.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <tuple>
 #include <unordered_map>
+#include <vector>
 
 #ifndef BTORCH_WARP_SPEC_MODE
 #define BTORCH_WARP_SPEC_MODE 0
@@ -24,6 +27,8 @@
 
 constexpr int kThreadsPerBlock = 256;
 constexpr int kMinimumEdgesPerTask = 128;
+constexpr int kComponentEventCount = 7;
+constexpr int kComponentTimingColumns = 6;
 
 void launch_persistent_snn_kernel(
     const int* event_offsets,
@@ -47,14 +52,16 @@ void launch_persistent_snn_kernel(
     int* queue_tail,
     int* next_ticket,
     int* update_done_blocks,
-    int* propagation_done_tasks,
     unsigned long long* debug_counters,
+    unsigned long long* timing_stats,
+    int* timing_counters,
 #else
     int* spike_queue_batch,
     int* spike_queue_edge_start,
     int* spike_queue_edge_end,
     int* spike_count,
     int* work_counter,
+    unsigned long long* timing_stats,
 #endif
     int* event_counts,
     int* event_indices_full,
@@ -66,9 +73,13 @@ void launch_persistent_snn_kernel(
 #endif
     int n_neuron,
 #ifdef BTORCH_PERSISTENT_PIPELINE
+    int queue_capacity,
     int update_block_count,
-    int consumer_warps_per_block,
+    int dedicated_consumer_warps,
+    int helper_consumer_warps,
     int ticket_chunk,
+    int static_waves,
+    int high_fanout_threshold,
     uint32_t forward_epoch_base,
 #else
     int queue_capacity,
@@ -318,11 +329,24 @@ int requested_cooperative_grid_dim(int maximum_grid_dim) {
     return static_cast<int>(requested);
 }
 
+bool pipeline_component_timing_enabled() {
+    const char* value = std::getenv("BTORCH_PIPELINE_COMPONENT_TIMING");
+    if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) {
+        return false;
+    }
+    TORCH_CHECK(
+        std::strcmp(value, "1") == 0,
+        "BTORCH_PIPELINE_COMPONENT_TIMING must be 0 or 1, got '",
+        value,
+        "'.");
+    return true;
+}
+
 #ifdef BTORCH_PERSISTENT_PIPELINE
 int pipeline_update_block_count(int grid_dim) {
     const char* value = std::getenv("BTORCH_PIPELINE_ROLE_RATIO");
     if (value == nullptr || value[0] == '\0') {
-        value = "3:1";
+        value = "7:1";
     }
 
     TORCH_CHECK(
@@ -359,10 +383,11 @@ bool pipeline_debug_counters_enabled() {
     return true;
 }
 
-int pipeline_consumer_warps_per_block() {
-    const char* value = std::getenv("BTORCH_PIPELINE_CONSUMER_WARPS");
+int pipeline_consumer_warps(
+    const char* environment_name, int default_warps) {
+    const char* value = std::getenv(environment_name);
     if (value == nullptr || value[0] == '\0') {
-        return 2;
+        return default_warps;
     }
     errno = 0;
     char* end = nullptr;
@@ -370,10 +395,21 @@ int pipeline_consumer_warps_per_block() {
     TORCH_CHECK(
         errno == 0 && end != value && *end == '\0' &&
             (warps == 1 || warps == 2 || warps == 4 || warps == 8),
-        "BTORCH_PIPELINE_CONSUMER_WARPS must be 1, 2, 4, or 8, got '",
+        environment_name,
+        " must be 1, 2, 4, or 8, got '",
         value,
         "'.");
     return static_cast<int>(warps);
+}
+
+int pipeline_dedicated_consumer_warps() {
+    return pipeline_consumer_warps(
+        "BTORCH_PIPELINE_DEDICATED_WARPS", 1);
+}
+
+int pipeline_helper_consumer_warps() {
+    return pipeline_consumer_warps(
+        "BTORCH_PIPELINE_HELPER_WARPS", 1);
 }
 
 int pipeline_ticket_chunk() {
@@ -391,6 +427,41 @@ int pipeline_ticket_chunk() {
         value,
         "'.");
     return static_cast<int>(chunk);
+}
+
+int pipeline_static_waves() {
+    const char* value = std::getenv("BTORCH_PIPELINE_STATIC_WAVES");
+    if (value == nullptr || value[0] == '\0') {
+        return 0;
+    }
+    errno = 0;
+    char* end = nullptr;
+    const long waves = std::strtol(value, &end, 10);
+    TORCH_CHECK(
+        errno == 0 && end != value && *end == '\0' &&
+            (waves == 0 || waves == 1 || waves == 2 || waves == 4),
+        "BTORCH_PIPELINE_STATIC_WAVES must be 0, 1, 2, or 4, got '",
+        value,
+        "'.");
+    return static_cast<int>(waves);
+}
+
+int pipeline_binned_threshold() {
+    const char* value = std::getenv("BTORCH_PIPELINE_BINNED_THRESHOLD");
+    if (value == nullptr || value[0] == '\0') {
+        return 512;
+    }
+    errno = 0;
+    char* end = nullptr;
+    const long threshold = std::strtol(value, &end, 10);
+    TORCH_CHECK(
+        errno == 0 && end != value && *end == '\0' &&
+            (threshold == 0 || threshold == 128 || threshold == 256 ||
+             threshold == 512),
+        "BTORCH_PIPELINE_BINNED_THRESHOLD must be 0, 128, 256, or 512, got '",
+        value,
+        "'.");
+    return static_cast<int>(threshold);
 }
 
 std::tuple<uint32_t, bool> pipeline_forward_epoch(
@@ -449,7 +520,11 @@ persistent_snn_forward_cuda_impl(
     bool return_events,
     torch::Tensor graph_high_fanout,
     bool fanout_binning,
-    bool spike_block) {
+    bool spike_block,
+    torch::Tensor pipeline_delta_0,
+    torch::Tensor pipeline_delta_1,
+    bool pipeline_preallocated_delta,
+    bool pipeline_fold_psc) {
     TORCH_CHECK(
         !(fanout_binning && spike_block),
         "fanout_binning and spike_block are mutually exclusive.");
@@ -480,6 +555,18 @@ persistent_snn_forward_cuda_impl(
     check_same_device(spike_count, v, "spike_count");
     check_same_device(work_counter, v, "work_counter");
     check_same_device(psc, v, "psc");
+    if (pipeline_preallocated_delta) {
+        check_cuda_tensor(
+            pipeline_delta_0, "pipeline_delta_0", torch::kFloat32);
+        check_cuda_tensor(
+            pipeline_delta_1, "pipeline_delta_1", torch::kFloat32);
+        check_same_device(pipeline_delta_0, v, "pipeline_delta_0");
+        check_same_device(pipeline_delta_1, v, "pipeline_delta_1");
+        TORCH_CHECK(
+            pipeline_delta_0.sizes() == psc.sizes() &&
+                pipeline_delta_1.sizes() == psc.sizes(),
+            "preallocated pipeline deltas must match psc shape.");
+    }
     if (fanout_binning) {
         check_cuda_tensor(
             graph_high_fanout, "graph_high_fanout", torch::kInt32);
@@ -501,6 +588,27 @@ persistent_snn_forward_cuda_impl(
     }
 
     c10::cuda::CUDAGuard guard(v.device());
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const bool component_timing = pipeline_component_timing_enabled();
+#ifdef ENABLE_PIPELINE_TIMING
+    TORCH_CHECK(
+        !component_timing,
+        "pipeline overlap timing and component timing are mutually exclusive.");
+#endif
+    TORCH_CHECK(
+        !component_timing || (!fanout_binning && !spike_block),
+        "component timing requires the plain persistent provider.");
+    std::array<cudaEvent_t, kComponentEventCount> component_events{};
+    if (component_timing) {
+        for (cudaEvent_t& event : component_events) {
+            const cudaError_t error = cudaEventCreate(&event);
+            TORCH_CHECK(
+                error == cudaSuccess,
+                "failed to create component timing event: ",
+                cudaGetErrorString(error));
+        }
+        cudaEventRecord(component_events[0], stream);
+    }
     if (has_delay && !delay_validated) {
         // Only pay for this O(E) reduction + device->host sync when the caller
         // (the Python `persistent_snn_forward` dispatcher) hasn't already
@@ -577,6 +685,9 @@ persistent_snn_forward_cuda_impl(
     const auto options_i = event_offsets.options();
     auto v_out = v.clone();
     auto psc_out = psc.clone();
+    if (component_timing) {
+        cudaEventRecord(component_events[1], stream);
+    }
     auto dense_spikes = return_dense
         ? torch::empty({t_steps, batch_size, n_neuron}, options_f)
         : torch::empty({0}, options_f);
@@ -601,7 +712,11 @@ persistent_snn_forward_cuda_impl(
             spike_queue_edge_start.numel() >= queue_capacity &&
             spike_queue_edge_end.numel() >= queue_capacity,
         "persistent SNN task queues are too small.");
-    const int counter_size = (fanout_binning || spike_block) ? 2 : 1;
+    const int counter_size =
+#ifdef BTORCH_PERSISTENT_PIPELINE
+        (!fanout_binning && !spike_block) ? 2 :
+#endif
+        ((fanout_binning || spike_block) ? 2 : 1);
     TORCH_CHECK(
         spike_count.numel() >= counter_size,
         "spike_count does not have enough counters.");
@@ -628,12 +743,36 @@ persistent_snn_forward_cuda_impl(
 #else
     auto overflow = torch::empty({0}, options_i);
 #endif
+#ifdef ENABLE_PIPELINE_TIMING
+#ifdef BTORCH_PERSISTENT_PIPELINE
+    constexpr int kPipelineTimingStatsColumns = 9;
+#else
+    constexpr int kPipelineTimingStatsColumns = 5;
+#endif
+    auto pipeline_timing_stats =
+        torch::zeros(
+            {t_steps, kPipelineTimingStatsColumns},
+            options_i.dtype(torch::kInt64));
+    if (!fanout_binning && !spike_block) {
+        overflow = pipeline_timing_stats;
+    }
+#else
+    auto pipeline_timing_stats = torch::empty({0}, options_i);
+#endif
 #ifdef BTORCH_PERSISTENT_PIPELINE
     const bool pipeline_debug_counters =
         !fanout_binning && !spike_block &&
         pipeline_debug_counters_enabled();
+#ifdef ENABLE_PIPELINE_TIMING
+    TORCH_CHECK(
+        !pipeline_debug_counters,
+        "pipeline debug counters and timing cannot be enabled together.");
+    auto pipeline_timing_counters = torch::zeros({3}, options_i);
+#else
+    auto pipeline_timing_counters = torch::empty({0}, options_i);
+#endif
     if (pipeline_debug_counters) {
-        overflow = torch::zeros({4}, options_i.dtype(torch::kInt64));
+        overflow = torch::zeros({14}, options_i.dtype(torch::kInt64));
     }
 #endif
 
@@ -646,8 +785,9 @@ persistent_snn_forward_cuda_impl(
                : cooperative_grid_dim(
                      kThreadsPerBlock, return_dense, return_events));
     const int grid_dim = requested_cooperative_grid_dim(maximum_grid_dim);
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
-
+    if (component_timing) {
+        cudaEventRecord(component_events[2], stream);
+    }
     if (spike_block) {
         launch_persistent_snn_spike_block_kernel(
             event_offsets.data_ptr<int>(),
@@ -728,17 +868,40 @@ persistent_snn_forward_cuda_impl(
             "blocks.");
         const int update_block_count =
             pipeline_update_block_count(grid_dim);
-        const int consumer_warps_per_block =
-            pipeline_consumer_warps_per_block();
+        const int dedicated_consumer_warps =
+            pipeline_dedicated_consumer_warps();
+        const int helper_consumer_warps =
+            pipeline_helper_consumer_warps();
         const int ticket_chunk = pipeline_ticket_chunk();
+        const int static_waves = pipeline_static_waves();
+        const int high_fanout_threshold = pipeline_binned_threshold();
+        TORCH_CHECK(
+            high_fanout_threshold == 0 ||
+                (ticket_chunk == 1 && static_waves == 0),
+            "pipeline binning currently requires ticket chunk 1 and static "
+            "waves 0.");
         const auto [forward_epoch_base, must_clear_queue_state] =
             pipeline_forward_epoch(
                 spike_queue_edge_start.data_ptr<int>(), t_steps);
-        auto recurrent_delta_0 = torch::zeros_like(psc_out);
-        auto recurrent_delta_1 = torch::zeros_like(psc_out);
-        auto pipeline_done_counters = torch::zeros({2}, options_i);
+        auto recurrent_delta_0 = pipeline_preallocated_delta
+            ? pipeline_delta_0
+            : torch::zeros_like(psc_out);
+        auto recurrent_delta_1 = pipeline_preallocated_delta
+            ? pipeline_delta_1
+            : torch::zeros_like(psc_out);
+        if (pipeline_preallocated_delta) {
+            recurrent_delta_0.zero_();
+            recurrent_delta_1.zero_();
+        }
+        auto pipeline_update_done = torch::zeros({1}, options_i);
+        if (component_timing) {
+            cudaEventRecord(component_events[3], stream);
+        }
         if (must_clear_queue_state) {
             spike_queue_edge_start.zero_();
+        }
+        if (component_timing) {
+            cudaEventRecord(component_events[4], stream);
         }
         launch_persistent_snn_kernel(
             event_offsets.data_ptr<int>(),
@@ -759,21 +922,32 @@ persistent_snn_forward_cuda_impl(
                 spike_queue_edge_start.data_ptr<int>()),
             spike_count.data_ptr<int>(),
             work_counter.data_ptr<int>(),
-            pipeline_done_counters.data_ptr<int>(),
-            pipeline_done_counters.data_ptr<int>() + 1,
+            pipeline_update_done.data_ptr<int>(),
             pipeline_debug_counters
                 ? reinterpret_cast<unsigned long long*>(
                       overflow.data_ptr<int64_t>())
                 : nullptr,
+#ifdef ENABLE_PIPELINE_TIMING
+            reinterpret_cast<unsigned long long*>(
+                pipeline_timing_stats.data_ptr<int64_t>()),
+            pipeline_timing_counters.data_ptr<int>(),
+#else
+            nullptr,
+            nullptr,
+#endif
             return_events ? event_counts.data_ptr<int>() : nullptr,
             return_events ? event_indices_full.data_ptr<int>() : nullptr,
             return_dense,
             return_events,
             t_steps,
             n_neuron,
+            queue_capacity,
             update_block_count,
-            consumer_warps_per_block,
+            dedicated_consumer_warps,
+            helper_consumer_warps,
             ticket_chunk,
+            static_waves,
+            high_fanout_threshold,
             forward_epoch_base,
             static_cast<float>(dt),
             static_cast<float>(tau_mem),
@@ -784,11 +958,27 @@ persistent_snn_forward_cuda_impl(
             grid_dim,
             kThreadsPerBlock,
             stream);
+        if (component_timing) {
+            cudaEventRecord(component_events[5], stream);
+        }
         // The split PSC representation carries the last timestep's newly
         // generated recurrent current in the write delta. Fold it back into
         // psc_out so state remains compatible across separate forward calls.
-        psc_out.add_((t_steps & 1) ? recurrent_delta_1 : recurrent_delta_0);
+        if (pipeline_fold_psc) {
+            psc_out.add_(
+                (t_steps & 1) ? recurrent_delta_1 : recurrent_delta_0);
+        }
+        if (component_timing) {
+            cudaEventRecord(component_events[6], stream);
+        }
 #else
+        TORCH_CHECK(
+            !pipeline_preallocated_delta,
+            "preallocated deltas require the pipeline build.");
+        if (component_timing) {
+            cudaEventRecord(component_events[3], stream);
+            cudaEventRecord(component_events[4], stream);
+        }
         launch_persistent_snn_kernel(
             event_offsets.data_ptr<int>(),
             event_indices.data_ptr<int>(),
@@ -806,6 +996,12 @@ persistent_snn_forward_cuda_impl(
             spike_queue_edge_end.data_ptr<int>(),
             spike_count.data_ptr<int>(),
             work_counter.data_ptr<int>(),
+#ifdef ENABLE_PIPELINE_TIMING
+            reinterpret_cast<unsigned long long*>(
+                pipeline_timing_stats.data_ptr<int64_t>()),
+#else
+            nullptr,
+#endif
             return_events ? event_counts.data_ptr<int>() : nullptr,
             return_events ? event_indices_full.data_ptr<int>() : nullptr,
             return_dense,
@@ -823,9 +1019,39 @@ persistent_snn_forward_cuda_impl(
             grid_dim,
             kThreadsPerBlock,
             stream);
+        if (component_timing) {
+            cudaEventRecord(component_events[5], stream);
+            cudaEventRecord(component_events[6], stream);
+        }
 #endif
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    if (component_timing) {
+        const cudaError_t sync_error = cudaEventSynchronize(component_events[6]);
+        TORCH_CHECK(
+            sync_error == cudaSuccess,
+            "failed to synchronize component timing event: ",
+            cudaGetErrorString(sync_error));
+        std::vector<float> elapsed(kComponentTimingColumns, 0.0f);
+        cudaEventElapsedTime(
+            &elapsed[0], component_events[0], component_events[1]);
+        cudaEventElapsedTime(
+            &elapsed[1], component_events[2], component_events[3]);
+        cudaEventElapsedTime(
+            &elapsed[2], component_events[3], component_events[4]);
+        cudaEventElapsedTime(
+            &elapsed[3], component_events[4], component_events[5]);
+        cudaEventElapsedTime(
+            &elapsed[4], component_events[5], component_events[6]);
+        cudaEventElapsedTime(
+            &elapsed[5], component_events[0], component_events[6]);
+        for (cudaEvent_t event : component_events) {
+            cudaEventDestroy(event);
+        }
+        overflow = torch::tensor(
+            elapsed, torch::TensorOptions().dtype(torch::kFloat32));
+    }
 
     torch::Tensor event_offsets_out;
     torch::Tensor event_indices_out;
@@ -905,7 +1131,15 @@ persistent_snn_forward_cuda(
     double c_m,
     bool hard_reset,
     bool return_dense,
-    bool return_events) {
+    bool return_events,
+    const std::optional<torch::Tensor>& pipeline_delta_0,
+    const std::optional<torch::Tensor>& pipeline_delta_1,
+    bool pipeline_fold_psc) {
+    TORCH_CHECK(
+        pipeline_delta_0.has_value() == pipeline_delta_1.has_value(),
+        "pipeline_delta_0 and pipeline_delta_1 must be provided together.");
+    const bool pipeline_preallocated_delta =
+        pipeline_delta_0.has_value();
     return persistent_snn_forward_cuda_impl(
         event_offsets,
         event_indices,
@@ -937,7 +1171,11 @@ persistent_snn_forward_cuda(
         return_events,
         torch::Tensor(),
         false,
-        false);
+        false,
+        pipeline_delta_0.value_or(torch::Tensor()),
+        pipeline_delta_1.value_or(torch::Tensor()),
+        pipeline_preallocated_delta,
+        pipeline_fold_psc);
 }
 
 std::tuple<
@@ -1030,7 +1268,11 @@ persistent_snn_forward_binned_cuda(
         return_events,
         graph_high_fanout,
         true,
-        false);
+        false,
+        torch::Tensor(),
+        torch::Tensor(),
+        false,
+        true);
 
 }
 
@@ -1101,6 +1343,10 @@ persistent_snn_forward_spike_block_cuda(
         return_events,
         torch::Tensor(),
         false,
+        true,
+        torch::Tensor(),
+        torch::Tensor(),
+        false,
         true);
 }
 
@@ -1117,7 +1363,9 @@ TORCH_LIBRARY(btorch_cuda, m) {
         "bool delay_validated, Tensor v, "
         "Tensor psc, float dt, float tau_mem, float tau_syn, "
         "float v_threshold, float v_reset, float c_m, bool hard_reset, "
-        "bool return_dense, bool return_events) -> "
+        "bool return_dense, bool return_events, "
+        "Tensor? pipeline_delta_0=None, Tensor? pipeline_delta_1=None, "
+        "bool pipeline_fold_psc=True) -> "
         "(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def(
         "persistent_snn_forward_binned("
