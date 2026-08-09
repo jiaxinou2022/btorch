@@ -71,6 +71,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import statistics
 import sys
 import time
@@ -112,6 +113,11 @@ from benchmark.sota_rsnn_cudagraph import (  # noqa: E402
     SPMSPV_EAGER_PROVIDERS,
     SotaCUDAGraphProvider,
     SotaEagerProvider,
+)
+from btorch.backend.persistent.reorder import (  # noqa: E402
+    ReorderConfig,
+    prepare_reordered_inputs,
+    restore_output,
 )
 from btorch.backend.persistent_snn import (  # noqa: E402
     PersistentSNNParams,
@@ -862,6 +868,20 @@ class PersistentProvider:
 
     def __init__(self) -> None:
         self._runners: dict[tuple, object] = {}
+        self._backend_loaded = False
+
+    def _ensure_backend(self) -> None:
+        """Load persistent kernels with the default block-hash configuration."""
+
+        if self._backend_loaded:
+            return
+        os.environ.setdefault("BTORCH_BLOCK_EDGE_BUDGET", "512")
+        os.environ.setdefault("BTORCH_BLOCK_HASH_AGGREGATION", "512")
+        os.environ.setdefault("BTORCH_BLOCK_HASH_CAPACITY", "512")
+        from btorch.backend.persistent import plain_version
+
+        plain_version.load(enable_block_hash=True)
+        self._backend_loaded = True
 
     def fixed_runner(
         self, x_seq: torch.Tensor, matrix: CSR, case: BenchCase, *, variant: str
@@ -871,6 +891,7 @@ class PersistentProvider:
         if cached is not None:
             return cached
 
+        self._ensure_backend()
         events = dense_to_windowed_events(x_seq)
         graph = csr_to_persistent_graph(matrix)
         state = make_empty_state(
@@ -879,6 +900,18 @@ class PersistentProvider:
             device=x_seq.device,
             refractory=False,
         )
+        permutation = None
+        if variant == "spike_block":
+            reordered = prepare_reordered_inputs(
+                events,
+                graph,
+                state,
+                ReorderConfig(mode="global_similarity"),
+            )
+            events = reordered.events
+            graph = reordered.graph
+            state = reordered.state
+            permutation = reordered.permutation
         workspace = make_persistent_snn_workspace(graph, case.batch_size)
         params = PersistentSNNParams(
             dt=case.dt,
@@ -925,6 +958,8 @@ class PersistentProvider:
                 **options,
             )
             current_state = output.state
+            if permutation is not None:
+                output = restore_output(output, permutation)
             assert output.spikes is not None
             return RSNNResult(
                 spikes=output.spikes,
