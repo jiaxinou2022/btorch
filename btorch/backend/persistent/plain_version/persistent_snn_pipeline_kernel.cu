@@ -2,6 +2,7 @@
 #include <cuda/atomic>
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace cg = cooperative_groups;
@@ -124,11 +125,19 @@ __global__ void persistent_snn_kernel(
     float v_reset,
     float c_m) {
     cg::grid_group grid = cg::this_grid();
+    extern __shared__ unsigned char shared_storage[];
     const int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int global_stride = blockDim.x * gridDim.x;
     const bool is_update_block = blockIdx.x < update_block_count;
-    const int update_tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int update_stride = update_block_count * blockDim.x;
+    const int neurons_per_update_block =
+        (n_neuron + update_block_count - 1) / update_block_count;
+    const int neuron_begin = blockIdx.x * neurons_per_update_block;
+    const int neuron_end =
+        min(neuron_begin + neurons_per_update_block, n_neuron);
+    const int local_neuron_count = max(0, neuron_end - neuron_begin);
+    float* shared_v = reinterpret_cast<float*>(shared_storage);
+    float* shared_recurrent = shared_v + neurons_per_update_block;
+    float* shared_current = shared_recurrent + neurons_per_update_block;
     const int lane = threadIdx.x & 31;
     const int warp_in_block = threadIdx.x >> 5;
     const int propagation_block_count = gridDim.x - update_block_count;
@@ -186,18 +195,39 @@ __global__ void persistent_snn_kernel(
         grid.sync();
 
         if (is_update_block) {
-            for (int n = update_tid; n < n_neuron; n += update_stride) {
+            // Phase A: preload this CTA's contiguous neuron partition. The
+            // input buffers are consumed here and remain disjoint from the
+            // delta buffer written by propagation during this timestep.
+            for (int local = threadIdx.x; local < local_neuron_count;
+                 local += blockDim.x) {
+                const int n = neuron_begin + local;
                 const float recurrent = psc[n] + delta_read[n];
-                delta_read[n] = 0.0f;
                 const float current = recurrent + input_current[n];
+
+                shared_v[local] = v[n];
+                shared_recurrent[local] = recurrent;
+                shared_current[local] = current;
+                delta_read[n] = 0.0f;
                 input_current[n] = 0.0f;
+            }
+            __syncthreads();
+
+            // Phase B: update shared-resident state and publish sparse work as
+            // soon as each spike is known, preserving producer-consumer
+            // overlap with the unchanged propagation queue.
+            for (int local = threadIdx.x; local < local_neuron_count;
+                 local += blockDim.x) {
+                const int n = neuron_begin + local;
+                const float recurrent = shared_recurrent[local];
+                const float current = shared_current[local];
+                const float v_old = shared_v[local];
                 const float v_pre =
-                    v[n] +
-                    dt * (-(v[n] - v_reset) / tau_mem + current / c_m);
+                    v_old +
+                    dt * (-(v_old - v_reset) / tau_mem + current / c_m);
                 const bool fired = v_pre >= v_threshold;
                 const float spike = fired ? 1.0f : 0.0f;
-                v[n] = v_pre - reset_delta * spike;
-                psc[n] = recurrent * decay;
+                shared_v[local] = v_pre - reset_delta * spike;
+                shared_recurrent[local] = recurrent * decay;
 
                 if constexpr (ReturnDense) {
                     dense_spikes[t * n_neuron + n] = spike;
@@ -293,6 +323,16 @@ __global__ void persistent_snn_kernel(
                 }
             }
 
+            // Phase C: concentrate the remaining dense global stores. After
+            // this barrier the shared allocation is dead and can be reused by
+            // helper propagation in a later optimization.
+            __syncthreads();
+            for (int local = threadIdx.x; local < local_neuron_count;
+                 local += blockDim.x) {
+                const int n = neuron_begin + local;
+                v[n] = shared_v[local];
+                psc[n] = shared_recurrent[local];
+            }
             __syncthreads();
             if (threadIdx.x == 0) {
                 const int old = atomicAdd(update_done_blocks, 1);
@@ -836,18 +876,38 @@ void launch_persistent_snn_kernel(
     const void* kernel = return_dense
         ? reinterpret_cast<void*>(persistent_snn_kernel<true>)
         : reinterpret_cast<void*>(persistent_snn_kernel<false>);
+    const int neurons_per_update_block =
+        (n_neuron + update_block_count - 1) / update_block_count;
+    const size_t dynamic_shared_bytes =
+        static_cast<size_t>(neurons_per_update_block) * 3 * sizeof(float);
+    cudaFuncSetAttribute(
+        kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(dynamic_shared_bytes));
     cudaLaunchCooperativeKernel(
-        kernel, grid_dim, block_dim, args, 0, stream);
+        kernel, grid_dim, block_dim, args, dynamic_shared_bytes, stream);
 }
 
 int persistent_snn_max_active_blocks_per_sm(
-    int block_dim, bool return_dense, bool return_events) {
+    int block_dim,
+    bool return_dense,
+    bool return_events,
+    size_t dynamic_shared_bytes) {
     int active_blocks = 0;
     const void* kernel = return_dense
         ? reinterpret_cast<void*>(persistent_snn_kernel<true>)
         : reinterpret_cast<void*>(persistent_snn_kernel<false>);
+    if (dynamic_shared_bytes > 0) {
+        const cudaError_t attribute_error = cudaFuncSetAttribute(
+            kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(dynamic_shared_bytes));
+        if (attribute_error != cudaSuccess) {
+            return 0;
+        }
+    }
     const cudaError_t error = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &active_blocks, kernel, block_dim, 0);
+        &active_blocks, kernel, block_dim, dynamic_shared_bytes);
     if (error != cudaSuccess) {
         return 0;
     }

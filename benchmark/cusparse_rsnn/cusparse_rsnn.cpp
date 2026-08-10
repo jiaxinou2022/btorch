@@ -207,6 +207,55 @@ int64_t get_workspace_bytes(int64_t plan_id) {
     return plan->workspace.numel() * plan->workspace.element_size();
 }
 
+void run_propagation(
+    const std::shared_ptr<Plan>& plan,
+    int timestep,
+    cusparseHandle_t handle) {
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    void* workspace = plan->workspace.numel() == 0
+        ? nullptr
+        : plan->workspace.data_ptr();
+    if (plan->use_spmv) {
+        CUSPARSE_CHECK(cusparseSpMV(
+            handle,
+            CUSPARSE_OPERATION_NON_TRANSPOSE,
+            &alpha,
+            plan->matrix,
+            plan->spike_vectors[timestep],
+            &beta,
+            plan->recurrent_vector,
+            CUDA_R_32F,
+            CUSPARSE_SPMV_ALG_DEFAULT,
+            workspace));
+    } else {
+        CUSPARSE_CHECK(cusparseSpMM(
+            handle,
+            CUSPARSE_OPERATION_NON_TRANSPOSE,
+            CUSPARSE_OPERATION_NON_TRANSPOSE,
+            &alpha,
+            plan->matrix,
+            plan->spike_matrices[timestep],
+            &beta,
+            plan->recurrent_matrix,
+            CUDA_R_32F,
+            CUSPARSE_SPMM_CSR_ALG1,
+            workspace));
+    }
+}
+
+void propagate(int64_t plan_id, int64_t timestep) {
+    auto plan = get_plan(plan_id);
+    c10::cuda::CUDAGuard guard(plan->weight.device());
+    TORCH_CHECK(
+        timestep >= 0 && timestep < plan->t_steps,
+        "timestep is outside the prepared spike sequence.");
+    cusparseHandle_t handle = at::cuda::getCurrentCUDASparseHandle();
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    CUSPARSE_CHECK(cusparseSetStream(handle, stream));
+    run_propagation(plan, static_cast<int>(timestep), handle);
+}
+
 void run(
     int64_t plan_id,
     torch::Tensor input,
@@ -239,12 +288,7 @@ void run(
     C10_CUDA_CHECK(cudaMemsetAsync(psc.data_ptr<float>(), 0, psc.nbytes(), stream));
 
     const int count = plan->batch_size * plan->n_neuron;
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
     const float decay = std::exp(-static_cast<float>(dt / tau_syn));
-    void* workspace = plan->workspace.numel() == 0
-        ? nullptr
-        : plan->workspace.data_ptr();
     for (int t = 0; t < plan->t_steps; ++t) {
         float* spike_t =
             plan->spikes.data_ptr<float>() + static_cast<int64_t>(t) * count;
@@ -262,32 +306,7 @@ void run(
             static_cast<float>(v_reset),
             static_cast<float>(c_m),
             stream);
-        if (plan->use_spmv) {
-            CUSPARSE_CHECK(cusparseSpMV(
-                handle,
-                CUSPARSE_OPERATION_NON_TRANSPOSE,
-                &alpha,
-                plan->matrix,
-                plan->spike_vectors[t],
-                &beta,
-                plan->recurrent_vector,
-                CUDA_R_32F,
-                CUSPARSE_SPMV_ALG_DEFAULT,
-                workspace));
-        } else {
-            CUSPARSE_CHECK(cusparseSpMM(
-                handle,
-                CUSPARSE_OPERATION_NON_TRANSPOSE,
-                CUSPARSE_OPERATION_NON_TRANSPOSE,
-                &alpha,
-                plan->matrix,
-                plan->spike_matrices[t],
-                &beta,
-                plan->recurrent_matrix,
-                CUDA_R_32F,
-                CUSPARSE_SPMM_CSR_ALG1,
-                workspace));
-        }
+        run_propagation(plan, t, handle);
         launch_psc_step(
             psc.data_ptr<float>(),
             plan->recurrent.data_ptr<float>(),
@@ -306,5 +325,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         "workspace_bytes",
         &get_workspace_bytes,
         "Return direct cuSPARSE workspace bytes");
+    module.def(
+        "propagate",
+        &propagate,
+        "Run one prepared direct cuSPARSE propagation step");
     module.def("run", &run, "Run direct cuSPARSE RSNN forward");
 }

@@ -242,7 +242,9 @@ def load(
     512 edges for the two-ended HIGH/LOW pipeline queue, and
     ``BTORCH_PIPELINE_LOW_SUBWARP_SIZE`` selects 4, 8, or 16 lanes per LOW
     neuron. ``BTORCH_PIPELINE_HIGH_LOW_RATIO`` selects 1, 2, or 4 HIGH tasks
-    per LOW group.
+    per LOW group. ``BTORCH_PIPELINE_UPDATE_SMEM_KB`` caps the dynamic shared
+    memory available to each UPDATE block (32 KiB by default); the launcher
+    chooses a cooperative grid that can stage all neuron state within it.
     ``BTORCH_PIPELINE_TIMING=1`` builds opt-in overlap
     timestamps, while ``BTORCH_PIPELINE_COMPONENT_TIMING=1`` enables host-side
     CUDA Event component timings. Instrumentation modes are mutually exclusive.

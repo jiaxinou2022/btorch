@@ -1473,6 +1473,9 @@ def benchmark_row(
             latency_ms + input_permutation_ms + output_restore_ms
         ),
         "grid_blocks": os.environ.get("BTORCH_PERSISTENT_GRID_BLOCKS", "auto"),
+        "pipeline_update_smem_kb": os.environ.get(
+            "BTORCH_PIPELINE_UPDATE_SMEM_KB", "32"
+        ),
         "timing_mode": (
             "instrumented_debug"
             if block_stats is not None or pipeline_stats is not None

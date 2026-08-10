@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -177,8 +178,16 @@ void launch_compact_event_indices_kernel(
     int block_dim,
     cudaStream_t stream);
 
+#ifdef BTORCH_PERSISTENT_PIPELINE
+int persistent_snn_max_active_blocks_per_sm(
+    int block_dim,
+    bool return_dense,
+    bool return_events,
+    size_t dynamic_shared_bytes);
+#else
 int persistent_snn_max_active_blocks_per_sm(
     int block_dim, bool return_dense, bool return_events);
+#endif
 int persistent_snn_binned_max_active_blocks_per_sm(
     int block_dim, bool return_dense, bool return_events);
 int persistent_snn_spike_block_max_active_blocks_per_sm(
@@ -218,8 +227,13 @@ int cooperative_grid_dim_uncached(
         prop.cooperativeLaunch,
         "persistent SNN requires CUDA cooperative launch support.");
 
+#ifdef BTORCH_PERSISTENT_PIPELINE
+    const int active_blocks = persistent_snn_max_active_blocks_per_sm(
+        block_dim, return_dense, return_events, 0);
+#else
     const int active_blocks = persistent_snn_max_active_blocks_per_sm(
         block_dim, return_dense, return_events);
+#endif
     TORCH_CHECK(active_blocks > 0, "persistent SNN kernel has zero occupancy.");
     return active_blocks * prop.multiProcessorCount;
 }
@@ -368,6 +382,112 @@ int pipeline_update_block_count(int grid_dim) {
         update_blocks = grid_dim / 2;
     }
     return std::min(grid_dim - 1, std::max(1, update_blocks));
+}
+
+size_t pipeline_update_shared_memory_limit() {
+    const char* value = std::getenv("BTORCH_PIPELINE_UPDATE_SMEM_KB");
+    if (value == nullptr || value[0] == '\0') {
+        return 32 * 1024;
+    }
+
+    errno = 0;
+    char* end = nullptr;
+    const long kibibytes = std::strtol(value, &end, 10);
+    TORCH_CHECK(
+        errno == 0 && end != value && *end == '\0' && kibibytes > 0,
+        "BTORCH_PIPELINE_UPDATE_SMEM_KB must be a positive integer, got '",
+        value,
+        "'.");
+    TORCH_CHECK(
+        static_cast<unsigned long>(kibibytes) <=
+            std::numeric_limits<size_t>::max() / 1024,
+        "BTORCH_PIPELINE_UPDATE_SMEM_KB is too large.");
+    return static_cast<size_t>(kibibytes) * 1024;
+}
+
+int pipeline_cooperative_grid_dim(
+    int maximum_grid_dim,
+    int block_dim,
+    bool return_dense,
+    bool return_events,
+    int n_neuron) {
+    constexpr size_t kUpdateBytesPerNeuron = 3 * sizeof(float);
+    int device = -1;
+    check_cuda(cudaGetDevice(&device), "cudaGetDevice failed");
+
+    cudaDeviceProp prop{};
+    check_cuda(
+        cudaGetDeviceProperties(&prop, device),
+        "cudaGetDeviceProperties failed");
+    const size_t configured_limit = pipeline_update_shared_memory_limit();
+    const size_t device_limit = static_cast<size_t>(
+        prop.sharedMemPerBlockOptin > 0 ? prop.sharedMemPerBlockOptin
+                                       : prop.sharedMemPerBlock);
+    const size_t shared_limit = std::min(configured_limit, device_limit);
+
+    const char* requested_value =
+        std::getenv("BTORCH_PERSISTENT_GRID_BLOCKS");
+    const bool has_requested_grid =
+        requested_value != nullptr && requested_value[0] != '\0';
+    const int requested_grid =
+        requested_cooperative_grid_dim(maximum_grid_dim);
+
+    auto configuration_fits = [&](int candidate_grid) {
+        if (candidate_grid < 2) {
+            return false;
+        }
+        const int update_blocks =
+            pipeline_update_block_count(candidate_grid);
+        const int neurons_per_block =
+            (n_neuron + update_blocks - 1) / update_blocks;
+        const size_t shared_bytes =
+            static_cast<size_t>(neurons_per_block) *
+            kUpdateBytesPerNeuron;
+        if (shared_bytes > shared_limit) {
+            return false;
+        }
+        const int active_blocks = persistent_snn_max_active_blocks_per_sm(
+            block_dim,
+            return_dense,
+            return_events,
+            shared_bytes);
+        return active_blocks > 0 &&
+            candidate_grid <= active_blocks * prop.multiProcessorCount;
+    };
+
+    if (has_requested_grid) {
+        TORCH_CHECK(
+            configuration_fits(requested_grid),
+            "BTORCH_PERSISTENT_GRID_BLOCKS=",
+            requested_grid,
+            " cannot stage all ",
+            n_neuron,
+            " neurons within the ",
+            configured_limit / 1024,
+            " KiB UPDATE shared-memory budget and cooperative occupancy.");
+        return requested_grid;
+    }
+
+    const int maximum_blocks_per_sm =
+        maximum_grid_dim / prop.multiProcessorCount;
+    for (int blocks_per_sm = maximum_blocks_per_sm; blocks_per_sm >= 1;
+         --blocks_per_sm) {
+        const int candidate_grid =
+            blocks_per_sm * prop.multiProcessorCount;
+        if (configuration_fits(candidate_grid)) {
+            return candidate_grid;
+        }
+    }
+    TORCH_CHECK(
+        false,
+        "No cooperative pipeline grid can stage all ",
+        n_neuron,
+        " neurons within the ",
+        configured_limit / 1024,
+        " KiB UPDATE shared-memory budget (device limit ",
+        device_limit / 1024,
+        " KiB).");
+    return 0;
 }
 
 bool pipeline_debug_counters_enabled() {
@@ -784,7 +904,19 @@ persistent_snn_forward_cuda_impl(
                      kThreadsPerBlock, return_dense, return_events)
                : cooperative_grid_dim(
                      kThreadsPerBlock, return_dense, return_events));
-    const int grid_dim = requested_cooperative_grid_dim(maximum_grid_dim);
+#ifdef BTORCH_PERSISTENT_PIPELINE
+    const int grid_dim = !spike_block && !fanout_binning
+        ? pipeline_cooperative_grid_dim(
+              maximum_grid_dim,
+              kThreadsPerBlock,
+              return_dense,
+              return_events,
+              n_neuron)
+        : requested_cooperative_grid_dim(maximum_grid_dim);
+#else
+    const int grid_dim =
+        requested_cooperative_grid_dim(maximum_grid_dim);
+#endif
     if (component_timing) {
         cudaEventRecord(component_events[2], stream);
     }
