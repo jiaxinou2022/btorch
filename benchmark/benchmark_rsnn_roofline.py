@@ -4,7 +4,8 @@ The input spike trace, recurrent graph, and initial state are fixed for every
 run. One persistent CUDA launch advances exactly ``--t-steps`` timesteps, so
 neither timing nor profiling depends on host polling. The ``flybrain`` dataset
 selects the signed FlyWire graph for this common RSNN workload, not the full
-Shiu et al. refractory, delay, and hard-reset dynamics.
+Shiu et al. refractory, delay, and hard-reset dynamics. ``fly_hemibrain`` uses
+the unsigned Hemibrain synapse-count graph with normalized recurrent strength.
 
 Normal timing (CUDA Events, median of at least 20 runs)::
 
@@ -98,6 +99,7 @@ from benchmark.benchmark_rsnn_cudagraph_compare import (  # noqa: E402
     V_ATOL,
     DirectCuSparseProvider,
     load_flybrain_csr,
+    load_hemibrain_csr,
     make_torch_csr_weight,
     max_normalized_error,
     resolve_dataset_defaults,
@@ -123,7 +125,7 @@ from btorch.backend.persistent_snn import (  # noqa: E402
 from btorch.sparse import CSR  # noqa: E402
 
 
-Dataset = Literal["flybrain", "uniform", "mice_column_v1"]
+Dataset = Literal["flybrain", "fly_hemibrain", "uniform", "mice_column_v1"]
 Mode = Literal["benchmark", "ncu"]
 Provider = Literal["persistent", "cusparse_cudagraph"]
 FANOUT_BINNING_THRESHOLD = 256
@@ -224,6 +226,8 @@ def load_connectome_csr(
 
     if dataset == "flybrain":
         return load_flybrain_csr(root, weight_scale=weight_scale, device=device)
+    if dataset == "fly_hemibrain":
+        return load_hemibrain_csr(root, weight_scale=weight_scale, device=device)
     if dataset != "mice_column_v1":
         raise ValueError(f"Unsupported connectome dataset: {dataset}.")
 
@@ -1566,7 +1570,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--dataset",
-        choices=("flybrain", "flywire_783", "uniform", "mice_column_v1"),
+        choices=(
+            "flybrain",
+            "flywire_783",
+            "fly_hemibrain",
+            "hemibrain",
+            "uniform",
+            "mice_column_v1",
+        ),
         default="flybrain",
     )
     parser.add_argument(
@@ -1756,7 +1767,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Global recurrent weight scale. Defaults to 0.275 for FlyBrain "
-            "and 0.15 for mice_column_v1 or uniform."
+            "and 0.15 for fly_hemibrain, mice_column_v1, or uniform."
         ),
     )
     parser.add_argument("--dt", type=float, default=1.0)

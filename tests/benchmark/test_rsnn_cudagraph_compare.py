@@ -28,6 +28,7 @@ from benchmark.benchmark_rsnn_cudagraph_compare import (
     correctness_metrics,
     latency_summary,
     load_flybrain_csr,
+    load_hemibrain_csr,
     make_eager_runner,
     make_torch_csr_weight,
     median_ms,
@@ -812,6 +813,41 @@ def test_flybrain_is_the_default_dataset(monkeypatch):
     assert roofline_args.weight_scale == pytest.approx(0.275)
 
 
+def test_hemibrain_loader_preserves_relative_synapse_counts(
+    monkeypatch, tmp_path: Path
+):
+    """Hemibrain normalization should retain weighted graph structure."""
+
+    source = sp.csr_matrix(
+        ([1.0, 3.0], ([0, 1], [1, 0])),
+        shape=(2, 2),
+        dtype="float32",
+    )
+    archive = tmp_path / "fly_hemibrain.csv.zip"
+    archive.touch()
+    calls = {}
+
+    def fake_load_csv_zip(path):
+        calls["path"] = path
+        return source.copy()
+
+    monkeypatch.setattr(
+        "connectome_dataset.graph_loader.load_csv_zip",
+        fake_load_csv_zip,
+    )
+    matrix = load_hemibrain_csr(
+        tmp_path,
+        weight_scale=0.2,
+        device=torch.device("cpu"),
+    )
+
+    assert calls == {"path": archive}
+    torch.testing.assert_close(
+        matrix.to_dense(),
+        torch.tensor([[0.0, 0.1], [0.3, 0.0]]),
+    )
+
+
 def test_external_framework_tuning_options_are_explicit(monkeypatch):
     """Framework tuning choices should be reproducible from the CLI."""
 
@@ -844,6 +880,14 @@ def test_dataset_specific_weight_scale_defaults():
 
     assert resolve_dataset_defaults("flybrain", None) == ("flybrain", 0.275)
     assert resolve_dataset_defaults("flywire_783", None) == ("flybrain", 0.275)
+    assert resolve_dataset_defaults("hemibrain", None) == (
+        "fly_hemibrain",
+        0.15,
+    )
+    assert resolve_dataset_defaults("fly_hemibrain", 0.4) == (
+        "fly_hemibrain",
+        0.4,
+    )
     assert resolve_dataset_defaults("mice_column_v1", None) == (
         "mice_column_v1",
         0.15,

@@ -2,10 +2,12 @@
 
 The primary baseline is a conventional timestep loop without CUDA Graph
 capture or per-timestep timing events. A separate instrumented pass records
-phase envelopes, and an optional CUDA Graph replay estimates graph-removable
-dispatch cost. The graph difference is deliberately not called pure kernel
-launch time. Neuron updates use eager PyTorch CUDA operations; recurrent
-propagation uses the same direct cuSPARSE adapter as the main RSNN benchmark.
+phase envelopes, a Kineto/CUPTI pass sums raw device kernel-active time, and an
+optional CUDA Graph replay estimates graph-removable dispatch cost. Execution
+overhead is the uninstrumented wall time left after subtracting update and
+cuSPARSE kernel-active durations. Neuron updates use eager PyTorch CUDA
+operations; recurrent propagation uses the same direct cuSPARSE adapter as the
+main RSNN benchmark.
 
 Example:
     Run a small synthetic smoke benchmark:
@@ -49,7 +51,7 @@ from btorch.sparse import CSR  # noqa: E402
 
 
 DEFAULT_ACTIVITIES = (0.005, 0.01, 0.02, 0.04, 0.08, 0.16)
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 TIMING_FIELDS = (
     "eager_wall_total_ms",
     "eager_gpu_total_ms",
@@ -64,6 +66,9 @@ TIMING_FIELDS = (
     "cudagraph_gpu_total_ms",
     "graph_removable_wall_ms",
     "graph_removable_gpu_ms",
+    "update_kernel_active_ms",
+    "current_kernel_active_ms",
+    "execution_overhead_ms",
     "eager_wall_us_per_step",
     "eager_gpu_us_per_step",
     "update_phase_elapsed_us_per_step",
@@ -73,6 +78,9 @@ TIMING_FIELDS = (
     "cudagraph_gpu_us_per_step",
     "graph_removable_wall_us_per_step",
     "graph_removable_gpu_us_per_step",
+    "update_kernel_active_us_per_step",
+    "current_kernel_active_us_per_step",
+    "execution_overhead_us_per_step",
     "update_fraction_of_instrumented_gpu",
     "current_fraction_of_instrumented_gpu",
     "inter_phase_fraction_of_instrumented_gpu",
@@ -86,6 +94,17 @@ class LoopTiming:
 
     wall_ms: float
     gpu_ms: float
+
+
+@dataclass(frozen=True)
+class KernelProfile:
+    """Store CUPTI kernel-active durations for one complete loop."""
+
+    update_ms: float
+    current_ms: float
+    update_kernel_count: int
+    current_kernel_count: int
+    ignored_device_event_count: int
 
 
 @dataclass(frozen=True)
@@ -408,6 +427,76 @@ def time_callable(
     )
 
 
+def profile_kernel_active_time(
+    state: RSNNState,
+    spike_indices: torch.Tensor,
+    extension,
+    args: argparse.Namespace,
+    decay: float,
+) -> KernelProfile:
+    """Measure device kernel-active time with Kineto/CUPTI.
+
+    This is a separate diagnostic pass. Raw CUDA kernel activities are summed,
+    rather than CUDA annotation ranges or phase event envelopes. cuSPARSE
+    kernels are identified by their demangled ``cusparse::`` names; all other
+    workload kernels belong to the PyTorch update. Profiler-internal activity
+    buffer events are explicitly excluded.
+    """
+
+    from torch.profiler import ProfilerActivity, profile
+
+    state.reset()
+    torch.cuda.synchronize()
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+    ) as trace:
+        run_uninstrumented_loop(
+            state,
+            spike_indices,
+            extension,
+            args,
+            decay,
+        )
+        torch.cuda.synchronize()
+
+    update_us = 0.0
+    current_us = 0.0
+    update_count = 0
+    current_count = 0
+    ignored_count = 0
+    for event in trace.events():
+        if event.device_type != torch.autograd.DeviceType.CUDA:
+            continue
+        duration_us = float(event.self_device_time_total)
+        if duration_us <= 0.0 or event.is_user_annotation:
+            continue
+        name = str(event.key)
+        if name.startswith("Activity Buffer Request"):
+            ignored_count += 1
+        elif "cusparse::" in name:
+            current_us += duration_us
+            current_count += 1
+        else:
+            update_us += duration_us
+            update_count += 1
+
+    if update_count == 0 or current_count == 0:
+        raise RuntimeError(
+            "CUPTI did not report both update and cuSPARSE kernels; "
+            f"update_count={update_count}, current_count={current_count}"
+        )
+    return KernelProfile(
+        update_ms=update_us / 1_000.0,
+        current_ms=current_us / 1_000.0,
+        update_kernel_count=update_count,
+        current_kernel_count=current_count,
+        ignored_device_event_count=ignored_count,
+    )
+
+
 def prepare_cudagraph(
     state: RSNNState,
     spike_indices: torch.Tensor,
@@ -536,6 +625,22 @@ def benchmark_activity(
                 else None
             )
 
+        kernel_profile = None
+        kernel_profile_status = "disabled"
+        if args.profile_kernel_active:
+            try:
+                kernel_profile = profile_kernel_active_time(
+                    state,
+                    spike_indices,
+                    extension,
+                    args,
+                    decay,
+                )
+                kernel_profile_status = "ok"
+            except RuntimeError as error:
+                kernel_profile_status = f"profile_error: {error}"
+                print(f"warning: kernel-active profiling unavailable: {error}")
+
         instrumented_timing = time_callable(
             instrumented_run,
             state,
@@ -564,6 +669,24 @@ def benchmark_activity(
             graph_removable_wall_ms = max(0.0, raw_graph_wall_ms)
             graph_removable_gpu_ms = max(0.0, raw_graph_gpu_ms)
 
+        if kernel_profile is None:
+            update_kernel_ms = float("nan")
+            current_kernel_ms = float("nan")
+            execution_overhead_ms = float("nan")
+            update_kernel_count = 0
+            current_kernel_count = 0
+            ignored_device_event_count = 0
+        else:
+            update_kernel_ms = kernel_profile.update_ms
+            current_kernel_ms = kernel_profile.current_ms
+            execution_overhead_ms = max(
+                0.0,
+                eager_timing.wall_ms - update_kernel_ms - current_kernel_ms,
+            )
+            update_kernel_count = kernel_profile.update_kernel_count
+            current_kernel_count = kernel_profile.current_kernel_count
+            ignored_device_event_count = kernel_profile.ignored_device_event_count
+
         divisor = args.t_steps
         row = {
             **common,
@@ -573,6 +696,7 @@ def benchmark_activity(
             "spike_seed": spike_seed,
             "repeat": repeat,
             "cudagraph_status": cudagraph_status,
+            "kernel_profile_status": kernel_profile_status,
             "eager_wall_total_ms": eager_timing.wall_ms,
             "eager_gpu_total_ms": eager_timing.gpu_ms,
             "eager_boundary_ms": eager_boundary_ms,
@@ -589,6 +713,12 @@ def benchmark_activity(
             "raw_graph_removable_gpu_ms": raw_graph_gpu_ms,
             "graph_removable_wall_ms": graph_removable_wall_ms,
             "graph_removable_gpu_ms": graph_removable_gpu_ms,
+            "update_kernel_active_ms": update_kernel_ms,
+            "current_kernel_active_ms": current_kernel_ms,
+            "execution_overhead_ms": execution_overhead_ms,
+            "update_kernel_count": update_kernel_count,
+            "current_kernel_count": current_kernel_count,
+            "ignored_device_event_count": ignored_device_event_count,
             "eager_wall_us_per_step": eager_timing.wall_ms * 1_000.0 / divisor,
             "eager_gpu_us_per_step": eager_timing.gpu_ms * 1_000.0 / divisor,
             "update_phase_elapsed_us_per_step": update_ms * 1_000.0 / divisor,
@@ -601,6 +731,13 @@ def benchmark_activity(
             ),
             "graph_removable_gpu_us_per_step": (
                 graph_removable_gpu_ms * 1_000.0 / divisor
+            ),
+            "update_kernel_active_us_per_step": (update_kernel_ms * 1_000.0 / divisor),
+            "current_kernel_active_us_per_step": (
+                current_kernel_ms * 1_000.0 / divisor
+            ),
+            "execution_overhead_us_per_step": (
+                execution_overhead_ms * 1_000.0 / divisor
             ),
             "update_fraction_of_instrumented_gpu": (
                 update_ms / instrumented_timing.gpu_ms
@@ -656,6 +793,7 @@ def aggregate_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
             "n_active_per_step": first["n_active_per_step"],
             "spike_seed": first["spike_seed"],
             "cudagraph_status": first["cudagraph_status"],
+            "kernel_profile_status": first["kernel_profile_status"],
             "repeat_count": len(group),
         }
         for field in TIMING_FIELDS:
@@ -727,6 +865,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--profile-kernel-active",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use a separate Kineto/CUPTI pass to sum raw update and cuSPARSE "
+            "kernel-active durations, excluding host launch/API time."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path(__file__).resolve().parent / "results",
@@ -778,13 +925,14 @@ def main() -> None:
         "t_steps": args.t_steps,
         "warmup_steps": args.warmup,
         "seed": args.seed,
-        "timing_method": "separate_eager_phase_event_and_cudagraph_passes",
+        "timing_method": ("separate_eager_cupti_phase_event_and_cudagraph_passes"),
         "update_backend": "pytorch_cuda_eager",
         "current_backend": "cusparse_direct_eager",
         "cusparse_primitive": "SpMV",
         "cusparse_algorithm": "CUSPARSE_SPMV_ALG_DEFAULT",
         "baseline_cuda_graph": False,
         "cudagraph_proxy_requested": args.measure_cudagraph_proxy,
+        "kernel_active_profile_requested": args.profile_kernel_active,
     }
 
     all_repeat_rows: list[dict[str, object]] = []
@@ -816,10 +964,10 @@ def main() -> None:
         all_timestep_rows.extend(timestep_rows)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    breakdown_path = args.output_dir / "naive_rsnn_breakdown_v2.csv"
-    aggregate_path = args.output_dir / "naive_rsnn_aggregate_v2.csv"
-    timestep_path = args.output_dir / "naive_rsnn_timesteps_v2.csv"
-    metadata_path = args.output_dir / "naive_rsnn_metadata_v2.json"
+    breakdown_path = args.output_dir / "naive_rsnn_breakdown_v3.csv"
+    aggregate_path = args.output_dir / "naive_rsnn_aggregate_v3.csv"
+    timestep_path = args.output_dir / "naive_rsnn_timesteps_v3.csv"
+    metadata_path = args.output_dir / "naive_rsnn_metadata_v3.json"
     save_csv(all_repeat_rows, breakdown_path)
     save_csv(aggregate_rows(all_repeat_rows), aggregate_path)
     if args.save_timestep_data:
@@ -856,6 +1004,15 @@ def main() -> None:
             "phase_measurement": (
                 "separate instrumented pass; values are stream elapsed "
                 "phase envelopes, not pure kernel-active time"
+            ),
+            "kernel_active_measurement": (
+                "separate Kineto/CUPTI pass summing raw CUDA kernel activity; "
+                "cuSPARSE kernels are classified by demangled cusparse:: names"
+            ),
+            "three_way_execution_overhead": (
+                "max(0, uninstrumented eager wall - update kernel active - "
+                "cuSPARSE kernel active); includes critical-path launch/API, "
+                "framework, allocation, scheduling, and GPU idle time"
             ),
             "eager_boundary": (
                 "max(0, eager wall - eager GPU); not cumulative host launch time"

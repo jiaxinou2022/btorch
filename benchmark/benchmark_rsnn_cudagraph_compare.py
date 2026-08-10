@@ -44,9 +44,12 @@ the heavy-tailed FlyWire out-degree distribution. Framework versions, build
 time, timing method, and every raw latency sample are written to the CSV.
 
 FlyBrain (FlyWire v783) is the default dataset. Its signed synapse counts are
-scaled by ``--weight-scale``. Dense providers are opt-in for FlyBrain because
-materializing its whole-brain adjacency as a dense tensor is usually
-impractical. The main comparison is one fixed batch-1 RSNN workload. Providers
+scaled by ``--weight-scale``. ``fly_hemibrain`` preserves the Hemibrain
+synapse-count distribution and normalizes its mean weighted fanout to
+``--weight-scale``; its public edge list does not encode neuronal polarity.
+Dense providers are opt-in for both fly connectomes because materializing their
+adjacency as a dense tensor is usually impractical. The main comparison is one
+fixed batch-1 RSNN workload. Providers
 whose public API cannot execute that workload are reported as not applicable
 instead of changing the workload to suit the provider.
 
@@ -189,9 +192,11 @@ FLYBRAIN_DEFAULT_PROVIDERS: tuple[Provider, ...] = tuple(
 )
 DEFAULT_WEIGHT_SCALES = {
     "flybrain": 0.275,
+    "fly_hemibrain": 0.15,
     "mice_column_v1": 0.15,
     "uniform": 0.15,
 }
+LARGE_CONNECTOME_DATASETS = frozenset(("flybrain", "fly_hemibrain"))
 SPIKE_MISMATCH_RATE_TOL = 1e-3
 STATE_RTOL = 2e-3
 V_ATOL = 2e-1
@@ -459,7 +464,11 @@ def resolve_dataset_defaults(
 ) -> tuple[str, float]:
     """Canonicalize a dataset name and select its default weight scale."""
 
-    aliases = {"mice_v1_column": "mice_column_v1", "flywire_783": "flybrain"}
+    aliases = {
+        "hemibrain": "fly_hemibrain",
+        "mice_v1_column": "mice_column_v1",
+        "flywire_783": "flybrain",
+    }
     canonical = aliases.get(dataset, dataset)
     if canonical not in DEFAULT_WEIGHT_SCALES:
         raise ValueError(f"Unsupported dataset: {dataset}.")
@@ -498,6 +507,42 @@ def load_flybrain_csr(
     if scipy_matrix.shape[0] != scipy_matrix.shape[1]:
         raise ValueError(f"flybrain must be square, got {scipy_matrix.shape}.")
     scipy_matrix.data *= weight_scale
+    return CSR.from_scipy(scipy_matrix, device=device, dtype=torch.float32)
+
+
+def load_hemibrain_csr(
+    root: Path | None, *, weight_scale: float, device: torch.device
+) -> CSR:
+    """Load the Hemibrain graph while preserving relative synapse counts.
+
+    The Netzschleuder edge list contains positive synapse counts but no neuron
+    polarity. Normalize the mean weighted fanout so ``weight_scale`` has the
+    same explicit total-strength interpretation as for other unsigned graphs.
+    """
+
+    try:
+        from connectome_dataset.graph_loader import load_csv_zip
+    except ImportError as exc:
+        raise RuntimeError(
+            "connectome_dataset is required for --dataset fly_hemibrain"
+        ) from exc
+
+    default_root = DATASET_ROOT / "data" / "skewed" / "fly_hemibrain"
+    source = Path(root) if root is not None else default_root
+    path = source if source.is_file() else source / "fly_hemibrain.csv.zip"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"fly_hemibrain requires fly_hemibrain.csv.zip under {source}. "
+            "Download it from networks.skewed.de or pass --connectome-root."
+        )
+
+    scipy_matrix = load_csv_zip(path).tocsr()
+    if scipy_matrix.shape[0] != scipy_matrix.shape[1]:
+        raise ValueError(f"fly_hemibrain must be square, got {scipy_matrix.shape}.")
+    mean_weighted_fanout = float(abs(scipy_matrix).sum()) / max(
+        scipy_matrix.shape[0], 1
+    )
+    scipy_matrix.data *= weight_scale / max(mean_weighted_fanout, 1.0)
     return CSR.from_scipy(scipy_matrix, device=device, dtype=torch.float32)
 
 
@@ -1839,6 +1884,8 @@ def parse_args() -> argparse.Namespace:
         choices=(
             "flybrain",
             "flywire_783",
+            "fly_hemibrain",
+            "hemibrain",
             "uniform",
             "mice_column_v1",
             "mice_v1_column",
@@ -1877,7 +1924,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Global recurrent weight scale. Defaults to 0.275 for FlyBrain "
-            "and 0.15 for mice_column_v1 or uniform."
+            "and 0.15 for fly_hemibrain, mice_column_v1, or uniform."
         ),
     )
     parser.add_argument("--warmup", type=int, default=10)
@@ -2033,11 +2080,21 @@ def main() -> None:
     providers = tuple(
         args.providers
         if args.providers is not None
-        else (FLYBRAIN_DEFAULT_PROVIDERS if dataset == "flybrain" else PROVIDERS)
+        else (
+            FLYBRAIN_DEFAULT_PROVIDERS
+            if dataset in LARGE_CONNECTOME_DATASETS
+            else PROVIDERS
+        )
     )
     matrix = None
     if dataset == "flybrain":
         matrix = load_flybrain_csr(
+            args.connectome_root,
+            weight_scale=args.weight_scale,
+            device=device,
+        )
+    elif dataset == "fly_hemibrain":
+        matrix = load_hemibrain_csr(
             args.connectome_root,
             weight_scale=args.weight_scale,
             device=device,
