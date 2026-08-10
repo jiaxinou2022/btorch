@@ -1,10 +1,11 @@
 """Characterize phase-separated PyTorch and cuSPARSE RSNN execution.
 
-This script measures a conventional timestep loop without CUDA Graph capture.
-Neuron-state updates and controlled spike construction use eager PyTorch CUDA
-operations; recurrent propagation uses the same direct cuSPARSE adapter as the
-main RSNN benchmark. CUDA events measure each phase while synchronized wall
-time measures the complete loop.
+The primary baseline is a conventional timestep loop without CUDA Graph
+capture or per-timestep timing events. A separate instrumented pass records
+phase envelopes, and an optional CUDA Graph replay estimates graph-removable
+dispatch cost. The graph difference is deliberately not called pure kernel
+launch time. Neuron updates use eager PyTorch CUDA operations; recurrent
+propagation uses the same direct cuSPARSE adapter as the main RSNN benchmark.
 
 Example:
     Run a small synthetic smoke benchmark:
@@ -22,6 +23,7 @@ import math
 import statistics
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -47,23 +49,64 @@ from btorch.sparse import CSR  # noqa: E402
 
 
 DEFAULT_ACTIVITIES = (0.005, 0.01, 0.02, 0.04, 0.08, 0.16)
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 TIMING_FIELDS = (
-    "wall_total_ms",
-    "gpu_total_ms",
-    "update_gpu_ms",
-    "current_gpu_ms",
-    "gpu_gap_ms",
-    "host_overhead_ms",
-    "execution_overhead_ms",
-    "wall_us_per_step",
-    "gpu_total_us_per_step",
-    "update_us_per_step",
-    "current_us_per_step",
-    "gpu_gap_us_per_step",
-    "host_overhead_us_per_step",
-    "execution_overhead_us_per_step",
+    "eager_wall_total_ms",
+    "eager_gpu_total_ms",
+    "eager_boundary_ms",
+    "instrumented_wall_total_ms",
+    "instrumented_gpu_total_ms",
+    "update_phase_elapsed_ms",
+    "current_phase_elapsed_ms",
+    "inter_phase_residual_ms",
+    "instrumentation_wall_delta_ms",
+    "cudagraph_wall_total_ms",
+    "cudagraph_gpu_total_ms",
+    "graph_removable_wall_ms",
+    "graph_removable_gpu_ms",
+    "eager_wall_us_per_step",
+    "eager_gpu_us_per_step",
+    "update_phase_elapsed_us_per_step",
+    "current_phase_elapsed_us_per_step",
+    "inter_phase_residual_us_per_step",
+    "cudagraph_wall_us_per_step",
+    "cudagraph_gpu_us_per_step",
+    "graph_removable_wall_us_per_step",
+    "graph_removable_gpu_us_per_step",
+    "update_fraction_of_instrumented_gpu",
+    "current_fraction_of_instrumented_gpu",
+    "inter_phase_fraction_of_instrumented_gpu",
+    "graph_removable_wall_fraction_of_eager",
 )
+
+
+@dataclass(frozen=True)
+class LoopTiming:
+    """Store synchronized wall-clock and stream elapsed time."""
+
+    wall_ms: float
+    gpu_ms: float
+
+
+@dataclass(frozen=True)
+class EventPair:
+    """Hold one reusable CUDA event pair."""
+
+    start: torch.cuda.Event
+    end: torch.cuda.Event
+
+    @classmethod
+    def create(cls) -> "EventPair":
+        """Create and initialize timing events outside measurement."""
+
+        pair = cls(
+            start=torch.cuda.Event(enable_timing=True),
+            end=torch.cuda.Event(enable_timing=True),
+        )
+        pair.start.record()
+        pair.end.record()
+        torch.cuda.synchronize()
+        return pair
 
 
 @dataclass
@@ -247,22 +290,20 @@ def generate_spike_control(
     return indices, n_active
 
 
-def run_one_step(
+def neuron_update(
     state: RSNNState,
     active_indices: torch.Tensor,
     timestep: int,
-    extension,
     *,
     dt: float,
     tau_mem: float,
-    tau_syn: float,
     v_threshold: float,
     v_reset: float,
     c_m: float,
+    decay: float,
 ) -> None:
-    """Run one eager PyTorch update followed by direct cuSPARSE propagation."""
+    """Update neuron state and construct one controlled spike vector."""
 
-    decay = math.exp(-dt / tau_syn)
     state.psc.mul_(decay).add_(state.recurrent)
     state.v.add_(dt * (-(state.v - v_reset) / tau_mem + state.psc / c_m))
     spike_t = state.spikes[timestep, 0]
@@ -270,7 +311,139 @@ def run_one_step(
     if active_indices.numel():
         spike_t.scatter_(0, active_indices, 1.0)
     state.v.sub_((v_threshold - v_reset) * spike_t)
+
+
+def run_one_step(
+    state: RSNNState,
+    active_indices: torch.Tensor,
+    timestep: int,
+    extension,
+    args: argparse.Namespace,
+    decay: float,
+) -> None:
+    """Run one eager PyTorch update followed by direct cuSPARSE propagation."""
+
+    neuron_update(
+        state,
+        active_indices,
+        timestep,
+        dt=args.dt,
+        tau_mem=args.tau_mem,
+        v_threshold=args.v_threshold,
+        v_reset=args.v_reset,
+        c_m=args.c_m,
+        decay=decay,
+    )
     extension.propagate(state.plan, timestep)
+
+
+def run_uninstrumented_loop(
+    state: RSNNState,
+    spike_indices: torch.Tensor,
+    extension,
+    args: argparse.Namespace,
+    decay: float,
+) -> None:
+    """Run the ordinary timestep loop without per-phase CUDA events."""
+
+    for timestep in range(args.t_steps):
+        run_one_step(
+            state,
+            spike_indices[timestep],
+            timestep,
+            extension,
+            args,
+            decay,
+        )
+
+
+def run_instrumented_loop(
+    state: RSNNState,
+    spike_indices: torch.Tensor,
+    extension,
+    args: argparse.Namespace,
+    decay: float,
+    events: PhaseEvents,
+) -> None:
+    """Run a separate diagnostic loop with phase-envelope events."""
+
+    for timestep in range(args.t_steps):
+        events.update_start[timestep].record()
+        neuron_update(
+            state,
+            spike_indices[timestep],
+            timestep,
+            dt=args.dt,
+            tau_mem=args.tau_mem,
+            v_threshold=args.v_threshold,
+            v_reset=args.v_reset,
+            c_m=args.c_m,
+            decay=decay,
+        )
+        events.update_end[timestep].record()
+
+        events.current_start[timestep].record()
+        extension.propagate(state.plan, timestep)
+        events.current_end[timestep].record()
+
+
+def time_callable(
+    run: Callable[[], object],
+    state: RSNNState,
+    events: EventPair,
+) -> LoopTiming:
+    """Time one callable after an untimed state reset and synchronization."""
+
+    state.reset()
+    torch.cuda.synchronize()
+    wall_start = time.perf_counter()
+    events.start.record()
+    run()
+    events.end.record()
+    events.end.synchronize()
+    wall_ms = (time.perf_counter() - wall_start) * 1_000.0
+    return LoopTiming(
+        wall_ms=wall_ms,
+        gpu_ms=events.start.elapsed_time(events.end),
+    )
+
+
+def prepare_cudagraph(
+    state: RSNNState,
+    spike_indices: torch.Tensor,
+    extension,
+    args: argparse.Namespace,
+    decay: float,
+) -> torch.cuda.CUDAGraph:
+    """Capture the same complete loop for a dispatch-overhead proxy."""
+
+    current_stream = torch.cuda.current_stream()
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(current_stream)
+    with torch.cuda.stream(side_stream):
+        for _ in range(3):
+            run_uninstrumented_loop(
+                state,
+                spike_indices,
+                extension,
+                args,
+                decay,
+            )
+    current_stream.wait_stream(side_stream)
+    torch.cuda.synchronize()
+    state.reset()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_uninstrumented_loop(
+            state,
+            spike_indices,
+            extension,
+            args,
+            decay,
+        )
+    torch.cuda.synchronize()
+    return graph
 
 
 def _warmup(
@@ -282,6 +455,7 @@ def _warmup(
     """Warm up PyTorch, pybind, and cuSPARSE without synchronizing each step."""
 
     state.reset()
+    decay = math.exp(-args.dt / args.tau_syn)
     for step in range(args.warmup):
         timestep = step % args.t_steps
         run_one_step(
@@ -289,12 +463,8 @@ def _warmup(
             spike_indices[timestep],
             timestep,
             extension,
-            dt=args.dt,
-            tau_mem=args.tau_mem,
-            tau_syn=args.tau_syn,
-            v_threshold=args.v_threshold,
-            v_reset=args.v_reset,
-            c_m=args.c_m,
+            args,
+            decay,
         )
     torch.cuda.synchronize()
 
@@ -309,55 +479,91 @@ def benchmark_activity(
     args: argparse.Namespace,
     common: dict[str, object],
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    """Measure all repeats for one controlled firing rate."""
+    """Measure eager, instrumented, and CUDA Graph diagnostic executions."""
 
     _warmup(state, spike_indices, extension, args)
     repeat_rows: list[dict[str, object]] = []
     timestep_rows: list[dict[str, object]] = []
     actual_activity = n_active / state.v.numel()
     decay = math.exp(-args.dt / args.tau_syn)
-    events = PhaseEvents.create(args.t_steps)
-    events.initialize()
+    phase_events = PhaseEvents.create(args.t_steps)
+    phase_events.initialize()
+    eager_events = EventPair.create()
+    graph_events = EventPair.create()
+
+    graph = None
+    cudagraph_status = "disabled"
+    if args.measure_cudagraph_proxy:
+        try:
+            graph = prepare_cudagraph(
+                state,
+                spike_indices,
+                extension,
+                args,
+                decay,
+            )
+            cudagraph_status = "ok"
+        except RuntimeError as error:
+            cudagraph_status = f"capture_error: {error}"
+            print(f"warning: CUDA Graph proxy unavailable: {error}")
+
+    eager_run = lambda: run_uninstrumented_loop(  # noqa: E731
+        state,
+        spike_indices,
+        extension,
+        args,
+        decay,
+    )
+    instrumented_run = lambda: run_instrumented_loop(  # noqa: E731
+        state,
+        spike_indices,
+        extension,
+        args,
+        decay,
+        phase_events,
+    )
+    graph_run = graph.replay if graph is not None else None
 
     for repeat in range(args.repeat):
-        state.reset()
-        torch.cuda.synchronize()
-
-        wall_start = time.perf_counter()
-        events.total_start.record()
-        for timestep in range(args.t_steps):
-            events.update_start[timestep].record()
-
-            state.psc.mul_(decay).add_(state.recurrent)
-            state.v.add_(
-                args.dt
-                * (-(state.v - args.v_reset) / args.tau_mem + state.psc / args.c_m)
+        if graph_run is not None and repeat % 2:
+            graph_timing = time_callable(graph_run, state, graph_events)
+            eager_timing = time_callable(eager_run, state, eager_events)
+        else:
+            eager_timing = time_callable(eager_run, state, eager_events)
+            graph_timing = (
+                time_callable(graph_run, state, graph_events)
+                if graph_run is not None
+                else None
             )
-            spike_t = state.spikes[timestep, 0]
-            spike_t.zero_()
-            active_t = spike_indices[timestep]
-            if active_t.numel():
-                spike_t.scatter_(0, active_t, 1.0)
-            state.v.sub_((args.v_threshold - args.v_reset) * spike_t)
 
-            events.update_end[timestep].record()
-            events.current_start[timestep].record()
-            extension.propagate(state.plan, timestep)
-            events.current_end[timestep].record()
-
-        events.total_end.record()
-        torch.cuda.synchronize()
-        wall_ms = (time.perf_counter() - wall_start) * 1_000.0
-
-        update_us, current_us = events.phase_times_us()
+        instrumented_timing = time_callable(
+            instrumented_run,
+            state,
+            EventPair(phase_events.total_start, phase_events.total_end),
+        )
+        update_us, current_us = phase_events.phase_times_us()
         update_ms = sum(update_us) / 1_000.0
         current_ms = sum(current_us) / 1_000.0
-        gpu_total_ms = events.total_start.elapsed_time(events.total_end)
-        raw_gpu_gap_ms = gpu_total_ms - update_ms - current_ms
-        raw_host_overhead_ms = wall_ms - gpu_total_ms
-        gpu_gap_ms = max(0.0, raw_gpu_gap_ms)
-        host_overhead_ms = max(0.0, raw_host_overhead_ms)
-        execution_overhead_ms = max(0.0, wall_ms - update_ms - current_ms)
+        raw_inter_phase_ms = instrumented_timing.gpu_ms - update_ms - current_ms
+        inter_phase_ms = max(0.0, raw_inter_phase_ms)
+        eager_boundary_ms = max(0.0, eager_timing.wall_ms - eager_timing.gpu_ms)
+        instrumentation_delta_ms = instrumented_timing.wall_ms - eager_timing.wall_ms
+
+        if graph_timing is None:
+            graph_wall_ms = float("nan")
+            graph_gpu_ms = float("nan")
+            raw_graph_wall_ms = float("nan")
+            raw_graph_gpu_ms = float("nan")
+            graph_removable_wall_ms = float("nan")
+            graph_removable_gpu_ms = float("nan")
+        else:
+            graph_wall_ms = graph_timing.wall_ms
+            graph_gpu_ms = graph_timing.gpu_ms
+            raw_graph_wall_ms = eager_timing.wall_ms - graph_wall_ms
+            raw_graph_gpu_ms = eager_timing.gpu_ms - graph_gpu_ms
+            graph_removable_wall_ms = max(0.0, raw_graph_wall_ms)
+            graph_removable_gpu_ms = max(0.0, raw_graph_gpu_ms)
+
         divisor = args.t_steps
         row = {
             **common,
@@ -366,27 +572,48 @@ def benchmark_activity(
             "n_active_per_step": n_active,
             "spike_seed": spike_seed,
             "repeat": repeat,
-            "wall_total_ms": wall_ms,
-            "gpu_total_ms": gpu_total_ms,
-            "update_gpu_ms": update_ms,
-            "current_gpu_ms": current_ms,
-            "raw_gpu_gap_ms": raw_gpu_gap_ms,
-            "gpu_gap_ms": gpu_gap_ms,
-            "raw_host_overhead_ms": raw_host_overhead_ms,
-            "host_overhead_ms": host_overhead_ms,
-            "execution_overhead_ms": execution_overhead_ms,
-            "wall_us_per_step": wall_ms * 1_000.0 / divisor,
-            "gpu_total_us_per_step": gpu_total_ms * 1_000.0 / divisor,
-            "update_us_per_step": update_ms * 1_000.0 / divisor,
-            "current_us_per_step": current_ms * 1_000.0 / divisor,
-            "gpu_gap_us_per_step": gpu_gap_ms * 1_000.0 / divisor,
-            "host_overhead_us_per_step": host_overhead_ms * 1_000.0 / divisor,
-            "execution_overhead_us_per_step": (
-                execution_overhead_ms * 1_000.0 / divisor
+            "cudagraph_status": cudagraph_status,
+            "eager_wall_total_ms": eager_timing.wall_ms,
+            "eager_gpu_total_ms": eager_timing.gpu_ms,
+            "eager_boundary_ms": eager_boundary_ms,
+            "instrumented_wall_total_ms": instrumented_timing.wall_ms,
+            "instrumented_gpu_total_ms": instrumented_timing.gpu_ms,
+            "update_phase_elapsed_ms": update_ms,
+            "current_phase_elapsed_ms": current_ms,
+            "raw_inter_phase_residual_ms": raw_inter_phase_ms,
+            "inter_phase_residual_ms": inter_phase_ms,
+            "instrumentation_wall_delta_ms": instrumentation_delta_ms,
+            "cudagraph_wall_total_ms": graph_wall_ms,
+            "cudagraph_gpu_total_ms": graph_gpu_ms,
+            "raw_graph_removable_wall_ms": raw_graph_wall_ms,
+            "raw_graph_removable_gpu_ms": raw_graph_gpu_ms,
+            "graph_removable_wall_ms": graph_removable_wall_ms,
+            "graph_removable_gpu_ms": graph_removable_gpu_ms,
+            "eager_wall_us_per_step": eager_timing.wall_ms * 1_000.0 / divisor,
+            "eager_gpu_us_per_step": eager_timing.gpu_ms * 1_000.0 / divisor,
+            "update_phase_elapsed_us_per_step": update_ms * 1_000.0 / divisor,
+            "current_phase_elapsed_us_per_step": current_ms * 1_000.0 / divisor,
+            "inter_phase_residual_us_per_step": (inter_phase_ms * 1_000.0 / divisor),
+            "cudagraph_wall_us_per_step": graph_wall_ms * 1_000.0 / divisor,
+            "cudagraph_gpu_us_per_step": graph_gpu_ms * 1_000.0 / divisor,
+            "graph_removable_wall_us_per_step": (
+                graph_removable_wall_ms * 1_000.0 / divisor
             ),
-            "update_fraction_of_wall": update_ms / wall_ms,
-            "current_fraction_of_wall": current_ms / wall_ms,
-            "execution_overhead_fraction_of_wall": (execution_overhead_ms / wall_ms),
+            "graph_removable_gpu_us_per_step": (
+                graph_removable_gpu_ms * 1_000.0 / divisor
+            ),
+            "update_fraction_of_instrumented_gpu": (
+                update_ms / instrumented_timing.gpu_ms
+            ),
+            "current_fraction_of_instrumented_gpu": (
+                current_ms / instrumented_timing.gpu_ms
+            ),
+            "inter_phase_fraction_of_instrumented_gpu": (
+                inter_phase_ms / instrumented_timing.gpu_ms
+            ),
+            "graph_removable_wall_fraction_of_eager": (
+                graph_removable_wall_ms / eager_timing.wall_ms
+            ),
         }
         repeat_rows.append(row)
 
@@ -402,8 +629,8 @@ def benchmark_activity(
                     "spike_seed": spike_seed,
                     "repeat": repeat,
                     "timestep": timestep,
-                    "update_gpu_us": update_time,
-                    "current_gpu_us": current_time,
+                    "update_phase_elapsed_us": update_time,
+                    "current_phase_elapsed_us": current_time,
                 }
                 for timestep, (update_time, current_time) in enumerate(
                     zip(update_us, current_us, strict=True)
@@ -428,6 +655,7 @@ def aggregate_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
             "actual_activity": first["actual_activity"],
             "n_active_per_step": first["n_active_per_step"],
             "spike_seed": first["spike_seed"],
+            "cudagraph_status": first["cudagraph_status"],
             "repeat_count": len(group),
         }
         for field in TIMING_FIELDS:
@@ -490,6 +718,15 @@ def parse_args() -> argparse.Namespace:
         default=True,
     )
     parser.add_argument(
+        "--measure-cudagraph-proxy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Compare eager execution with a CUDA Graph replay of the same "
+            "loop. The difference is a dispatch proxy, not pure launch time."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path(__file__).resolve().parent / "results",
@@ -541,12 +778,13 @@ def main() -> None:
         "t_steps": args.t_steps,
         "warmup_steps": args.warmup,
         "seed": args.seed,
-        "timing_method": "per_step_cuda_events_and_synchronized_wall_clock",
+        "timing_method": "separate_eager_phase_event_and_cudagraph_passes",
         "update_backend": "pytorch_cuda_eager",
         "current_backend": "cusparse_direct_eager",
         "cusparse_primitive": "SpMV",
         "cusparse_algorithm": "CUSPARSE_SPMV_ALG_DEFAULT",
-        "cuda_graph": False,
+        "baseline_cuda_graph": False,
+        "cudagraph_proxy_requested": args.measure_cudagraph_proxy,
     }
 
     all_repeat_rows: list[dict[str, object]] = []
@@ -578,10 +816,10 @@ def main() -> None:
         all_timestep_rows.extend(timestep_rows)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    breakdown_path = args.output_dir / "naive_rsnn_breakdown.csv"
-    aggregate_path = args.output_dir / "naive_rsnn_aggregate.csv"
-    timestep_path = args.output_dir / "naive_rsnn_timesteps.csv"
-    metadata_path = args.output_dir / "naive_rsnn_metadata.json"
+    breakdown_path = args.output_dir / "naive_rsnn_breakdown_v2.csv"
+    aggregate_path = args.output_dir / "naive_rsnn_aggregate_v2.csv"
+    timestep_path = args.output_dir / "naive_rsnn_timesteps_v2.csv"
+    metadata_path = args.output_dir / "naive_rsnn_metadata_v2.json"
     save_csv(all_repeat_rows, breakdown_path)
     save_csv(aggregate_rows(all_repeat_rows), aggregate_path)
     if args.save_timestep_data:
@@ -614,9 +852,23 @@ def main() -> None:
             "spike_construction_in_update_phase": True,
             "random_generation_in_timing": False,
             "synchronize_per_timestep": False,
-            "execution_overhead": "max(0, wall - update - current)",
-            "gpu_gap": "max(0, gpu_total-update-current)",
-            "host_overhead": "max(0, wall-gpu_total)",
+            "eager_baseline": ("ordinary loop with only one outer CUDA event pair"),
+            "phase_measurement": (
+                "separate instrumented pass; values are stream elapsed "
+                "phase envelopes, not pure kernel-active time"
+            ),
+            "eager_boundary": (
+                "max(0, eager wall - eager GPU); not cumulative host launch time"
+            ),
+            "inter_phase_residual": (
+                "max(0, instrumented GPU - update envelope - current envelope); "
+                "not launch overhead"
+            ),
+            "graph_removable_proxy": (
+                "max(0, eager - CUDA Graph replay); includes graph-removable "
+                "Python, framework, API submission, and device dispatch effects"
+            ),
+            "launch_overhead_claim": "not measured exactly",
         },
         "outputs": {
             "repeat_samples": breakdown_path.name,
