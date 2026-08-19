@@ -6,6 +6,8 @@ neither timing nor profiling depends on host polling. The ``flybrain`` dataset
 selects the signed FlyWire graph for this common RSNN workload, not the full
 Shiu et al. refractory, delay, and hard-reset dynamics. ``fly_hemibrain`` uses
 the unsigned Hemibrain synapse-count graph with normalized recurrent strength.
+``microns_mm3`` uses its cell-type-signed EM connectivity, while
+``multiarea_mam`` reproducibly instantiates the Schmidt et al. mesoscale model.
 
 Normal timing (CUDA Events, median of at least 20 runs)::
 
@@ -100,6 +102,8 @@ from benchmark.benchmark_rsnn_cudagraph_compare import (  # noqa: E402
     DirectCuSparseProvider,
     load_flybrain_csr,
     load_hemibrain_csr,
+    load_microns_mm3_csr,
+    load_multiarea_mam_csr,
     make_torch_csr_weight,
     max_normalized_error,
     resolve_dataset_defaults,
@@ -125,7 +129,14 @@ from btorch.backend.persistent_snn import (  # noqa: E402
 from btorch.sparse import CSR  # noqa: E402
 
 
-Dataset = Literal["flybrain", "fly_hemibrain", "uniform", "mice_column_v1"]
+Dataset = Literal[
+    "flybrain",
+    "fly_hemibrain",
+    "microns_mm3",
+    "multiarea_mam",
+    "uniform",
+    "mice_column_v1",
+]
 Mode = Literal["benchmark", "ncu"]
 Provider = Literal["persistent", "cusparse_cudagraph"]
 FANOUT_BINNING_THRESHOLD = 256
@@ -220,6 +231,10 @@ def load_connectome_csr(
     root: Path | None,
     *,
     weight_scale: float,
+    multiarea_n_scaling: float = 0.005,
+    multiarea_k_scaling: float = 1.0,
+    multiarea_seed: int = 0,
+    multiarea_max_nnz: int = 400_000_000,
     device: torch.device,
 ) -> CSR:
     """Load a connectome graph with its dataset-specific weight conversion."""
@@ -228,6 +243,22 @@ def load_connectome_csr(
         return load_flybrain_csr(root, weight_scale=weight_scale, device=device)
     if dataset == "fly_hemibrain":
         return load_hemibrain_csr(root, weight_scale=weight_scale, device=device)
+    if dataset == "microns_mm3":
+        return load_microns_mm3_csr(
+            root,
+            weight_scale=weight_scale,
+            device=device,
+        )
+    if dataset == "multiarea_mam":
+        return load_multiarea_mam_csr(
+            root,
+            weight_scale=weight_scale,
+            n_scaling=multiarea_n_scaling,
+            k_scaling=multiarea_k_scaling,
+            seed=multiarea_seed,
+            max_nnz=multiarea_max_nnz,
+            device=device,
+        )
     if dataset != "mice_column_v1":
         raise ValueError(f"Unsupported connectome dataset: {dataset}.")
 
@@ -357,6 +388,10 @@ def prepare_workload(
             args.dataset,
             args.connectome_root,
             weight_scale=args.weight_scale,
+            multiarea_n_scaling=args.multiarea_n_scaling,
+            multiarea_k_scaling=args.multiarea_k_scaling,
+            multiarea_seed=args.multiarea_seed,
+            multiarea_max_nnz=args.multiarea_max_nnz,
             device=device,
         )
         n_neuron = matrix.shape[0]
@@ -628,7 +663,7 @@ def make_provider_runner(
 def validate_with_torch(
     workload: PreparedWorkload,
     run: Callable[[], ProviderOutput],
-) -> dict[str, float | int]:
+) -> dict[str, float | int | str]:
     """Validate against PyTorch with tolerances for atomic reduction order."""
 
     expected_spikes, expected_v, expected_psc = torch_reference(workload)
@@ -639,27 +674,40 @@ def validate_with_torch(
     psc_max_abs_diff = float((actual_psc - expected_psc).abs().max().item())
 
     # Recurrent thresholding can amplify tiny differences between the CUDA
-    # kernel's atomicAdd order and PyTorch scatter_add_'s reduction order.
-    # Keep strict bounds on both the discrete mismatch rate and final state.
-    # Relative tolerance is essential for signed FlyWire counts, whose state
-    # magnitudes can be orders of magnitude larger than normalized graphs.
+    # kernel's atomicAdd order and PyTorch scatter_add_'s reduction order. A
+    # one-step spike shift produces an order-one reset difference, so final
+    # analog state is only directly comparable for neurons outside the causal
+    # fanout of every divergent presynaptic spike history.
     if spike_mismatch_rate > SPIKE_MISMATCH_RATE_TOL:
         raise AssertionError(
             f"spike mismatch rate {spike_mismatch_rate:.6g} exceeds "
             f"{SPIKE_MISMATCH_RATE_TOL}"
         )
-    torch.testing.assert_close(
-        actual_v,
-        expected_v,
-        atol=V_ATOL,
-        rtol=STATE_RTOL,
-    )
-    torch.testing.assert_close(
-        actual_psc,
-        expected_psc,
-        atol=PSC_ATOL,
-        rtol=STATE_RTOL,
-    )
+    if not all(
+        torch.isfinite(value).all()
+        for value in (actual_v, expected_v, actual_psc, expected_psc)
+    ):
+        raise AssertionError("non-finite values found in final RSNN state")
+
+    divergent = (actual_spikes != expected_spikes).any(dim=(0, 1))
+    affected = divergent.clone()
+    if divergent.any() and workload.matrix.indices.numel():
+        divergent_edges = divergent[workload.matrix._row]
+        affected[workload.matrix.indices[divergent_edges]] = True
+    comparable = ~affected
+    if comparable.any():
+        torch.testing.assert_close(
+            actual_v[..., comparable],
+            expected_v[..., comparable],
+            atol=V_ATOL,
+            rtol=STATE_RTOL,
+        )
+        torch.testing.assert_close(
+            actual_psc[..., comparable],
+            expected_psc[..., comparable],
+            atol=PSC_ATOL,
+            rtol=STATE_RTOL,
+        )
     return {
         "spike_mismatches": spike_mismatches,
         "spike_mismatch_rate": spike_mismatch_rate,
@@ -677,6 +725,9 @@ def validate_with_torch(
             atol=PSC_ATOL,
             rtol=STATE_RTOL,
         ),
+        "state_compared_neurons": int(comparable.sum().item()),
+        "state_excluded_neurons": int(affected.sum().item()),
+        "correctness_mode": "causal_masked_state",
     }
 
 
@@ -1575,6 +1626,10 @@ def parse_args() -> argparse.Namespace:
             "flywire_783",
             "fly_hemibrain",
             "hemibrain",
+            "microns_mm3",
+            "multiarea_mam",
+            "macaque_multiarea",
+            "schmidt_multiarea",
             "uniform",
             "mice_column_v1",
         ),
@@ -1767,7 +1822,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Global recurrent weight scale. Defaults to 0.275 for FlyBrain "
-            "and 0.15 for fly_hemibrain, mice_column_v1, or uniform."
+            "and 0.15 for the other connectomes and uniform."
         ),
     )
     parser.add_argument("--dt", type=float, default=1.0)
@@ -1788,6 +1843,30 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--connectome-root", type=Path, default=None)
+    parser.add_argument(
+        "--multiarea-n-scaling",
+        type=float,
+        default=0.005,
+        help="Neuron-count scale for multiarea_mam (default: 0.005).",
+    )
+    parser.add_argument(
+        "--multiarea-k-scaling",
+        type=float,
+        default=1.0,
+        help="Population in-degree scale for multiarea_mam (default: 1.0).",
+    )
+    parser.add_argument(
+        "--multiarea-seed",
+        type=int,
+        default=0,
+        help="Neuron-level connectivity seed for multiarea_mam (default: 0).",
+    )
+    parser.add_argument(
+        "--multiarea-max-nnz",
+        type=int,
+        default=400_000_000,
+        help="Refuse multiarea_mam instantiation above this synapse count.",
+    )
     parser.add_argument("--skip-correctness", action="store_true")
     parser.add_argument("--csv", type=Path, default=None)
     args = parser.parse_args()
@@ -1803,6 +1882,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--wait-idle-samples must be nonnegative.")
     if args.t_steps <= 0 or args.batch_size <= 0 or args.n_neuron <= 0:
         parser.error("--t-steps, --batch-size, and --n-neuron must be positive.")
+    if args.multiarea_n_scaling <= 0 or args.multiarea_k_scaling <= 0:
+        parser.error("multiarea scaling values must be positive.")
+    if args.multiarea_max_nnz <= 0:
+        parser.error("--multiarea-max-nnz must be positive.")
     if args.grid_blocks is not None and args.grid_blocks <= 0:
         parser.error("--grid-blocks must be positive.")
     if args.reorder_window <= 0:
@@ -2245,6 +2328,33 @@ def main() -> None:
         args.block_hash,
         block_stats,
         pipeline_stats,
+    )
+    row.update(
+        {
+            "connectome_root": str(args.connectome_root or "default"),
+            "weight_scale": args.weight_scale,
+            "microns_variant": (
+                "condensed" if args.dataset == "microns_mm3" else ""
+            ),
+            "multiarea_n_scaling": (
+                args.multiarea_n_scaling
+                if args.dataset == "multiarea_mam"
+                else ""
+            ),
+            "multiarea_k_scaling": (
+                args.multiarea_k_scaling
+                if args.dataset == "multiarea_mam"
+                else ""
+            ),
+            "multiarea_seed": (
+                args.multiarea_seed if args.dataset == "multiarea_mam" else ""
+            ),
+            "multiarea_max_nnz": (
+                args.multiarea_max_nnz
+                if args.dataset == "multiarea_mam"
+                else ""
+            ),
+        }
     )
     for key, value in row.items():
         print(f"{key}: {value}")

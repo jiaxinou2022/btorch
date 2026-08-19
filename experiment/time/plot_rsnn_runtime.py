@@ -199,14 +199,15 @@ def plot_composition(
         left += value
 
     overhead_center = percentages[:2].sum() + percentages[2] / 2.0
-    ax.text(
-        overhead_center,
-        0,
-        f"{percentages[2]:.1f}%",
-        ha="center",
-        va="center",
-        fontsize=6.3,
-    )
+    if percentages[2] >= 10.0:
+        ax.text(
+            overhead_center,
+            0,
+            f"{percentages[2]:.1f}%",
+            ha="center",
+            va="center",
+            fontsize=6.3,
+        )
 
     ax.set_xlim(0, 100)
     ax.set_ylim(-0.43, 0.43)

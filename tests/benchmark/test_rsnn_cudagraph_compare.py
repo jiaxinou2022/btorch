@@ -29,6 +29,8 @@ from benchmark.benchmark_rsnn_cudagraph_compare import (
     latency_summary,
     load_flybrain_csr,
     load_hemibrain_csr,
+    load_microns_mm3_csr,
+    load_multiarea_mam_csr,
     make_eager_runner,
     make_torch_csr_weight,
     median_ms,
@@ -848,6 +850,93 @@ def test_hemibrain_loader_preserves_relative_synapse_counts(
     )
 
 
+def test_microns_loader_applies_presynaptic_cell_type_signs(tmp_path: Path):
+    """MICrONS loading should sign condensed counts from cell annotations."""
+
+    h5py = pytest.importorskip("h5py")
+    path = tmp_path / "microns_mm3_connectome.h5"
+    with h5py.File(path, "w") as payload:
+        group = payload.create_group("connectivity/condensed")
+        edge_indices = group.create_group("edge_indices")
+        edge_indices.create_dataset("block0_items", data=[b"row", b"col"])
+        edge_indices.create_dataset("block0_values", data=[[0, 1], [1, 0]])
+        edges = group.create_group("edges")
+        edges.create_dataset(
+            "block0_items", data=[b"count", b"total_size"]
+        )
+        edges.create_dataset("block0_values", data=[[1, 10], [3, 30]])
+        vertex_properties = group.create_group("vertex_properties")
+        vertex_dtype = np.dtype([("values_block_2", "S8", (5,))])
+        vertices = np.zeros(2, dtype=vertex_dtype)
+        vertices["values_block_2"][:, 1] = [b"23P", b"BC"]
+        vertex_properties.create_dataset("table", data=vertices)
+
+    matrix = load_microns_mm3_csr(
+        path,
+        weight_scale=0.2,
+        device=torch.device("cpu"),
+    )
+
+    torch.testing.assert_close(
+        matrix.to_dense(),
+        torch.tensor([[0.0, 0.1], [-0.3, 0.0]]),
+    )
+
+
+def test_multiarea_loader_forwards_reproducibility_controls(monkeypatch):
+    """Schmidt graph generation should expose scale, seed, and allocation cap."""
+
+    source = sp.csr_matrix(
+        ([2.0, -2.0], ([0, 1], [1, 0])),
+        shape=(2, 2),
+        dtype="float32",
+    )
+    calls = {}
+
+    def fake_spec(*, root, n_scaling, k_scaling):
+        calls.update(
+            root=root,
+            n_scaling=n_scaling,
+            k_scaling=k_scaling,
+        )
+        return "spec"
+
+    def fake_instantiate(spec, *, seed, max_nnz):
+        calls.update(spec=spec, seed=seed, max_nnz=max_nnz)
+        return source.copy()
+
+    monkeypatch.setattr(
+        "connectome_dataset.cortical_network.multiarea_spec",
+        fake_spec,
+    )
+    monkeypatch.setattr(
+        "connectome_dataset.cortical_network.instantiate_connectivity",
+        fake_instantiate,
+    )
+    matrix = load_multiarea_mam_csr(
+        Path("mesoscale"),
+        weight_scale=0.2,
+        n_scaling=0.005,
+        k_scaling=0.5,
+        seed=7,
+        max_nnz=123,
+        device=torch.device("cpu"),
+    )
+
+    assert calls == {
+        "root": Path("mesoscale"),
+        "n_scaling": 0.005,
+        "k_scaling": 0.5,
+        "spec": "spec",
+        "seed": 7,
+        "max_nnz": 123,
+    }
+    torch.testing.assert_close(
+        matrix.to_dense(),
+        torch.tensor([[0.0, 0.2], [-0.2, 0.0]]),
+    )
+
+
 def test_external_framework_tuning_options_are_explicit(monkeypatch):
     """Framework tuning choices should be reproducible from the CLI."""
 
@@ -887,6 +976,14 @@ def test_dataset_specific_weight_scale_defaults():
     assert resolve_dataset_defaults("fly_hemibrain", 0.4) == (
         "fly_hemibrain",
         0.4,
+    )
+    assert resolve_dataset_defaults("microns_mm3", None) == (
+        "microns_mm3",
+        0.15,
+    )
+    assert resolve_dataset_defaults("schmidt_multiarea", None) == (
+        "multiarea_mam",
+        0.15,
     )
     assert resolve_dataset_defaults("mice_column_v1", None) == (
         "mice_column_v1",
@@ -1013,6 +1110,36 @@ def test_correctness_rejects_material_error_near_zero():
     metrics = correctness_metrics(result, reference)
 
     assert metrics["status"] == "correctness_failed"
+
+
+def test_correctness_masks_causal_state_after_rare_spike_divergence():
+    """Comparison rows should use the same causal state mask as roofline."""
+
+    reference = RSNNResult(
+        spikes=torch.zeros(400, 1, 3),
+        v=torch.zeros(1, 3),
+        psc=torch.zeros(1, 3),
+    )
+    result = RSNNResult(
+        spikes=reference.spikes.clone(),
+        v=torch.tensor([[0.99, 0.3, 1e-4]]),
+        psc=torch.tensor([[0.02, 0.02, 1e-6]]),
+    )
+    result.spikes[10, 0, 0] = 1.0
+    matrix = CSR.from_edges(
+        torch.tensor([0]),
+        torch.tensor([1]),
+        torch.tensor([1.0]),
+        (3, 3),
+    )
+
+    metrics = correctness_metrics(result, reference, matrix=matrix)
+
+    assert metrics["status"] == "passed_causal_masked_state"
+    assert metrics["state_compared_neurons"] == 1
+    assert metrics["state_excluded_neurons"] == 2
+    assert metrics["v_compared_max_normalized_error"] < 1.0
+    assert metrics["psc_compared_max_normalized_error"] < 1.0
 
 
 def test_spike_equivalence_retains_state_errors_as_diagnostics():

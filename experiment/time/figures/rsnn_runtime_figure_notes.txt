@@ -1,0 +1,22 @@
+RSNN runtime characterization figure notes
+
+Runtime composition
+-------------------
+Normalized runtime composition at 1% controlled firing rate.
+The stacked bar reports the mean per-repeat fraction of uninstrumented eager
+wall time across n=10 repeats: Update=8.94%,
+Synaptic current computation=89.25%, and Execution
+overhead=1.81%. Update and synaptic current are
+CUPTI raw CUDA kernel-active durations. Execution overhead is eager wall time
+minus both kernel-active components. It includes repeated kernel launch/API
+costs, but also framework, allocation, scheduling, synchronization, and GPU
+idle time; it must not be interpreted as pure launch time.
+
+Activity sweep
+--------------
+Points are individual benchmark repeats; lines are means and shaded bands are
+mean ± SD, n=10 repeats per firing rate. Update and synaptic current are raw
+kernel-active durations from a separate CUPTI profiling pass. Execution
+overhead is the additive residual against the uninstrumented eager wall pass.
+The cuSPARSE SpMV traverses the fixed CSR nonzeros at every firing rate, so its
+runtime is not expected to scale with the number of nonzero spike values.

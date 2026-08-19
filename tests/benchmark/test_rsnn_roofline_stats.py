@@ -2,10 +2,56 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import benchmark.benchmark_rsnn_roofline as roofline
 from benchmark.benchmark_rsnn_roofline import summarize_block_stats
+
+
+def test_validation_masks_causal_fanout_of_rare_spike_divergence(monkeypatch):
+    """State checks should exclude reset-divergent neurons and direct posts."""
+
+    expected_spikes = torch.zeros((400, 1, 3))
+    actual_spikes = expected_spikes.clone()
+    actual_spikes[10, 0, 0] = 1.0
+    expected_v = torch.zeros((1, 3))
+    expected_psc = torch.zeros((1, 3))
+
+    # Neuron 0 diverged at threshold and neuron 1 receives its recurrent edge.
+    # Their final states are causally incomparable; independent neuron 2 must
+    # still satisfy the original strict analog-state tolerances.
+    actual_v = torch.tensor([[0.99, 0.3, 1e-4]])
+    actual_psc = torch.tensor([[0.02, 0.02, 1e-6]])
+    workload = SimpleNamespace(
+        matrix=SimpleNamespace(
+            _row=torch.tensor([0]),
+            indices=torch.tensor([1]),
+        )
+    )
+    monkeypatch.setattr(
+        roofline,
+        "torch_reference",
+        lambda candidate: (expected_spikes, expected_v, expected_psc),
+    )
+
+    metrics = roofline.validate_with_torch(
+        workload,
+        lambda: (actual_spikes, actual_v, actual_psc),
+    )
+
+    assert metrics["spike_mismatches"] == 1
+    assert metrics["state_compared_neurons"] == 1
+    assert metrics["state_excluded_neurons"] == 2
+    assert metrics["correctness_mode"] == "causal_masked_state"
+
+    invalid_v = actual_v.clone()
+    invalid_v[0, 2] = 1.0
+    with pytest.raises(AssertionError, match="not close"):
+        roofline.validate_with_torch(
+            workload,
+            lambda: (actual_spikes, invalid_v, actual_psc),
+        )
 
 
 def test_block_stats_summary_derives_requested_metrics():

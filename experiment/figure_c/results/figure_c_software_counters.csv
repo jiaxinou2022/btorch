@@ -1,0 +1,5 @@
+variant,label,edges_processed,tasks_generated,fragments_generated,global_updates_emitted,hash_entries_flushed,hash_fallback_updates,atomic_per_edge,merge_ratio
+v0_binning,Binning,32792092,,,32792092,0,0,1.0,0.0
+v1_block,+ Block,32792092,68681,90579,32792092,0,0,1.0,0.0
+v2_block_sort,+ Sort,32792092,66384,89420,32792092,0,0,1.0,0.0
+v3_block_sort_hash,+ Hash,32792092,66384,89420,31539478,13768425,2085714,0.9618013391765308,0.03819866082346923

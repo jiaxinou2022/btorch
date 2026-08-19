@@ -47,9 +47,11 @@ FlyBrain (FlyWire v783) is the default dataset. Its signed synapse counts are
 scaled by ``--weight-scale``. ``fly_hemibrain`` preserves the Hemibrain
 synapse-count distribution and normalizes its mean weighted fanout to
 ``--weight-scale``; its public edge list does not encode neuronal polarity.
-Dense providers are opt-in for both fly connectomes because materializing their
-adjacency as a dense tensor is usually impractical. The main comparison is one
-fixed batch-1 RSNN workload. Providers
+``microns_mm3`` recovers presynaptic signs from the cell-type annotations.
+``multiarea_mam`` instantiates the Schmidt et al. mesoscale model at an explicit
+scale and seed. Dense providers are opt-in for these large connectomes because
+materializing their adjacency as a dense tensor is usually impractical. The
+main comparison is one fixed batch-1 RSNN workload. Providers
 whose public API cannot execute that workload are reported as not applicable
 instead of changing the workload to suit the provider.
 
@@ -193,10 +195,14 @@ FLYBRAIN_DEFAULT_PROVIDERS: tuple[Provider, ...] = tuple(
 DEFAULT_WEIGHT_SCALES = {
     "flybrain": 0.275,
     "fly_hemibrain": 0.15,
+    "microns_mm3": 0.15,
+    "multiarea_mam": 0.15,
     "mice_column_v1": 0.15,
     "uniform": 0.15,
 }
-LARGE_CONNECTOME_DATASETS = frozenset(("flybrain", "fly_hemibrain"))
+LARGE_CONNECTOME_DATASETS = frozenset(
+    ("flybrain", "fly_hemibrain", "microns_mm3", "multiarea_mam")
+)
 SPIKE_MISMATCH_RATE_TOL = 1e-3
 STATE_RTOL = 2e-3
 V_ATOL = 2e-1
@@ -466,7 +472,9 @@ def resolve_dataset_defaults(
 
     aliases = {
         "hemibrain": "fly_hemibrain",
+        "macaque_multiarea": "multiarea_mam",
         "mice_v1_column": "mice_column_v1",
+        "schmidt_multiarea": "multiarea_mam",
         "flywire_783": "flybrain",
     }
     canonical = aliases.get(dataset, dataset)
@@ -543,6 +551,111 @@ def load_hemibrain_csr(
         scipy_matrix.shape[0], 1
     )
     scipy_matrix.data *= weight_scale / max(mean_weighted_fanout, 1.0)
+    return CSR.from_scipy(scipy_matrix, device=device, dtype=torch.float32)
+
+
+def _normalize_mean_abs_fanout(scipy_matrix, weight_scale: float) -> None:
+    """Normalize a weighted graph in place by its mean absolute row sum."""
+
+    mean_abs_fanout = float(abs(scipy_matrix).sum()) / max(
+        scipy_matrix.shape[0], 1
+    )
+    scipy_matrix.data *= weight_scale / max(mean_abs_fanout, 1.0)
+
+
+def load_microns_mm3_csr(
+    root: Path | None, *, weight_scale: float, device: torch.device
+) -> CSR:
+    """Load signed MICrONS mm3 condensed connectivity from its HDF5 payload.
+
+    Condensed edge counts preserve the number of synapses per connected pair.
+    Presynaptic cell types provide the E/I sign: BC, MC, NGC, and BPC neurons
+    are inhibitory, while annotated pyramidal classes are excitatory.
+    """
+
+    try:
+        import h5py
+        import numpy as np
+        import scipy.sparse as scipy_sparse
+    except ImportError as exc:
+        raise RuntimeError(
+            "h5py, NumPy, and SciPy are required for --dataset microns_mm3"
+        ) from exc
+
+    default_root = DATASET_ROOT / "data" / "external" / "microns"
+    source = Path(root) if root is not None else default_root
+    path = source if source.is_file() else source / "microns_mm3_connectome.h5"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"microns_mm3 requires microns_mm3_connectome.h5 under {source}. "
+            "Restore connectome_dataset/data/external/microns.dvc or pass "
+            "--connectome-root."
+        )
+
+    with h5py.File(path, "r") as payload:
+        group = payload["connectivity/condensed"]
+        edge_columns = [
+            value.decode() for value in group["edge_indices/block0_items"][:]
+        ]
+        edge_indices = group["edge_indices/block0_values"][:]
+        rows = edge_indices[:, edge_columns.index("row")]
+        cols = edge_indices[:, edge_columns.index("col")]
+
+        value_columns = [
+            value.decode() for value in group["edges/block0_items"][:]
+        ]
+        edge_values = group["edges/block0_values"][:]
+        counts = edge_values[:, value_columns.index("count")].astype(np.float32)
+
+        vertices = group["vertex_properties/table"]
+        cell_types = vertices["values_block_2"][:, 1].astype("U")
+
+    inhibitory_types = np.array(("BC", "MC", "NGC", "BPC"))
+    signs = np.where(np.isin(cell_types, inhibitory_types), -1.0, 1.0)
+    values = counts * signs[rows]
+    scipy_matrix = scipy_sparse.csr_matrix(
+        (values, (rows, cols)),
+        shape=(cell_types.size, cell_types.size),
+        dtype=np.float32,
+    )
+    scipy_matrix.sum_duplicates()
+    _normalize_mean_abs_fanout(scipy_matrix, weight_scale)
+    return CSR.from_scipy(scipy_matrix, device=device, dtype=torch.float32)
+
+
+def load_multiarea_mam_csr(
+    root: Path | None,
+    *,
+    weight_scale: float,
+    n_scaling: float,
+    k_scaling: float,
+    seed: int,
+    max_nnz: int,
+    device: torch.device,
+) -> CSR:
+    """Instantiate the signed Schmidt et al. macaque multi-area graph."""
+
+    try:
+        from connectome_dataset.cortical_network import (
+            instantiate_connectivity,
+            multiarea_spec,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "connectome_dataset is required for --dataset multiarea_mam"
+        ) from exc
+
+    spec = multiarea_spec(
+        root=root,
+        n_scaling=n_scaling,
+        k_scaling=k_scaling,
+    )
+    scipy_matrix = instantiate_connectivity(
+        spec,
+        seed=seed,
+        max_nnz=max_nnz,
+    ).tocsr()
+    _normalize_mean_abs_fanout(scipy_matrix, weight_scale)
     return CSR.from_scipy(scipy_matrix, device=device, dtype=torch.float32)
 
 
@@ -1328,6 +1441,7 @@ def correctness_metrics(
     reference: RSNNResult,
     *,
     strict_state: bool = True,
+    matrix: CSR | None = None,
 ) -> dict:
     """Return exact-state or spike-equivalence correctness metrics.
 
@@ -1357,10 +1471,45 @@ def correctness_metrics(
     states_finite = bool(
         torch.isfinite(result.v).all() and torch.isfinite(result.psc).all()
     )
-    state_passed = v_normalized <= 1.0 and psc_normalized <= 1.0
+    comparable = torch.ones(
+        reference.v.shape[-1],
+        device=reference.v.device,
+        dtype=torch.bool,
+    )
+    correctness_mode = "full_state"
+    if matrix is not None and spike_mismatches:
+        divergent = (result.spikes != reference.spikes).any(dim=(0, 1))
+        affected = divergent.clone()
+        if matrix.indices.numel():
+            divergent_edges = divergent[matrix._row]
+            affected[matrix.indices[divergent_edges]] = True
+        comparable = ~affected
+        correctness_mode = "causal_masked_state"
+    if comparable.any():
+        compared_v_normalized = max_normalized_error(
+            result.v[..., comparable],
+            reference.v[..., comparable],
+            atol=V_ATOL,
+            rtol=STATE_RTOL,
+        )
+        compared_psc_normalized = max_normalized_error(
+            result.psc[..., comparable],
+            reference.psc[..., comparable],
+            atol=PSC_ATOL,
+            rtol=STATE_RTOL,
+        )
+        state_passed = (
+            compared_v_normalized <= 1.0 and compared_psc_normalized <= 1.0
+        )
+    else:
+        compared_v_normalized = float("nan")
+        compared_psc_normalized = float("nan")
+        state_passed = True
     passed = spikes_passed and states_finite and (state_passed or not strict_state)
     if passed and not strict_state and not state_passed:
         status = "passed_spike_equivalent"
+    elif passed and correctness_mode == "causal_masked_state":
+        status = "passed_causal_masked_state"
     else:
         status = "passed" if passed else "correctness_failed"
     return {
@@ -1371,6 +1520,11 @@ def correctness_metrics(
         "psc_max_abs_diff": psc_diff,
         "v_max_normalized_error": v_normalized,
         "psc_max_normalized_error": psc_normalized,
+        "v_compared_max_normalized_error": compared_v_normalized,
+        "psc_compared_max_normalized_error": compared_psc_normalized,
+        "state_compared_neurons": int(comparable.sum().item()),
+        "state_excluded_neurons": int((~comparable).sum().item()),
+        "correctness_mode": correctness_mode,
     }
 
 
@@ -1383,6 +1537,11 @@ def _empty_metrics(status: str = "not_checked") -> dict:
         "psc_max_abs_diff": float("nan"),
         "v_max_normalized_error": float("nan"),
         "psc_max_normalized_error": float("nan"),
+        "v_compared_max_normalized_error": float("nan"),
+        "psc_compared_max_normalized_error": float("nan"),
+        "state_compared_neurons": 0,
+        "state_excluded_neurons": 0,
+        "correctness_mode": "not_checked",
     }
 
 
@@ -1426,6 +1585,7 @@ def bench_case(
     requested_activity: float | None = None,
     calibration: dict[str, object] | None = None,
     audit_manifest: dict[str, dict[str, object]] | None = None,
+    dataset_metadata: dict[str, object] | None = None,
 ) -> list[dict]:
     """Prepare and benchmark all selected providers for one case."""
 
@@ -1512,7 +1672,7 @@ def bench_case(
                 prepared_metadata = unprepared_metadata(provider, case)
                 prepared_metadata.timing_scope = "framework_native_timing"
                 metrics = (
-                    correctness_metrics(result, reference)
+                    correctness_metrics(result, reference, matrix=matrix)
                     if check_correctness and result is not None
                     else _empty_metrics()
                 )
@@ -1633,6 +1793,7 @@ def bench_case(
                         reference,
                         strict_state=provider
                         not in {"dtc_spmm_eager", "flashsparse_eager"},
+                        matrix=matrix,
                     )
                     if check_correctness
                     else _empty_metrics()
@@ -1663,6 +1824,7 @@ def bench_case(
             {
                 "provider": provider,
                 "dataset": dataset,
+                **(dataset_metadata or {}),
                 "workload_id": workload_id,
                 "n_neuron": case.n_neuron,
                 "t_steps": case.t_steps,
@@ -1886,6 +2048,10 @@ def parse_args() -> argparse.Namespace:
             "flywire_783",
             "fly_hemibrain",
             "hemibrain",
+            "microns_mm3",
+            "multiarea_mam",
+            "macaque_multiarea",
+            "schmidt_multiarea",
             "uniform",
             "mice_column_v1",
             "mice_v1_column",
@@ -1893,6 +2059,30 @@ def parse_args() -> argparse.Namespace:
         default="flybrain",
     )
     parser.add_argument("--connectome-root", type=Path, default=None)
+    parser.add_argument(
+        "--multiarea-n-scaling",
+        type=float,
+        default=0.005,
+        help="Neuron-count scale for multiarea_mam (default: 0.005).",
+    )
+    parser.add_argument(
+        "--multiarea-k-scaling",
+        type=float,
+        default=1.0,
+        help="Population in-degree scale for multiarea_mam (default: 1.0).",
+    )
+    parser.add_argument(
+        "--multiarea-seed",
+        type=int,
+        default=0,
+        help="Neuron-level connectivity seed for multiarea_mam (default: 0).",
+    )
+    parser.add_argument(
+        "--multiarea-max-nnz",
+        type=int,
+        default=400_000_000,
+        help="Refuse multiarea_mam instantiation above this synapse count.",
+    )
     parser.add_argument("--n-neuron", type=int, default=2**13)
     parser.add_argument("--t-steps", type=int, nargs="+", default=[128])
     parser.add_argument("--batch-size", type=int, default=1)
@@ -1924,7 +2114,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Global recurrent weight scale. Defaults to 0.275 for FlyBrain "
-            "and 0.15 for fly_hemibrain, mice_column_v1, or uniform."
+            "and 0.15 for the other connectomes and uniform."
         ),
     )
     parser.add_argument("--warmup", type=int, default=10)
@@ -2040,6 +2230,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("every --t-steps value must be positive")
     if args.n_neuron <= 0 or args.fanout < 0:
         parser.error("--n-neuron must be positive and --fanout non-negative")
+    if args.multiarea_n_scaling <= 0 or args.multiarea_k_scaling <= 0:
+        parser.error("multiarea scaling values must be positive")
+    if args.multiarea_max_nnz <= 0:
+        parser.error("--multiarea-max-nnz must be positive")
     if args.external_timeout <= 0:
         parser.error("--external-timeout must be positive")
     if args.brian2cuda_sm_multiplier <= 0:
@@ -2097,6 +2291,22 @@ def main() -> None:
         matrix = load_hemibrain_csr(
             args.connectome_root,
             weight_scale=args.weight_scale,
+            device=device,
+        )
+    elif dataset == "microns_mm3":
+        matrix = load_microns_mm3_csr(
+            args.connectome_root,
+            weight_scale=args.weight_scale,
+            device=device,
+        )
+    elif dataset == "multiarea_mam":
+        matrix = load_multiarea_mam_csr(
+            args.connectome_root,
+            weight_scale=args.weight_scale,
+            n_scaling=args.multiarea_n_scaling,
+            k_scaling=args.multiarea_k_scaling,
+            seed=args.multiarea_seed,
+            max_nnz=args.multiarea_max_nnz,
             device=device,
         )
     elif dataset == "mice_column_v1":
@@ -2206,6 +2416,33 @@ def main() -> None:
                     else None
                 ),
                 audit_manifest=audit_manifest,
+                dataset_metadata={
+                    "connectome_root": str(args.connectome_root or "default"),
+                    "weight_scale": args.weight_scale,
+                    "microns_variant": (
+                        "condensed" if dataset == "microns_mm3" else ""
+                    ),
+                    "multiarea_n_scaling": (
+                        args.multiarea_n_scaling
+                        if dataset == "multiarea_mam"
+                        else ""
+                    ),
+                    "multiarea_k_scaling": (
+                        args.multiarea_k_scaling
+                        if dataset == "multiarea_mam"
+                        else ""
+                    ),
+                    "multiarea_seed": (
+                        args.multiarea_seed
+                        if dataset == "multiarea_mam"
+                        else ""
+                    ),
+                    "multiarea_max_nnz": (
+                        args.multiarea_max_nnz
+                        if dataset == "multiarea_mam"
+                        else ""
+                    ),
+                },
             )
             for row in rows:
                 print(
