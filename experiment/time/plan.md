@@ -1,3 +1,20 @@
+> **2026-08-25 小规模暴露实验（当前实施版本，优先级最高）**：为避免大网络的
+> GPU 计算掩盖逐 timestep 提交开销，先在 RTX 5090 上比较原生 Mice V1
+> （4,166 neurons / 726,404 edges）、Mice V1 x2（8,332 / 1,452,808）与
+> uniform 16,384 neurons / fanout 96（1,572,864 edges）。正式实验选择最后一组：
+> 它仍有约 157 万条边，不是过小的 launch-only toy case，同时 CUDA Graph 的
+> GPU compute 与 eager 对应部分保持一致，并能稳定暴露 128 个 timestep 的提交
+> 开销。正式配置为 `T=128`、0--50 Hz（10 Hz 间隔）、100 次 warmup、20 次重复。
+>
+> 数据 schema 为 v5。加和分解只使用同一条 GPU critical path：
+> `non-kernel critical-path residual + Update + Propagation = end-to-end runtime`。
+> 其中 residual 包含 launch/dispatch 等未归入 kernel activity 的代价，但不得称为
+> 纯 launch API time。Host submission 由独立计时 pass 测量，因为它可与 GPU 执行
+> 重叠，不参与上述加和。CUPTI 计数用于验证 eager 每次运行有约 1,920--2,048 次
+> kernel launch，而 CUDA Graph 每次运行只有 1 次 graph launch。最终图由两个面板
+> 组成：左侧为 eager/Graph 成对堆叠端到端时间，右侧用对数轴单独展示 host
+> submission，从而直接回答 CUDA Graph 是否把逐 timestep launch 提交压缩到一次。
+
 > **2026-08-25 修订口径（优先于下文旧方案）**：模拟窗口固定为
 > `T=128`。横轴使用 controlled average firing partition 表示整体运行的
 > 稀疏程度，并通过 `rate_hz = partition * 1000 / dt_ms` 换算为 0–50 Hz。

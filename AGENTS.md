@@ -88,3 +88,25 @@ Key patterns:
 
 - Usability over performance; simple over clever; customizability over abstraction.
 - Keep network models cohesive (single file/folder principle).
+
+<!-- TRELLIS:START -->
+# Trellis Instructions
+
+These instructions are for AI assistants working in this project.
+
+This project is managed by Trellis. The working knowledge you need lives under
+`.trellis/`:
+
+- `.trellis/workflow.md` — development phases, when to create tasks, skill routing
+- `.trellis/spec/` — package- and layer-scoped coding guidelines
+- `.trellis/workspace/` — per-developer journals and session traces
+- `.trellis/tasks/` — active and archived tasks, PRDs, and research
+
+If a Trellis command is available on your platform, prefer it over manual steps.
+Codex and other agent-capable tools can also use `.agents/skills/` and the custom
+subagents under `.codex/agents/`.
+
+Managed by Trellis. Edits outside this block are preserved; edits inside may be
+overwritten by a future `trellis update`.
+
+<!-- TRELLIS:END -->

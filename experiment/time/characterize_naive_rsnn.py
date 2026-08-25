@@ -3,10 +3,12 @@
 The conventional baseline is a timestep loop without CUDA Graph capture or
 per-timestep timing events. Separate Kineto/CUPTI passes sum raw Update and
 cuSPARSE Propagation kernel-active time for both eager execution and CUDA Graph
-replay. Each mode's launch-and-execution overhead is its synchronized wall time
-after subtracting those two components. Neuron updates use eager PyTorch CUDA
-operations; recurrent propagation uses the same direct cuSPARSE adapter as the
-main RSNN benchmark. Controlled firing partitions are reported as rates in Hz.
+replay. Each mode's non-kernel critical-path residual is its synchronized wall
+time after subtracting those two components. Host submission is measured in a
+separate pass because it overlaps GPU work and is not additive. Neuron updates
+use eager PyTorch CUDA operations; recurrent propagation uses the same direct
+cuSPARSE adapter as the main RSNN benchmark. Controlled firing partitions are
+reported as rates in Hz.
 
 Example:
     Run a small synthetic smoke benchmark:
@@ -50,10 +52,11 @@ from btorch.sparse import CSR  # noqa: E402
 
 
 DEFAULT_FIRING_RATES_HZ = (0.0, 10.0, 20.0, 30.0, 40.0, 50.0)
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 TIMING_FIELDS = (
     "eager_wall_total_ms",
     "eager_gpu_total_ms",
+    "eager_host_submission_ms",
     "eager_boundary_ms",
     "instrumented_wall_total_ms",
     "instrumented_gpu_total_ms",
@@ -63,33 +66,48 @@ TIMING_FIELDS = (
     "instrumentation_wall_delta_ms",
     "cudagraph_wall_total_ms",
     "cudagraph_gpu_total_ms",
+    "cudagraph_host_submission_ms",
     "graph_removable_wall_ms",
     "graph_removable_gpu_ms",
     "eager_update_kernel_active_ms",
     "eager_propagation_kernel_active_ms",
-    "eager_launch_execution_overhead_ms",
+    "eager_non_kernel_critical_path_residual_ms",
     "cudagraph_update_kernel_active_ms",
     "cudagraph_propagation_kernel_active_ms",
-    "cudagraph_launch_execution_overhead_ms",
+    "cudagraph_non_kernel_critical_path_residual_ms",
     "eager_wall_us_per_step",
     "eager_gpu_us_per_step",
+    "eager_host_submission_us_per_step",
     "update_phase_elapsed_us_per_step",
     "current_phase_elapsed_us_per_step",
     "inter_phase_residual_us_per_step",
     "cudagraph_wall_us_per_step",
     "cudagraph_gpu_us_per_step",
+    "cudagraph_host_submission_us_per_step",
     "graph_removable_wall_us_per_step",
     "graph_removable_gpu_us_per_step",
     "eager_update_kernel_active_us_per_step",
     "eager_propagation_kernel_active_us_per_step",
-    "eager_launch_execution_overhead_us_per_step",
+    "eager_non_kernel_critical_path_residual_us_per_step",
     "cudagraph_update_kernel_active_us_per_step",
     "cudagraph_propagation_kernel_active_us_per_step",
-    "cudagraph_launch_execution_overhead_us_per_step",
+    "cudagraph_non_kernel_critical_path_residual_us_per_step",
     "update_fraction_of_instrumented_gpu",
     "current_fraction_of_instrumented_gpu",
     "inter_phase_fraction_of_instrumented_gpu",
     "graph_removable_wall_fraction_of_eager",
+)
+COUNTER_FIELDS = (
+    "eager_update_kernel_count",
+    "eager_propagation_kernel_count",
+    "eager_cpu_kernel_launch_count",
+    "eager_cpu_graph_launch_count",
+    "eager_cpu_launch_api_count",
+    "cudagraph_update_kernel_count",
+    "cudagraph_propagation_kernel_count",
+    "cudagraph_cpu_kernel_launch_count",
+    "cudagraph_cpu_graph_launch_count",
+    "cudagraph_cpu_launch_api_count",
 )
 
 
@@ -110,6 +128,8 @@ class KernelProfile:
     update_kernel_count: int
     current_kernel_count: int
     ignored_device_event_count: int
+    cpu_kernel_launch_count: int
+    cpu_graph_launch_count: int
 
 
 @dataclass(frozen=True)
@@ -216,26 +236,55 @@ def load_network(args: argparse.Namespace, device: torch.device) -> CSR:
     """Load one dataset or construct the benchmark's uniform network."""
 
     if args.dataset == "flybrain":
-        return load_flybrain_csr(
+        matrix = load_flybrain_csr(
             args.connectome_root,
             weight_scale=args.weight_scale,
             device=device,
         )
-    if args.dataset == "mice_column_v1":
-        return load_mice_column_v1_csr(
+    elif args.dataset == "mice_column_v1":
+        matrix = load_mice_column_v1_csr(
             args.connectome_root,
             weight_scale=args.weight_scale,
             device=device,
         )
-    case = BenchCase(
-        n_neuron=args.n_neuron,
-        batch_size=1,
-        t_steps=args.t_steps,
-        fanout=args.fanout,
-        event_rate=0.0,
-        weight_scale=args.weight_scale,
+    else:
+        case = BenchCase(
+            n_neuron=args.n_neuron,
+            batch_size=1,
+            t_steps=args.t_steps,
+            fanout=args.fanout,
+            event_rate=0.0,
+            weight_scale=args.weight_scale,
+        )
+        matrix = make_recurrent_csr(case, device)
+    return replicate_block_diagonal(matrix, args.dataset_replicas)
+
+
+def replicate_block_diagonal(matrix: CSR, replicas: int) -> CSR:
+    """Replicate one CSR graph as disconnected diagonal blocks."""
+
+    if replicas == 1:
+        return matrix
+    n_neuron = matrix.shape[0]
+    counts = matrix.indptr[1:] - matrix.indptr[:-1]
+    repeated_counts = counts.repeat(replicas)
+    indptr = torch.cat(
+        (
+            torch.zeros(1, device=matrix.indptr.device, dtype=torch.long),
+            repeated_counts.cumsum(0),
+        )
     )
-    return make_recurrent_csr(case, device)
+    indices = torch.cat(
+        tuple(matrix.indices + replica * n_neuron for replica in range(replicas))
+    )
+    data = matrix.effective_values().repeat(replicas)
+    return CSR(
+        indptr,
+        indices,
+        data,
+        shape=(n_neuron * replicas, n_neuron * replicas),
+        properties=matrix.properties,
+    )
 
 
 def prepare_state(
@@ -432,6 +481,18 @@ def time_callable(
     )
 
 
+def time_host_submission(run: Callable[[], object], state: RSNNState) -> float:
+    """Measure unsynchronized host submission in an independent pass."""
+
+    state.reset()
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    run()
+    submission_ms = (time.perf_counter() - start) * 1_000.0
+    torch.cuda.synchronize()
+    return submission_ms
+
+
 def profile_kernel_active_time(
     run: Callable[[], object],
     state: RSNNState,
@@ -464,13 +525,21 @@ def profile_kernel_active_time(
     update_count = 0
     current_count = 0
     ignored_count = 0
+    cpu_kernel_launch_count = 0
+    cpu_graph_launch_count = 0
     for event in trace.events():
+        name = str(event.key)
+        if event.device_type == torch.autograd.DeviceType.CPU:
+            if name.startswith(("cudaLaunchKernel", "cuLaunchKernel")):
+                cpu_kernel_launch_count += 1
+            elif name == "cudaGraphLaunch":
+                cpu_graph_launch_count += 1
+            continue
         if event.device_type != torch.autograd.DeviceType.CUDA:
             continue
         duration_us = float(event.self_device_time_total)
         if duration_us <= 0.0 or event.is_user_annotation:
             continue
-        name = str(event.key)
         if name.startswith("Activity Buffer Request"):
             ignored_count += 1
         elif "cusparse::" in name:
@@ -491,6 +560,8 @@ def profile_kernel_active_time(
         update_kernel_count=update_count,
         current_kernel_count=current_count,
         ignored_device_event_count=ignored_count,
+        cpu_kernel_launch_count=cpu_kernel_launch_count,
+        cpu_graph_launch_count=cpu_graph_launch_count,
     )
 
 
@@ -528,6 +599,8 @@ def prepare_cudagraph(
             args,
             decay,
         )
+    torch.cuda.synchronize()
+    graph.replay()
     torch.cuda.synchronize()
     return graph
 
@@ -624,6 +697,17 @@ def benchmark_activity(
                 else None
             )
 
+        if graph_run is not None and repeat % 2:
+            graph_host_submission_ms = time_host_submission(graph_run, state)
+            eager_host_submission_ms = time_host_submission(eager_run, state)
+        else:
+            eager_host_submission_ms = time_host_submission(eager_run, state)
+            graph_host_submission_ms = (
+                time_host_submission(graph_run, state)
+                if graph_run is not None
+                else float("nan")
+            )
+
         eager_kernel_profile = None
         graph_kernel_profile = None
         eager_kernel_profile_status = "disabled"
@@ -686,6 +770,8 @@ def benchmark_activity(
             eager_update_kernel_count = 0
             eager_propagation_kernel_count = 0
             eager_ignored_device_event_count = 0
+            eager_cpu_kernel_launch_count = 0
+            eager_cpu_graph_launch_count = 0
         else:
             eager_update_kernel_ms = eager_kernel_profile.update_ms
             eager_propagation_kernel_ms = eager_kernel_profile.current_ms
@@ -700,6 +786,8 @@ def benchmark_activity(
             eager_ignored_device_event_count = (
                 eager_kernel_profile.ignored_device_event_count
             )
+            eager_cpu_kernel_launch_count = eager_kernel_profile.cpu_kernel_launch_count
+            eager_cpu_graph_launch_count = eager_kernel_profile.cpu_graph_launch_count
 
         if graph_kernel_profile is None or graph_timing is None:
             graph_update_kernel_ms = float("nan")
@@ -708,6 +796,8 @@ def benchmark_activity(
             graph_update_kernel_count = 0
             graph_propagation_kernel_count = 0
             graph_ignored_device_event_count = 0
+            graph_cpu_kernel_launch_count = 0
+            graph_cpu_graph_launch_count = 0
             component_consistency_status = "unavailable"
         else:
             graph_update_kernel_ms = graph_kernel_profile.update_ms
@@ -723,6 +813,8 @@ def benchmark_activity(
             graph_ignored_device_event_count = (
                 graph_kernel_profile.ignored_device_event_count
             )
+            graph_cpu_kernel_launch_count = graph_kernel_profile.cpu_kernel_launch_count
+            graph_cpu_graph_launch_count = graph_kernel_profile.cpu_graph_launch_count
             counts_match = (
                 eager_update_kernel_count == graph_update_kernel_count
                 and eager_propagation_kernel_count == graph_propagation_kernel_count
@@ -756,6 +848,7 @@ def benchmark_activity(
             "component_consistency_status": component_consistency_status,
             "eager_wall_total_ms": eager_timing.wall_ms,
             "eager_gpu_total_ms": eager_timing.gpu_ms,
+            "eager_host_submission_ms": eager_host_submission_ms,
             "eager_boundary_ms": eager_boundary_ms,
             "instrumented_wall_total_ms": instrumented_timing.wall_ms,
             "instrumented_gpu_total_ms": instrumented_timing.gpu_ms,
@@ -766,29 +859,46 @@ def benchmark_activity(
             "instrumentation_wall_delta_ms": instrumentation_delta_ms,
             "cudagraph_wall_total_ms": graph_wall_ms,
             "cudagraph_gpu_total_ms": graph_gpu_ms,
+            "cudagraph_host_submission_ms": graph_host_submission_ms,
             "raw_graph_removable_wall_ms": raw_graph_wall_ms,
             "raw_graph_removable_gpu_ms": raw_graph_gpu_ms,
             "graph_removable_wall_ms": graph_removable_wall_ms,
             "graph_removable_gpu_ms": graph_removable_gpu_ms,
             "eager_update_kernel_active_ms": eager_update_kernel_ms,
             "eager_propagation_kernel_active_ms": eager_propagation_kernel_ms,
-            "eager_launch_execution_overhead_ms": eager_overhead_ms,
+            "eager_non_kernel_critical_path_residual_ms": eager_overhead_ms,
             "cudagraph_update_kernel_active_ms": graph_update_kernel_ms,
             "cudagraph_propagation_kernel_active_ms": (graph_propagation_kernel_ms),
-            "cudagraph_launch_execution_overhead_ms": graph_overhead_ms,
+            "cudagraph_non_kernel_critical_path_residual_ms": graph_overhead_ms,
             "eager_update_kernel_count": eager_update_kernel_count,
             "eager_propagation_kernel_count": eager_propagation_kernel_count,
             "eager_ignored_device_event_count": (eager_ignored_device_event_count),
+            "eager_cpu_kernel_launch_count": eager_cpu_kernel_launch_count,
+            "eager_cpu_graph_launch_count": eager_cpu_graph_launch_count,
+            "eager_cpu_launch_api_count": (
+                eager_cpu_kernel_launch_count + eager_cpu_graph_launch_count
+            ),
             "cudagraph_update_kernel_count": graph_update_kernel_count,
             "cudagraph_propagation_kernel_count": (graph_propagation_kernel_count),
             "cudagraph_ignored_device_event_count": (graph_ignored_device_event_count),
+            "cudagraph_cpu_kernel_launch_count": graph_cpu_kernel_launch_count,
+            "cudagraph_cpu_graph_launch_count": graph_cpu_graph_launch_count,
+            "cudagraph_cpu_launch_api_count": (
+                graph_cpu_kernel_launch_count + graph_cpu_graph_launch_count
+            ),
             "eager_wall_us_per_step": eager_timing.wall_ms * 1_000.0 / divisor,
             "eager_gpu_us_per_step": eager_timing.gpu_ms * 1_000.0 / divisor,
+            "eager_host_submission_us_per_step": (
+                eager_host_submission_ms * 1_000.0 / divisor
+            ),
             "update_phase_elapsed_us_per_step": update_ms * 1_000.0 / divisor,
             "current_phase_elapsed_us_per_step": current_ms * 1_000.0 / divisor,
             "inter_phase_residual_us_per_step": (inter_phase_ms * 1_000.0 / divisor),
             "cudagraph_wall_us_per_step": graph_wall_ms * 1_000.0 / divisor,
             "cudagraph_gpu_us_per_step": graph_gpu_ms * 1_000.0 / divisor,
+            "cudagraph_host_submission_us_per_step": (
+                graph_host_submission_ms * 1_000.0 / divisor
+            ),
             "graph_removable_wall_us_per_step": (
                 graph_removable_wall_ms * 1_000.0 / divisor
             ),
@@ -801,7 +911,7 @@ def benchmark_activity(
             "eager_propagation_kernel_active_us_per_step": (
                 eager_propagation_kernel_ms * 1_000.0 / divisor
             ),
-            "eager_launch_execution_overhead_us_per_step": (
+            "eager_non_kernel_critical_path_residual_us_per_step": (
                 eager_overhead_ms * 1_000.0 / divisor
             ),
             "cudagraph_update_kernel_active_us_per_step": (
@@ -810,7 +920,7 @@ def benchmark_activity(
             "cudagraph_propagation_kernel_active_us_per_step": (
                 graph_propagation_kernel_ms * 1_000.0 / divisor
             ),
-            "cudagraph_launch_execution_overhead_us_per_step": (
+            "cudagraph_non_kernel_critical_path_residual_us_per_step": (
                 graph_overhead_ms * 1_000.0 / divisor
             ),
             "update_fraction_of_instrumented_gpu": (
@@ -895,6 +1005,11 @@ def aggregate_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
             )
             output[f"{field}_min"] = min(values)
             output[f"{field}_max"] = max(values)
+        for field in COUNTER_FIELDS:
+            values = {int(row[field]) for row in group}
+            if len(values) != 1:
+                raise ValueError(f"Counter {field} varies within one rate: {values}")
+            output[field] = values.pop()
         aggregated.append(output)
     return aggregated
 
@@ -921,6 +1036,15 @@ def parse_args() -> argparse.Namespace:
         default="flybrain",
     )
     parser.add_argument("--connectome-root", type=Path, default=None)
+    parser.add_argument(
+        "--dataset-replicas",
+        type=int,
+        default=1,
+        help=(
+            "Replicate the loaded graph as disconnected block-diagonal copies. "
+            "Use 2 with mice_column_v1 for an approximately 1.45M-edge case."
+        ),
+    )
     parser.add_argument("--n-neuron", type=int, default=8192)
     parser.add_argument("--fanout", type=int, default=32)
     parser.add_argument("--weight-scale", type=float, default=None)
@@ -988,6 +1112,8 @@ def parse_args() -> argparse.Namespace:
     )
     if args.n_neuron <= 0 or args.fanout < 0:
         parser.error("--n-neuron must be positive and --fanout non-negative")
+    if args.dataset_replicas <= 0:
+        parser.error("--dataset-replicas must be positive")
     if args.t_steps <= 0 or args.warmup < 0 or args.repeat <= 0:
         parser.error("invalid --t-steps, --warmup, or --repeat")
     if not args.firing_rates_hz or any(
@@ -1029,6 +1155,7 @@ def main() -> None:
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
         "dataset": args.dataset,
+        "dataset_replicas": args.dataset_replicas,
         "n_neuron": matrix.shape[0],
         "edge_count": matrix.indices.numel(),
         "mean_fanout": matrix.indices.numel() / matrix.shape[0],
@@ -1080,10 +1207,10 @@ def main() -> None:
         all_timestep_rows.extend(timestep_rows)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    breakdown_path = args.output_dir / "naive_rsnn_breakdown_v4.csv"
-    aggregate_path = args.output_dir / "naive_rsnn_aggregate_v4.csv"
-    timestep_path = args.output_dir / "naive_rsnn_timesteps_v4.csv"
-    metadata_path = args.output_dir / "naive_rsnn_metadata_v4.json"
+    breakdown_path = args.output_dir / "naive_rsnn_breakdown_v5.csv"
+    aggregate_path = args.output_dir / "naive_rsnn_aggregate_v5.csv"
+    timestep_path = args.output_dir / "naive_rsnn_timesteps_v5.csv"
+    metadata_path = args.output_dir / "naive_rsnn_metadata_v5.json"
     save_csv(all_repeat_rows, breakdown_path)
     save_csv(aggregate_rows(all_repeat_rows), aggregate_path)
     if args.save_timestep_data:
@@ -1132,7 +1259,17 @@ def main() -> None:
                 "CUDA kernel activity; cuSPARSE kernels are classified by "
                 "demangled cusparse:: names"
             ),
-            "three_way_launch_execution_overhead": (
+            "host_submission_measurement": (
+                "independent pass measuring unsynchronized CPU wall time spent "
+                "inside the run callable, followed by an untimed synchronize; "
+                "includes Python/framework/CUDA API submission and may overlap "
+                "GPU execution"
+            ),
+            "cpu_launch_api_count": (
+                "raw Kineto CPU events named cudaLaunchKernel*, "
+                "cuLaunchKernel*, or cudaGraphLaunch"
+            ),
+            "three_way_non_kernel_critical_path_residual": (
                 "for each execution mode, max(0, wall time - update kernel "
                 "active - cuSPARSE propagation kernel active); includes "
                 "critical-path launch/API, framework, scheduling, and GPU idle"

@@ -1,0 +1,26 @@
+RSNN paired runtime-breakdown figure notes
+
+Each firing-rate group shows paired stacked bars for conventional eager and
+CUDA Graph execution of the same T=128 simulation. From bottom to top, the
+components are Launch & execution overhead, Update, and Propagation. Bars are
+component means across n=7–10 valid paired profiles per firing rate.
+Black points show the corresponding end-to-end runtime measurements; error
+bars show mean ± SD. Gray crosses show 6 paired profiles excluded
+from component summaries because of a failed profile, component mismatch,
+kernel-count mismatch, or a negative residual caused by cross-pass timing
+contamination. Excluded rows remain unchanged in the raw CSV and are listed in
+rsnn_runtime_excluded_component_profiles.csv.
+
+The controlled average firing partition is converted to Hz as
+rate_hz = partition * 1000 / dt_ms. The plotted range is 0–50 Hz. Update and
+Propagation are raw CUDA kernel-active durations from separate CUPTI profiles
+of eager execution and CUDA Graph replay. Their maximum mean relative
+differences across firing rates are
+5.81% (Update) and
+0.37% (Propagation).
+
+Launch & execution overhead is the additive residual between synchronized
+wall time and the two kernel-active components. It includes critical-path
+kernel launch/API cost, but also framework, graph-replay submission,
+scheduling, synchronization, and GPU idle time. It is not a pure cumulative
+launch API measurement.

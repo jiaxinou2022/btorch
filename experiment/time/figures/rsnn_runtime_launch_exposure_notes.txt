@@ -1,0 +1,33 @@
+RSNN paired runtime-breakdown figure notes
+
+Panel a shows paired stacked bars for conventional eager and CUDA Graph
+execution of the same T=128 simulation. From bottom to top, the components are
+Non-kernel critical-path residual, Update, and Propagation. Bars are
+component means across n=14–20 valid paired profiles per firing rate.
+Black points show the corresponding end-to-end runtime measurements; error
+bars show mean ± SD. Gray crosses show 11 paired profiles excluded
+from component summaries because of a failed profile, component mismatch,
+kernel-count mismatch, or a negative residual caused by cross-pass timing
+contamination. Excluded rows remain unchanged in the raw CSV and are listed in
+rsnn_runtime_excluded_component_profiles_v5.csv.
+
+The controlled average firing partition is converted to Hz as
+rate_hz = partition * 1000 / dt_ms. The plotted range is 0–50 Hz. Update and
+Propagation are raw CUDA kernel-active durations from separate CUPTI profiles
+of eager execution and CUDA Graph replay. Their maximum mean relative
+differences across firing rates are
+1.63% (Update) and
+5.37% (Propagation).
+
+The non-kernel critical-path residual is the additive difference between
+synchronized wall time and the two kernel-active components. It is not
+cumulative launch API time because CPU submission overlaps GPU execution.
+
+Panel b separately shows host submission time on a logarithmic axis. Boxes
+show median and IQR; whiskers extend to 1.5 x IQR and all measurements are
+overlaid. Eager submission issued 1920-2048 launch API calls,
+whereas CUDA Graph replay issued 1. Median
+host submission decreased from 13.1837 ms
+to 0.3471 ms, a
+38.0x reduction. Host submission is shown in a
+separate panel and is not added to panel a because it overlaps device work.

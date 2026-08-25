@@ -45,9 +45,12 @@ coverage.xml
 /tags
 
 .agent/rules/env.md
-.codex
 .desloppify
 .kilocode/
 .kilo/
 .playwright-mcp/btorch/backend/persistent/plain_version/problems.md
 results/persistent_kernel/
+
+# Keep project-scoped Trellis metadata and Codex integration shareable.
+!.trellis/**/*.json
+!.codex/hooks.json
