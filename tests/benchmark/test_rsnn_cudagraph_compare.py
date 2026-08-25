@@ -114,6 +114,27 @@ def test_standard_dense_and_csr_rsnn_baselines_are_equivalent():
     torch.testing.assert_close(dense.psc, sparse.psc, atol=1e-6, rtol=1e-6)
 
 
+def test_input_sequence_seed_is_reproducible_and_changes_workload():
+    """Workload seeds should preserve sparsity while changing active neurons."""
+
+    case = BenchCase(
+        n_neuron=101,
+        batch_size=1,
+        t_steps=17,
+        fanout=3,
+        event_rate=0.2,
+    )
+    first = make_input_sequence(case, torch.device("cpu"), seed=1)
+    repeated = make_input_sequence(case, torch.device("cpu"), seed=1)
+    second = make_input_sequence(case, torch.device("cpu"), seed=2)
+
+    torch.testing.assert_close(first, repeated)
+    assert not torch.equal(first, second)
+    expected = round(first.numel() * case.event_rate)
+    assert int(first.count_nonzero()) == expected
+    assert int(second.count_nonzero()) == expected
+
+
 def test_sota_rsnn_loop_uses_dynamic_recurrent_operator():
     """The SOTA adapter should consume each timestep's computed spikes."""
 

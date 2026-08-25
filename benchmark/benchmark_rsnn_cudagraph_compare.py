@@ -871,6 +871,7 @@ def calibrate_input_amplitude(
     max_amplitude: float = 100.0,
     max_iterations: int = 12,
     relative_tolerance: float = 0.1,
+    input_seed: int = 0,
 ) -> CalibrationResult:
     """Calibrate deterministic external input against closed-loop activity."""
 
@@ -885,7 +886,7 @@ def calibrate_input_amplitude(
     for _ in range(max_iterations):
         amplitude = (low + high) / 2.0
         candidate = dataclass_replace(case, input_amplitude=amplitude)
-        x_seq = make_input_sequence(candidate, device)
+        x_seq = make_input_sequence(candidate, device, seed=input_seed)
         result = make_eager_runner(
             x_seq,
             weight,
@@ -1044,7 +1045,14 @@ class PersistentProvider:
     def fixed_runner(
         self, x_seq: torch.Tensor, matrix: CSR, case: BenchCase, *, variant: str
     ):
-        key = (id(matrix), case.t_steps, case.batch_size, x_seq.shape, variant)
+        key = (
+            id(matrix),
+            id(x_seq),
+            case.t_steps,
+            case.batch_size,
+            x_seq.shape,
+            variant,
+        )
         cached = self._runners.get(key)
         if cached is not None:
             return cached
@@ -1586,10 +1594,11 @@ def bench_case(
     calibration: dict[str, object] | None = None,
     audit_manifest: dict[str, dict[str, object]] | None = None,
     dataset_metadata: dict[str, object] | None = None,
+    input_seed: int = 0,
 ) -> list[dict]:
     """Prepare and benchmark all selected providers for one case."""
 
-    x_seq = make_input_sequence(case, device)
+    x_seq = make_input_sequence(case, device, seed=input_seed)
     csr_weight = make_torch_csr_weight(matrix)
     reference = make_eager_runner(x_seq, csr_weight, case, sparse=True)()
     workload = build_closed_loop_workload(
@@ -1597,7 +1606,7 @@ def bench_case(
         x_seq,
         reference.spikes,
         dataset=dataset,
-        seed=20250308,
+        seed=input_seed,
         requested_activity=requested_activity,
     )
     graph_stats = workload.graph_stats
@@ -1824,8 +1833,12 @@ def bench_case(
             {
                 "provider": provider,
                 "dataset": dataset,
+                "gpu": torch.cuda.get_device_name(device),
+                "torch_version": torch.__version__,
+                "cuda_version": torch.version.cuda or "",
                 **(dataset_metadata or {}),
                 "workload_id": workload_id,
+                "input_seed": input_seed,
                 "n_neuron": case.n_neuron,
                 "t_steps": case.t_steps,
                 "batch_size": case.batch_size,
@@ -2088,6 +2101,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--fanout", type=int, default=32)
     parser.add_argument("--event-rate", type=float, default=0.01)
+    parser.add_argument(
+        "--input-seed",
+        type=int,
+        default=0,
+        help="Seed controlling the deterministic external input trace.",
+    )
     parser.add_argument("--dt", type=float, default=1.0)
     parser.add_argument("--tau-mem", type=float, default=20.0)
     parser.add_argument("--tau-syn", type=float, default=5.0)
@@ -2379,6 +2398,7 @@ def main() -> None:
                     max_amplitude=args.calibration_max_amplitude,
                     max_iterations=args.calibration_iterations,
                     relative_tolerance=(args.calibration_relative_tolerance),
+                    input_seed=args.input_seed,
                 )
                 calibrated_case = dataclass_replace(
                     case,
@@ -2387,7 +2407,7 @@ def main() -> None:
             print(
                 f"=== dataset={dataset} N={case.n_neuron} T={t_steps} "
                 f"B=1 edges={case_matrix.indices.numel()} "
-                f"target_activity={target_activity} ==="
+                f"target_activity={target_activity} seed={args.input_seed} ==="
             )
             rows = bench_case(
                 calibrated_case,
@@ -2443,6 +2463,7 @@ def main() -> None:
                         else ""
                     ),
                 },
+                input_seed=args.input_seed,
             )
             for row in rows:
                 print(

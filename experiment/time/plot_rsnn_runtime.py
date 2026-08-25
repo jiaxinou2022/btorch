@@ -1,13 +1,13 @@
-"""Plot publication-ready RSNN runtime characterization figures.
+"""Plot paired eager/CUDA Graph RSNN runtime breakdowns.
 
-The script consumes schema-v3 repeat-level measurements. Update and synaptic
-current computation are raw CUDA kernel-active durations collected by CUPTI.
-Execution overhead is the remaining uninstrumented eager wall time and
-therefore includes kernel launch/API costs as well as framework, scheduling,
-allocation, synchronization, and GPU idle time.
+The script consumes schema-v4 repeat-level measurements for a 128-timestep
+simulation. Each firing-rate group contains paired stacked bars for eager and
+CUDA Graph execution. From bottom to top, each bar shows launch-and-execution
+overhead, Update kernel-active time, and cuSPARSE Propagation kernel-active
+time. The residual includes launch costs but is not a pure launch API metric.
 
 Example:
-    Generate figures from the default result directory:
+    Generate the publication figure from the default result directory:
 
     >>> python experiment/time/plot_rsnn_runtime.py
 """
@@ -20,22 +20,36 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.patches import Patch
 from PIL import Image
 
 
 OKABE_ITO = {
-    "black": "#000000",
     "orange": "#E69F00",
-    "sky": "#56B4E9",
-    "green": "#009E73",
     "blue": "#0072B2",
     "vermillion": "#D55E00",
-    "purple": "#CC79A7",
-    "gray": "#8A8A8A",
-    "light_gray": "#D5D5D5",
 }
-COMPOSITION_SIZE = (3.5, 2.4)
-SWEEP_SIZE = (7.2, 2.8)
+FIGURE_SIZE = (7.2, 3.4)
+EAGER_COMPONENTS = (
+    "eager_launch_execution_overhead_ms",
+    "eager_update_kernel_active_ms",
+    "eager_propagation_kernel_active_ms",
+)
+GRAPH_COMPONENTS = (
+    "cudagraph_launch_execution_overhead_ms",
+    "cudagraph_update_kernel_active_ms",
+    "cudagraph_propagation_kernel_active_ms",
+)
+COMPONENT_LABELS = (
+    "Launch & execution overhead",
+    "Update",
+    "Propagation",
+)
+COMPONENT_COLORS = (
+    OKABE_ITO["vermillion"],
+    OKABE_ITO["orange"],
+    OKABE_ITO["blue"],
+)
 
 
 def setup_style() -> None:
@@ -51,8 +65,6 @@ def setup_style() -> None:
             "xtick.labelsize": 7,
             "ytick.labelsize": 7,
             "legend.fontsize": 7,
-            "lines.linewidth": 1.0,
-            "lines.markersize": 4.0,
             "axes.linewidth": 0.6,
             "xtick.major.width": 0.6,
             "ytick.major.width": 0.6,
@@ -69,58 +81,139 @@ def setup_style() -> None:
     )
 
 
-def load_results(path: Path) -> pd.DataFrame:
-    """Load and validate repeat-level schema-v3 timing data."""
+def _relative_difference(left: pd.Series, right: pd.Series) -> pd.Series:
+    """Return a symmetric relative difference with a stable zero case."""
+
+    scale = pd.concat((left.abs(), right.abs()), axis=1).max(axis=1)
+    difference = (left - right).abs()
+    return difference.where(scale > 0.0, 0.0).div(scale.where(scale > 0.0, 1.0))
+
+
+def component_consistency_table(
+    frame: pd.DataFrame,
+    tolerance: float,
+) -> pd.DataFrame:
+    """Compare mean eager and CUDA Graph kernel-active components."""
+
+    grouped = frame.groupby("requested_firing_rate_hz", sort=True)
+    table = grouped[
+        [
+            "eager_update_kernel_active_ms",
+            "cudagraph_update_kernel_active_ms",
+            "eager_propagation_kernel_active_ms",
+            "cudagraph_propagation_kernel_active_ms",
+        ]
+    ].mean()
+    table["update_relative_difference"] = _relative_difference(
+        table["eager_update_kernel_active_ms"],
+        table["cudagraph_update_kernel_active_ms"],
+    )
+    table["propagation_relative_difference"] = _relative_difference(
+        table["eager_propagation_kernel_active_ms"],
+        table["cudagraph_propagation_kernel_active_ms"],
+    )
+    table["consistency_status"] = np.where(
+        table[
+            [
+                "update_relative_difference",
+                "propagation_relative_difference",
+            ]
+        ].max(axis=1)
+        <= tolerance,
+        "ok",
+        "mismatch",
+    )
+    return table.reset_index()
+
+
+def load_results(path: Path, consistency_rtol: float) -> pd.DataFrame:
+    """Load and validate repeat-level schema-v4 paired timing data."""
 
     frame = pd.read_csv(path)
     required = {
         "schema_version",
-        "requested_activity",
+        "t_steps",
         "repeat",
-        "eager_wall_us_per_step",
-        "update_kernel_active_us_per_step",
-        "current_kernel_active_us_per_step",
-        "execution_overhead_us_per_step",
-        "kernel_profile_status",
+        "requested_average_firing_partition",
+        "actual_average_firing_partition",
+        "requested_firing_rate_hz",
+        "actual_firing_rate_hz",
+        "eager_wall_total_ms",
+        "cudagraph_wall_total_ms",
+        "eager_kernel_profile_status",
+        "cudagraph_kernel_profile_status",
+        "eager_update_kernel_count",
+        "eager_propagation_kernel_count",
+        "cudagraph_update_kernel_count",
+        "cudagraph_propagation_kernel_count",
+        *EAGER_COMPONENTS,
+        *GRAPH_COMPONENTS,
     }
     missing = required.difference(frame.columns)
     if missing:
-        raise ValueError(f"Missing schema-v3 columns: {sorted(missing)}")
-    if not (frame["schema_version"] == 3).all():
-        raise ValueError("Expected only schema_version=3 rows")
-    if not (frame["kernel_profile_status"] == "ok").all():
-        statuses = sorted(frame["kernel_profile_status"].astype(str).unique())
-        raise ValueError(f"CUPTI kernel profile is incomplete: {statuses}")
-    components = frame[
-        [
-            "update_kernel_active_us_per_step",
-            "current_kernel_active_us_per_step",
-            "execution_overhead_us_per_step",
-        ]
-    ]
-    if components.isna().any().any() or (components < 0).any().any():
-        raise ValueError("Three-way timing components must be finite and nonnegative")
-    reconstructed = components.sum(axis=1)
-    if not np.allclose(
-        reconstructed,
-        frame["eager_wall_us_per_step"],
-        rtol=1e-6,
-        atol=1e-6,
+        raise ValueError(f"Missing schema-v4 columns: {sorted(missing)}")
+    if not (frame["schema_version"] == 4).all():
+        raise ValueError("Expected only schema_version=4 rows")
+    if not (frame["t_steps"] == 128).all():
+        values = sorted(frame["t_steps"].unique())
+        raise ValueError(f"Expected T=128 for every row, found {values}")
+    if not frame["requested_firing_rate_hz"].between(0.0, 50.0).all():
+        raise ValueError("Requested firing rates must lie in [0, 50] Hz")
+    for column in (
+        "eager_kernel_profile_status",
+        "cudagraph_kernel_profile_status",
     ):
-        raise ValueError("Three-way timing components do not sum to eager wall time")
-    group_sizes = frame.groupby("requested_activity").size()
+        if not (frame[column] == "ok").all():
+            statuses = sorted(frame[column].astype(str).unique())
+            raise ValueError(f"Incomplete {column}: {statuses}")
+
+    components = frame[[*EAGER_COMPONENTS, *GRAPH_COMPONENTS]]
+    if not np.isfinite(components.to_numpy()).all() or (components < 0).any().any():
+        raise ValueError("Paired timing components must be finite and nonnegative")
+    for mode, columns, total in (
+        ("eager", EAGER_COMPONENTS, "eager_wall_total_ms"),
+        ("CUDA Graph", GRAPH_COMPONENTS, "cudagraph_wall_total_ms"),
+    ):
+        reconstructed = frame[list(columns)].sum(axis=1)
+        if not np.allclose(reconstructed, frame[total], rtol=1e-6, atol=1e-6):
+            raise ValueError(f"{mode} components do not sum to end-to-end runtime")
+
+    counts_match = (
+        frame["eager_update_kernel_count"] == frame["cudagraph_update_kernel_count"]
+    ) & (
+        frame["eager_propagation_kernel_count"]
+        == frame["cudagraph_propagation_kernel_count"]
+    )
+    if not counts_match.all():
+        raise ValueError("Eager and CUDA Graph kernel counts differ")
+    group_sizes = frame.groupby("requested_firing_rate_hz").size()
     if group_sizes.nunique() != 1 or group_sizes.iloc[0] < 2:
+        raise ValueError("Every firing rate must have equal repeats and n >= 2")
+
+    consistency = component_consistency_table(frame, consistency_rtol)
+    mismatches = consistency[consistency["consistency_status"] != "ok"]
+    if not mismatches.empty:
+        details = mismatches[
+            [
+                "requested_firing_rate_hz",
+                "update_relative_difference",
+                "propagation_relative_difference",
+            ]
+        ].to_dict("records")
         raise ValueError(
-            "Every firing rate must have the same number of repeats and n >= 2"
+            "Eager/CUDA Graph Update or Propagation differs beyond "
+            f"rtol={consistency_rtol}: {details}"
         )
-    return frame.sort_values(["requested_activity", "repeat"]).reset_index(drop=True)
+    return frame.sort_values(["requested_firing_rate_hz", "repeat"]).reset_index(
+        drop=True
+    )
 
 
-def _export(fig: plt.Figure, basename: Path, size: tuple[float, float]) -> None:
+def _export(fig: plt.Figure, basename: Path) -> None:
     """Export exact-size vector figures, PNG, and a grayscale preview."""
 
     basename.parent.mkdir(parents=True, exist_ok=True)
-    fig.set_size_inches(*size)
+    fig.set_size_inches(*FIGURE_SIZE)
     fig.canvas.draw()
     for suffix in ("pdf", "svg", "png"):
         kwargs = {"dpi": 600} if suffix == "png" else {}
@@ -136,269 +229,201 @@ def _export(fig: plt.Figure, basename: Path, size: tuple[float, float]) -> None:
         image.convert("L").save(gray_path, dpi=(600, 600))
 
 
-def plot_composition(
-    frame: pd.DataFrame,
-    output_dir: Path,
-    typical_activity: float,
-) -> dict[str, float]:
-    """Plot the normalized three-way eager runtime decomposition."""
+def _draw_stacked_mode(
+    ax: plt.Axes,
+    summary: pd.DataFrame,
+    x: np.ndarray,
+    columns: tuple[str, str, str],
+    *,
+    width: float,
+    hatch: str | None,
+) -> None:
+    """Draw one mode's three-component stacked bars."""
 
-    available = frame["requested_activity"].unique()
-    activity = float(available[np.argmin(np.abs(available - typical_activity))])
-    if not np.isclose(activity, typical_activity, rtol=0.0, atol=1e-9):
-        raise ValueError(
-            f"Requested typical activity {typical_activity} is unavailable; "
-            f"choices are {available.tolist()}"
-        )
-    selected = frame[frame["requested_activity"] == activity].copy()
-
-    component_columns = (
-        "update_kernel_active_us_per_step",
-        "current_kernel_active_us_per_step",
-        "execution_overhead_us_per_step",
-    )
-    fractions = selected.loc[:, component_columns].div(
-        selected["eager_wall_us_per_step"],
-        axis=0,
-    )
-    components = fractions.mean().to_numpy(dtype=float, copy=True)
-    components /= components.sum()
-
-    fig, ax = plt.subplots(figsize=COMPOSITION_SIZE)
-    colors = (
-        OKABE_ITO["orange"],
-        OKABE_ITO["blue"],
-        OKABE_ITO["sky"],
-    )
-    hatches = ("///", "\\\\\\", "...")
-    percentages = components * 100.0
-    labels = (
-        f"Update ({percentages[0]:.1f}%)",
-        f"Synaptic current computation ({percentages[1]:.1f}%)",
-        f"Execution overhead, incl. launch ({percentages[2]:.1f}%)",
-    )
-    left = 0.0
-    for value, color, hatch, label in zip(
-        components,
-        colors,
-        hatches,
-        labels,
-        strict=True,
-    ):
-        ax.barh(
-            0,
-            value * 100.0,
-            left=left * 100.0,
-            height=0.42,
+    bottom = np.zeros(len(summary), dtype=float)
+    for column, color in zip(columns, COMPONENT_COLORS, strict=True):
+        values = summary[(column, "mean")].to_numpy(dtype=float)
+        ax.bar(
+            x,
+            values,
+            width=width,
+            bottom=bottom,
             color=color,
             edgecolor="black",
-            linewidth=0.45,
+            linewidth=0.5,
             hatch=hatch,
-            label=label,
+            zorder=2,
         )
-        left += value
-
-    overhead_center = percentages[:2].sum() + percentages[2] / 2.0
-    if percentages[2] >= 10.0:
-        ax.text(
-            overhead_center,
-            0,
-            f"{percentages[2]:.1f}%",
-            ha="center",
-            va="center",
-            fontsize=6.3,
-        )
-
-    ax.set_xlim(0, 100)
-    ax.set_ylim(-0.43, 0.43)
-    ax.set_yticks([])
-    ax.set_xlabel("Fraction of eager timestep time (%)")
-    ax.set_title(
-        f"Runtime composition at {activity * 100:g}% firing rate "
-        f"(mean, n={len(selected)})"
-    )
-    ax.grid(axis="x", color="#D9D9D9", linewidth=0.45, linestyle=":")
-    ax.set_axisbelow(True)
-    ax.spines["left"].set_visible(False)
-    ax.legend(
-        frameon=False,
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.42),
-        ncol=1,
-    )
-
-    _export(
-        fig,
-        output_dir / "rsnn_runtime_three_way_composition",
-        COMPOSITION_SIZE,
-    )
-    plt.close(fig)
-    return {
-        "activity": activity,
-        "n": float(len(selected)),
-        "update_pct": percentages[0],
-        "current_pct": percentages[1],
-        "overhead_pct": percentages[2],
-    }
+        bottom += values
 
 
-def _draw_repeat_series(
-    ax: plt.Axes,
+def plot_paired_breakdown(
     frame: pd.DataFrame,
-    column: str,
-    label: str,
-    color: str,
-    marker: str,
-    linestyle: str,
-) -> None:
-    """Draw repeat points, mean line, and an SD band."""
+    output_dir: Path,
+    consistency_rtol: float,
+) -> dict[str, float]:
+    """Plot paired stacked end-to-end runtime bars over firing rate."""
 
-    grouped = frame.groupby("requested_activity", sort=True)[column]
-    mean = grouped.mean()
-    sd = grouped.std(ddof=1)
-    x = mean.index.to_numpy(dtype=float)
-    y = mean.to_numpy(dtype=float)
-    error = sd.to_numpy(dtype=float)
-    ax.fill_between(
-        x,
-        y - error,
-        y + error,
-        color=color,
-        alpha=0.16,
-        linewidth=0,
+    grouped = frame.groupby("requested_firing_rate_hz", sort=True)
+    columns = [
+        "eager_wall_total_ms",
+        "cudagraph_wall_total_ms",
+        *EAGER_COMPONENTS,
+        *GRAPH_COMPONENTS,
+    ]
+    summary = grouped[columns].agg(["mean", "std"])
+    rates = summary.index.to_numpy(dtype=float)
+    positions = np.arange(len(rates), dtype=float)
+    width = 0.34
+    eager_x = positions - width / 2.0
+    graph_x = positions + width / 2.0
+
+    fig, ax = plt.subplots(figsize=FIGURE_SIZE)
+    _draw_stacked_mode(
+        ax,
+        summary,
+        eager_x,
+        EAGER_COMPONENTS,
+        width=width,
+        hatch=None,
     )
-    ax.plot(
-        x,
-        y,
-        color=color,
-        marker=marker,
-        linestyle=linestyle,
-        markerfacecolor="white",
-        markeredgecolor=color,
-        markeredgewidth=0.7,
-        label=label,
-        zorder=3,
+    _draw_stacked_mode(
+        ax,
+        summary,
+        graph_x,
+        GRAPH_COMPONENTS,
+        width=width,
+        hatch="////",
     )
 
     repeats = sorted(frame["repeat"].unique())
-    offsets = dict(zip(repeats, np.linspace(-0.032, 0.032, len(repeats)), strict=True))
-    jittered_x = frame.apply(
-        lambda row: row["requested_activity"] * 2.0 ** offsets[row["repeat"]],
-        axis=1,
-    )
-    ax.scatter(
-        jittered_x,
-        frame[column],
-        s=7,
-        facecolor=color,
-        edgecolor="none",
-        alpha=0.28,
-        zorder=2,
-    )
-
-
-def plot_activity_sweep(frame: pd.DataFrame, output_dir: Path) -> None:
-    """Plot the three absolute runtime components against firing rate."""
-
-    fig, axes = plt.subplots(1, 2, figsize=SWEEP_SIZE, sharex=True)
-    left, right = axes
-
-    _draw_repeat_series(
-        left,
-        frame,
-        "update_kernel_active_us_per_step",
-        "Update",
-        OKABE_ITO["orange"],
-        "^",
-        "-",
-    )
-    _draw_repeat_series(
-        left,
-        frame,
-        "current_kernel_active_us_per_step",
-        "Synaptic current computation",
-        OKABE_ITO["blue"],
-        "s",
-        "--",
-    )
-    left.set_ylabel("Time per timestep (μs)")
-    left.set_title("Kernel-active computation")
-    left.legend(frameon=False, loc="best")
-
-    _draw_repeat_series(
-        right,
-        frame,
-        "execution_overhead_us_per_step",
-        "Execution overhead (incl. launch)",
-        OKABE_ITO["sky"],
-        "o",
-        "-",
-    )
-    right.set_ylabel("Time per timestep (μs)")
-    right.set_title("Execution overhead")
-    right.legend(frameon=False, loc="best")
-
-    activities = np.sort(frame["requested_activity"].unique())
-    labels = [f"{value * 100:g}" for value in activities]
-    for ax in axes:
-        ax.set_xscale("log", base=2)
-        ax.set_xlim(activities[0] / 1.18, activities[-1] * 1.18)
-        ax.set_xticks(activities, labels)
-        ax.set_xlabel("Firing rate (%)")
-        ax.set_ylim(bottom=0)
-        ax.grid(axis="y", color="#D9D9D9", linewidth=0.45, linestyle=":")
-        ax.set_axisbelow(True)
-    for ax, label in zip(axes, ("a", "b"), strict=True):
-        ax.annotate(
-            label,
-            xy=(0, 1),
-            xycoords="axes fraction",
-            xytext=(-20, 3),
-            textcoords="offset points",
-            ha="right",
-            va="bottom",
-            fontsize=9,
-            fontweight="bold",
-            annotation_clip=False,
+    jitter = dict(zip(repeats, np.linspace(-0.055, 0.055, len(repeats)), strict=True))
+    rate_to_position = dict(zip(rates, positions, strict=True))
+    for mode, total_column, offset, marker in (
+        ("Eager", "eager_wall_total_ms", -width / 2.0, "o"),
+        ("CUDA Graph", "cudagraph_wall_total_ms", width / 2.0, "D"),
+    ):
+        x_raw = frame.apply(
+            lambda row: (
+                rate_to_position[row["requested_firing_rate_hz"]]
+                + offset
+                + jitter[row["repeat"]]
+            ),
+            axis=1,
+        )
+        ax.scatter(
+            x_raw,
+            frame[total_column],
+            s=7,
+            marker=marker,
+            facecolor="black",
+            edgecolor="none",
+            alpha=0.25,
+            zorder=4,
+        )
+        mean = summary[(total_column, "mean")].to_numpy(dtype=float)
+        sd = summary[(total_column, "std")].to_numpy(dtype=float)
+        x_mode = eager_x if mode == "Eager" else graph_x
+        ax.errorbar(
+            x_mode,
+            mean,
+            yerr=sd,
+            fmt="none",
+            ecolor="black",
+            elinewidth=0.7,
+            capsize=2.0,
+            capthick=0.7,
+            zorder=5,
         )
 
-    _export(fig, output_dir / "rsnn_runtime_three_way_activity_sweep", SWEEP_SIZE)
+    ax.set_xticks(positions, [f"{rate:g}" for rate in rates])
+    ax.set_xlabel("Average firing rate (Hz)")
+    ax.set_ylabel("End-to-end runtime for T=128 (ms)")
+    eager_top = (
+        summary[("eager_wall_total_ms", "mean")]
+        + summary[("eager_wall_total_ms", "std")]
+    ).max()
+    graph_top = (
+        summary[("cudagraph_wall_total_ms", "mean")]
+        + summary[("cudagraph_wall_total_ms", "std")]
+    ).max()
+    ax.set_ylim(0, max(eager_top, graph_top) * 1.24)
+    ax.set_title("Runtime breakdown with and without CUDA Graph")
+    ax.grid(axis="y", color="#D9D9D9", linewidth=0.45, linestyle=":")
+    ax.set_axisbelow(True)
+
+    phase_handles = [
+        Patch(facecolor=color, edgecolor="black", linewidth=0.5, label=label)
+        for color, label in zip(COMPONENT_COLORS, COMPONENT_LABELS, strict=True)
+    ]
+    mode_handles = [
+        Patch(facecolor="white", edgecolor="black", label="Eager"),
+        Patch(
+            facecolor="white",
+            edgecolor="black",
+            hatch="////",
+            label="CUDA Graph",
+        ),
+    ]
+    ax.legend(
+        handles=[*phase_handles, *mode_handles],
+        frameon=False,
+        loc="upper center",
+        ncol=5,
+    )
+
+    basename = output_dir / "rsnn_runtime_paired_breakdown_t128"
+    _export(fig, basename)
     plt.close(fig)
+
+    consistency = component_consistency_table(frame, consistency_rtol)
+    consistency.to_csv(
+        output_dir / "rsnn_runtime_component_consistency.csv",
+        index=False,
+    )
+    return {
+        "n": float(grouped.size().iloc[0]),
+        "max_update_relative_difference": float(
+            consistency["update_relative_difference"].max()
+        ),
+        "max_propagation_relative_difference": float(
+            consistency["propagation_relative_difference"].max()
+        ),
+    }
 
 
 def write_figure_notes(
-    composition: dict[str, float],
+    frame: pd.DataFrame,
+    audit: dict[str, float],
     output_dir: Path,
 ) -> None:
-    """Write captions that state statistics and timing semantics."""
+    """Write captions that state statistics and measurement semantics."""
 
-    n = int(composition["n"])
-    activity = composition["activity"] * 100.0
-    notes = f"""RSNN runtime characterization figure notes
+    n = int(audit["n"])
+    notes = f"""RSNN paired runtime-breakdown figure notes
 
-Runtime composition
--------------------
-Normalized runtime composition at {activity:g}% controlled firing rate.
-The stacked bar reports the mean per-repeat fraction of uninstrumented eager
-wall time across n={n} repeats: Update={composition["update_pct"]:.2f}%,
-Synaptic current computation={composition["current_pct"]:.2f}%, and Execution
-overhead={composition["overhead_pct"]:.2f}%. Update and synaptic current are
-CUPTI raw CUDA kernel-active durations. Execution overhead is eager wall time
-minus both kernel-active components. It includes repeated kernel launch/API
-costs, but also framework, allocation, scheduling, synchronization, and GPU
-idle time; it must not be interpreted as pure launch time.
+Each firing-rate group shows paired stacked bars for conventional eager and
+CUDA Graph execution of the same T=128 simulation. From bottom to top, the
+components are Launch & execution overhead, Update, and Propagation. Bars are
+component means across n={n} repeats. Black points show individual end-to-end
+runtime measurements; error bars show mean ± SD.
 
-Activity sweep
---------------
-Points are individual benchmark repeats; lines are means and shaded bands are
-mean ± SD, n={n} repeats per firing rate. Update and synaptic current are raw
-kernel-active durations from a separate CUPTI profiling pass. Execution
-overhead is the additive residual against the uninstrumented eager wall pass.
-The cuSPARSE SpMV traverses the fixed CSR nonzeros at every firing rate, so its
-runtime is not expected to scale with the number of nonzero spike values.
+The controlled average firing partition is converted to Hz as
+rate_hz = partition * 1000 / dt_ms. The plotted range is 0–50 Hz. Update and
+Propagation are raw CUDA kernel-active durations from separate CUPTI profiles
+of eager execution and CUDA Graph replay. Their maximum mean relative
+differences across firing rates are
+{audit["max_update_relative_difference"] * 100:.2f}% (Update) and
+{audit["max_propagation_relative_difference"] * 100:.2f}% (Propagation).
+
+Launch & execution overhead is the additive residual between synchronized
+wall time and the two kernel-active components. It includes critical-path
+kernel launch/API cost, but also framework, graph-replay submission,
+scheduling, synchronization, and GPU idle time. It is not a pure cumulative
+launch API measurement.
 """
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "rsnn_runtime_figure_notes.txt").write_text(
+    (output_dir / "rsnn_runtime_paired_figure_notes.txt").write_text(
         notes,
         encoding="utf-8",
     )
@@ -412,27 +437,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input",
         type=Path,
-        default=base / "results" / "naive_rsnn_breakdown_v3.csv",
+        default=base / "results" / "naive_rsnn_breakdown_v4.csv",
     )
     parser.add_argument("--output-dir", type=Path, default=base / "figures")
-    parser.add_argument("--typical-activity", type=float, default=0.01)
-    return parser.parse_args()
+    parser.add_argument(
+        "--component-consistency-rtol",
+        type=float,
+        default=0.15,
+        help="Maximum allowed eager/Graph mean component difference.",
+    )
+    args = parser.parse_args()
+    if not 0.0 <= args.component_consistency_rtol <= 1.0:
+        parser.error("--component-consistency-rtol must be in [0, 1]")
+    return args
 
 
 def main() -> None:
-    """Generate both runtime figures and their caption notes."""
+    """Generate the paired runtime figure, audit table, and caption notes."""
 
     args = parse_args()
     setup_style()
-    frame = load_results(args.input)
-    composition = plot_composition(
+    frame = load_results(args.input, args.component_consistency_rtol)
+    audit = plot_paired_breakdown(
         frame,
         args.output_dir,
-        args.typical_activity,
+        args.component_consistency_rtol,
     )
-    plot_activity_sweep(frame, args.output_dir)
-    write_figure_notes(composition, args.output_dir)
-    print(f"saved publication figures to {args.output_dir}")
+    write_figure_notes(frame, audit, args.output_dir)
+    print(f"saved paired publication figure to {args.output_dir}")
 
 
 if __name__ == "__main__":

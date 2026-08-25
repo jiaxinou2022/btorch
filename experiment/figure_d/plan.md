@@ -1,3 +1,5 @@
+测试数据集采用flybrain，在5090上测试，可进入服务器调试，是micromamba的ml-py312环境 zhanghan@162.105.95.95，私钥如果缺失，可到本地win环境中寻找。运行在micromamba的ml-py312，可用GPU
+
 可以把这张图迁移成一张很合适的 **“不同 firing/activity regime 下，各种 SpMSpV / RSNN execution strategy 的性能适用区间”** 图。这里最关键的是：**横轴应该是真实测得的 spike rate，而不是输入强度参数本身**；否则不同 dataset 的 recurrent dynamics 不同，同一个 `weight_scale/input_scale` 实际产生的 activity 可能完全不同。
 
 你现在的 benchmark 本身已经比较适合作为基础：它让各 provider 跑同一套 recurrent LIF + ExponentialPSC dynamics，并且 CSV 中已经保留 raw latency samples 和 `speedup_vs_cusparse_direct_cudagraph`，因此不需要重新设计整个 benchmark harness。  VDHA 本身也是按 input sparsity 1%、5%、10%、20% 做性能 characterization，而且论文明确指出 cuSPARSE 的工作量基本不随 input sparsity 减少，而 column-driven SpMSpV 更直接随 active NNZ 变化，这恰好可以成为这张 RSNN 图的解释基础。

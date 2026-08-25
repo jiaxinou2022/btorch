@@ -1,13 +1,12 @@
 """Characterize phase-separated PyTorch and cuSPARSE RSNN execution.
 
-The primary baseline is a conventional timestep loop without CUDA Graph
-capture or per-timestep timing events. A separate instrumented pass records
-phase envelopes, a Kineto/CUPTI pass sums raw device kernel-active time, and an
-optional CUDA Graph replay estimates graph-removable dispatch cost. Execution
-overhead is the uninstrumented wall time left after subtracting update and
-cuSPARSE kernel-active durations. Neuron updates use eager PyTorch CUDA
+The conventional baseline is a timestep loop without CUDA Graph capture or
+per-timestep timing events. Separate Kineto/CUPTI passes sum raw Update and
+cuSPARSE Propagation kernel-active time for both eager execution and CUDA Graph
+replay. Each mode's launch-and-execution overhead is its synchronized wall time
+after subtracting those two components. Neuron updates use eager PyTorch CUDA
 operations; recurrent propagation uses the same direct cuSPARSE adapter as the
-main RSNN benchmark.
+main RSNN benchmark. Controlled firing partitions are reported as rates in Hz.
 
 Example:
     Run a small synthetic smoke benchmark:
@@ -50,8 +49,8 @@ from benchmark.benchmark_rsnn_cudagraph_compare import (  # noqa: E402
 from btorch.sparse import CSR  # noqa: E402
 
 
-DEFAULT_ACTIVITIES = (0.005, 0.01, 0.02, 0.04, 0.08, 0.16)
-SCHEMA_VERSION = 3
+DEFAULT_FIRING_RATES_HZ = (0.0, 10.0, 20.0, 30.0, 40.0, 50.0)
+SCHEMA_VERSION = 4
 TIMING_FIELDS = (
     "eager_wall_total_ms",
     "eager_gpu_total_ms",
@@ -66,9 +65,12 @@ TIMING_FIELDS = (
     "cudagraph_gpu_total_ms",
     "graph_removable_wall_ms",
     "graph_removable_gpu_ms",
-    "update_kernel_active_ms",
-    "current_kernel_active_ms",
-    "execution_overhead_ms",
+    "eager_update_kernel_active_ms",
+    "eager_propagation_kernel_active_ms",
+    "eager_launch_execution_overhead_ms",
+    "cudagraph_update_kernel_active_ms",
+    "cudagraph_propagation_kernel_active_ms",
+    "cudagraph_launch_execution_overhead_ms",
     "eager_wall_us_per_step",
     "eager_gpu_us_per_step",
     "update_phase_elapsed_us_per_step",
@@ -78,9 +80,12 @@ TIMING_FIELDS = (
     "cudagraph_gpu_us_per_step",
     "graph_removable_wall_us_per_step",
     "graph_removable_gpu_us_per_step",
-    "update_kernel_active_us_per_step",
-    "current_kernel_active_us_per_step",
-    "execution_overhead_us_per_step",
+    "eager_update_kernel_active_us_per_step",
+    "eager_propagation_kernel_active_us_per_step",
+    "eager_launch_execution_overhead_us_per_step",
+    "cudagraph_update_kernel_active_us_per_step",
+    "cudagraph_propagation_kernel_active_us_per_step",
+    "cudagraph_launch_execution_overhead_us_per_step",
     "update_fraction_of_instrumented_gpu",
     "current_fraction_of_instrumented_gpu",
     "inter_phase_fraction_of_instrumented_gpu",
@@ -428,11 +433,8 @@ def time_callable(
 
 
 def profile_kernel_active_time(
+    run: Callable[[], object],
     state: RSNNState,
-    spike_indices: torch.Tensor,
-    extension,
-    args: argparse.Namespace,
-    decay: float,
 ) -> KernelProfile:
     """Measure device kernel-active time with Kineto/CUPTI.
 
@@ -452,14 +454,9 @@ def profile_kernel_active_time(
         record_shapes=False,
         profile_memory=False,
         with_stack=False,
+        acc_events=True,
     ) as trace:
-        run_uninstrumented_loop(
-            state,
-            spike_indices,
-            extension,
-            args,
-            decay,
-        )
+        run()
         torch.cuda.synchronize()
 
     update_us = 0.0
@@ -573,7 +570,9 @@ def benchmark_activity(
     _warmup(state, spike_indices, extension, args)
     repeat_rows: list[dict[str, object]] = []
     timestep_rows: list[dict[str, object]] = []
-    actual_activity = n_active / state.v.numel()
+    actual_partition = n_active / state.v.numel()
+    requested_rate_hz = activity * 1_000.0 / args.dt
+    actual_rate_hz = actual_partition * 1_000.0 / args.dt
     decay = math.exp(-args.dt / args.tau_syn)
     phase_events = PhaseEvents.create(args.t_steps)
     phase_events.initialize()
@@ -625,21 +624,32 @@ def benchmark_activity(
                 else None
             )
 
-        kernel_profile = None
-        kernel_profile_status = "disabled"
+        eager_kernel_profile = None
+        graph_kernel_profile = None
+        eager_kernel_profile_status = "disabled"
+        graph_kernel_profile_status = "disabled"
         if args.profile_kernel_active:
-            try:
-                kernel_profile = profile_kernel_active_time(
-                    state,
-                    spike_indices,
-                    extension,
-                    args,
-                    decay,
-                )
-                kernel_profile_status = "ok"
-            except RuntimeError as error:
-                kernel_profile_status = f"profile_error: {error}"
-                print(f"warning: kernel-active profiling unavailable: {error}")
+            profile_targets = [("eager", eager_run)]
+            if graph_run is not None:
+                profile_targets.append(("cudagraph", graph_run))
+            if repeat % 2:
+                profile_targets.reverse()
+            for profile_name, profile_run in profile_targets:
+                try:
+                    result = profile_kernel_active_time(profile_run, state)
+                except RuntimeError as error:
+                    status = f"profile_error: {error}"
+                    print(f"warning: {profile_name} kernel profile failed: {error}")
+                else:
+                    status = "ok"
+                    if profile_name == "eager":
+                        eager_kernel_profile = result
+                    else:
+                        graph_kernel_profile = result
+                if profile_name == "eager":
+                    eager_kernel_profile_status = status
+                else:
+                    graph_kernel_profile_status = status
 
         instrumented_timing = time_callable(
             instrumented_run,
@@ -669,34 +679,81 @@ def benchmark_activity(
             graph_removable_wall_ms = max(0.0, raw_graph_wall_ms)
             graph_removable_gpu_ms = max(0.0, raw_graph_gpu_ms)
 
-        if kernel_profile is None:
-            update_kernel_ms = float("nan")
-            current_kernel_ms = float("nan")
-            execution_overhead_ms = float("nan")
-            update_kernel_count = 0
-            current_kernel_count = 0
-            ignored_device_event_count = 0
+        if eager_kernel_profile is None:
+            eager_update_kernel_ms = float("nan")
+            eager_propagation_kernel_ms = float("nan")
+            eager_overhead_ms = float("nan")
+            eager_update_kernel_count = 0
+            eager_propagation_kernel_count = 0
+            eager_ignored_device_event_count = 0
         else:
-            update_kernel_ms = kernel_profile.update_ms
-            current_kernel_ms = kernel_profile.current_ms
-            execution_overhead_ms = max(
+            eager_update_kernel_ms = eager_kernel_profile.update_ms
+            eager_propagation_kernel_ms = eager_kernel_profile.current_ms
+            eager_overhead_ms = max(
                 0.0,
-                eager_timing.wall_ms - update_kernel_ms - current_kernel_ms,
+                eager_timing.wall_ms
+                - eager_update_kernel_ms
+                - eager_propagation_kernel_ms,
             )
-            update_kernel_count = kernel_profile.update_kernel_count
-            current_kernel_count = kernel_profile.current_kernel_count
-            ignored_device_event_count = kernel_profile.ignored_device_event_count
+            eager_update_kernel_count = eager_kernel_profile.update_kernel_count
+            eager_propagation_kernel_count = eager_kernel_profile.current_kernel_count
+            eager_ignored_device_event_count = (
+                eager_kernel_profile.ignored_device_event_count
+            )
+
+        if graph_kernel_profile is None or graph_timing is None:
+            graph_update_kernel_ms = float("nan")
+            graph_propagation_kernel_ms = float("nan")
+            graph_overhead_ms = float("nan")
+            graph_update_kernel_count = 0
+            graph_propagation_kernel_count = 0
+            graph_ignored_device_event_count = 0
+            component_consistency_status = "unavailable"
+        else:
+            graph_update_kernel_ms = graph_kernel_profile.update_ms
+            graph_propagation_kernel_ms = graph_kernel_profile.current_ms
+            graph_overhead_ms = max(
+                0.0,
+                graph_timing.wall_ms
+                - graph_update_kernel_ms
+                - graph_propagation_kernel_ms,
+            )
+            graph_update_kernel_count = graph_kernel_profile.update_kernel_count
+            graph_propagation_kernel_count = graph_kernel_profile.current_kernel_count
+            graph_ignored_device_event_count = (
+                graph_kernel_profile.ignored_device_event_count
+            )
+            counts_match = (
+                eager_update_kernel_count == graph_update_kernel_count
+                and eager_propagation_kernel_count == graph_propagation_kernel_count
+            )
+            times_match = math.isclose(
+                eager_update_kernel_ms,
+                graph_update_kernel_ms,
+                rel_tol=args.component_consistency_rtol,
+            ) and math.isclose(
+                eager_propagation_kernel_ms,
+                graph_propagation_kernel_ms,
+                rel_tol=args.component_consistency_rtol,
+            )
+            component_consistency_status = (
+                "ok" if counts_match and times_match else "mismatch"
+            )
 
         divisor = args.t_steps
         row = {
             **common,
-            "requested_activity": activity,
-            "actual_activity": actual_activity,
+            "requested_average_firing_partition": activity,
+            "actual_average_firing_partition": actual_partition,
+            "requested_firing_rate_hz": requested_rate_hz,
+            "actual_firing_rate_hz": actual_rate_hz,
             "n_active_per_step": n_active,
             "spike_seed": spike_seed,
             "repeat": repeat,
             "cudagraph_status": cudagraph_status,
-            "kernel_profile_status": kernel_profile_status,
+            "eager_kernel_profile_status": eager_kernel_profile_status,
+            "cudagraph_kernel_profile_status": graph_kernel_profile_status,
+            "component_consistency_status": component_consistency_status,
             "eager_wall_total_ms": eager_timing.wall_ms,
             "eager_gpu_total_ms": eager_timing.gpu_ms,
             "eager_boundary_ms": eager_boundary_ms,
@@ -713,12 +770,18 @@ def benchmark_activity(
             "raw_graph_removable_gpu_ms": raw_graph_gpu_ms,
             "graph_removable_wall_ms": graph_removable_wall_ms,
             "graph_removable_gpu_ms": graph_removable_gpu_ms,
-            "update_kernel_active_ms": update_kernel_ms,
-            "current_kernel_active_ms": current_kernel_ms,
-            "execution_overhead_ms": execution_overhead_ms,
-            "update_kernel_count": update_kernel_count,
-            "current_kernel_count": current_kernel_count,
-            "ignored_device_event_count": ignored_device_event_count,
+            "eager_update_kernel_active_ms": eager_update_kernel_ms,
+            "eager_propagation_kernel_active_ms": eager_propagation_kernel_ms,
+            "eager_launch_execution_overhead_ms": eager_overhead_ms,
+            "cudagraph_update_kernel_active_ms": graph_update_kernel_ms,
+            "cudagraph_propagation_kernel_active_ms": (graph_propagation_kernel_ms),
+            "cudagraph_launch_execution_overhead_ms": graph_overhead_ms,
+            "eager_update_kernel_count": eager_update_kernel_count,
+            "eager_propagation_kernel_count": eager_propagation_kernel_count,
+            "eager_ignored_device_event_count": (eager_ignored_device_event_count),
+            "cudagraph_update_kernel_count": graph_update_kernel_count,
+            "cudagraph_propagation_kernel_count": (graph_propagation_kernel_count),
+            "cudagraph_ignored_device_event_count": (graph_ignored_device_event_count),
             "eager_wall_us_per_step": eager_timing.wall_ms * 1_000.0 / divisor,
             "eager_gpu_us_per_step": eager_timing.gpu_ms * 1_000.0 / divisor,
             "update_phase_elapsed_us_per_step": update_ms * 1_000.0 / divisor,
@@ -732,12 +795,23 @@ def benchmark_activity(
             "graph_removable_gpu_us_per_step": (
                 graph_removable_gpu_ms * 1_000.0 / divisor
             ),
-            "update_kernel_active_us_per_step": (update_kernel_ms * 1_000.0 / divisor),
-            "current_kernel_active_us_per_step": (
-                current_kernel_ms * 1_000.0 / divisor
+            "eager_update_kernel_active_us_per_step": (
+                eager_update_kernel_ms * 1_000.0 / divisor
             ),
-            "execution_overhead_us_per_step": (
-                execution_overhead_ms * 1_000.0 / divisor
+            "eager_propagation_kernel_active_us_per_step": (
+                eager_propagation_kernel_ms * 1_000.0 / divisor
+            ),
+            "eager_launch_execution_overhead_us_per_step": (
+                eager_overhead_ms * 1_000.0 / divisor
+            ),
+            "cudagraph_update_kernel_active_us_per_step": (
+                graph_update_kernel_ms * 1_000.0 / divisor
+            ),
+            "cudagraph_propagation_kernel_active_us_per_step": (
+                graph_propagation_kernel_ms * 1_000.0 / divisor
+            ),
+            "cudagraph_launch_execution_overhead_us_per_step": (
+                graph_overhead_ms * 1_000.0 / divisor
             ),
             "update_fraction_of_instrumented_gpu": (
                 update_ms / instrumented_timing.gpu_ms
@@ -760,8 +834,10 @@ def benchmark_activity(
                     "schema_version": SCHEMA_VERSION,
                     "run_id": common["run_id"],
                     "dataset": common["dataset"],
-                    "requested_activity": activity,
-                    "actual_activity": actual_activity,
+                    "requested_average_firing_partition": activity,
+                    "actual_average_firing_partition": actual_partition,
+                    "requested_firing_rate_hz": requested_rate_hz,
+                    "actual_firing_rate_hz": actual_rate_hz,
                     "n_active_per_step": n_active,
                     "spike_seed": spike_seed,
                     "repeat": repeat,
@@ -779,21 +855,35 @@ def benchmark_activity(
 def aggregate_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     """Aggregate repeat samples into plot-ready firing-rate rows."""
 
-    activities = sorted({float(row["requested_activity"]) for row in rows})
+    activities = sorted(
+        {float(row["requested_average_firing_partition"]) for row in rows}
+    )
     aggregated: list[dict[str, object]] = []
     for activity in activities:
-        group = [row for row in rows if float(row["requested_activity"]) == activity]
+        group = [
+            row
+            for row in rows
+            if float(row["requested_average_firing_partition"]) == activity
+        ]
         first = group[0]
         output: dict[str, object] = {
             "schema_version": SCHEMA_VERSION,
             "run_id": first["run_id"],
             "dataset": first["dataset"],
-            "requested_activity": activity,
-            "actual_activity": first["actual_activity"],
+            "requested_average_firing_partition": activity,
+            "actual_average_firing_partition": first["actual_average_firing_partition"],
+            "requested_firing_rate_hz": first["requested_firing_rate_hz"],
+            "actual_firing_rate_hz": first["actual_firing_rate_hz"],
             "n_active_per_step": first["n_active_per_step"],
             "spike_seed": first["spike_seed"],
             "cudagraph_status": first["cudagraph_status"],
-            "kernel_profile_status": first["kernel_profile_status"],
+            "eager_kernel_profile_status": first["eager_kernel_profile_status"],
+            "cudagraph_kernel_profile_status": first["cudagraph_kernel_profile_status"],
+            "component_consistency_status": (
+                "ok"
+                if all(row["component_consistency_status"] == "ok" for row in group)
+                else "mismatch"
+            ),
             "repeat_count": len(group),
         }
         for field in TIMING_FIELDS:
@@ -834,14 +924,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-neuron", type=int, default=8192)
     parser.add_argument("--fanout", type=int, default=32)
     parser.add_argument("--weight-scale", type=float, default=None)
-    parser.add_argument("--t-steps", type=int, default=1000)
+    parser.add_argument("--t-steps", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--repeat", type=int, default=10)
     parser.add_argument(
-        "--activities",
+        "--firing-rates-hz",
         type=float,
         nargs="+",
-        default=list(DEFAULT_ACTIVITIES),
+        default=list(DEFAULT_FIRING_RATES_HZ),
+        help=(
+            "Controlled average firing rates in Hz. Rates are converted to "
+            "per-timestep firing partitions using partition = rate * dt / 1000."
+        ),
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dt", type=float, default=1.0)
@@ -874,6 +968,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--component-consistency-rtol",
+        type=float,
+        default=0.15,
+        help=(
+            "Relative tolerance used to check that eager and CUDA Graph "
+            "Update/Propagation kernel-active times agree (default: 0.15)."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path(__file__).resolve().parent / "results",
@@ -887,12 +990,19 @@ def parse_args() -> argparse.Namespace:
         parser.error("--n-neuron must be positive and --fanout non-negative")
     if args.t_steps <= 0 or args.warmup < 0 or args.repeat <= 0:
         parser.error("invalid --t-steps, --warmup, or --repeat")
-    if not args.activities or any(not 0.0 <= value <= 1.0 for value in args.activities):
-        parser.error("--activities must contain values in [0, 1]")
+    if not args.firing_rates_hz or any(
+        not 0.0 <= value <= 50.0 for value in args.firing_rates_hz
+    ):
+        parser.error("--firing-rates-hz must contain values in [0, 50]")
     if args.dt <= 0.0 or args.tau_mem <= 0.0 or args.tau_syn <= 0.0:
         parser.error("--dt, --tau-mem, and --tau-syn must be positive")
     if args.c_m <= 0.0:
         parser.error("--c-m must be positive")
+    if not 0.0 <= args.component_consistency_rtol <= 1.0:
+        parser.error("--component-consistency-rtol must be in [0, 1]")
+    args.activities = [
+        firing_rate_hz * args.dt / 1_000.0 for firing_rate_hz in args.firing_rates_hz
+    ]
     return args
 
 
@@ -925,7 +1035,9 @@ def main() -> None:
         "t_steps": args.t_steps,
         "warmup_steps": args.warmup,
         "seed": args.seed,
-        "timing_method": ("separate_eager_cupti_phase_event_and_cudagraph_passes"),
+        "timing_method": (
+            "separate_eager_and_cudagraph_wall_cupti_profiles_plus_phase_events"
+        ),
         "update_backend": "pytorch_cuda_eager",
         "current_backend": "cusparse_direct_eager",
         "cusparse_primitive": "SpMV",
@@ -933,6 +1045,7 @@ def main() -> None:
         "baseline_cuda_graph": False,
         "cudagraph_proxy_requested": args.measure_cudagraph_proxy,
         "kernel_active_profile_requested": args.profile_kernel_active,
+        "component_consistency_rtol": args.component_consistency_rtol,
     }
 
     all_repeat_rows: list[dict[str, object]] = []
@@ -946,9 +1059,12 @@ def main() -> None:
             spike_seed,
             device,
         )
+        requested_rate_hz = activity * 1_000.0 / args.dt
+        actual_partition = n_active / matrix.shape[0]
+        actual_rate_hz = actual_partition * 1_000.0 / args.dt
         print(
-            f"activity={activity:.4%} actual={n_active / matrix.shape[0]:.4%} "
-            f"active={n_active}"
+            f"rate={requested_rate_hz:g} Hz actual={actual_rate_hz:.4f} Hz "
+            f"partition={actual_partition:.6f} active={n_active}"
         )
         repeat_rows, timestep_rows = benchmark_activity(
             state,
@@ -964,10 +1080,10 @@ def main() -> None:
         all_timestep_rows.extend(timestep_rows)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    breakdown_path = args.output_dir / "naive_rsnn_breakdown_v3.csv"
-    aggregate_path = args.output_dir / "naive_rsnn_aggregate_v3.csv"
-    timestep_path = args.output_dir / "naive_rsnn_timesteps_v3.csv"
-    metadata_path = args.output_dir / "naive_rsnn_metadata_v3.json"
+    breakdown_path = args.output_dir / "naive_rsnn_breakdown_v4.csv"
+    aggregate_path = args.output_dir / "naive_rsnn_aggregate_v4.csv"
+    timestep_path = args.output_dir / "naive_rsnn_timesteps_v4.csv"
+    metadata_path = args.output_dir / "naive_rsnn_metadata_v4.json"
     save_csv(all_repeat_rows, breakdown_path)
     save_csv(aggregate_rows(all_repeat_rows), aggregate_path)
     if args.save_timestep_data:
@@ -996,6 +1112,12 @@ def main() -> None:
         },
         "semantics": {
             "controlled_activity": True,
+            "average_firing_partition": (
+                "mean fraction of neurons forced to spike per timestep"
+            ),
+            "firing_rate_conversion": (
+                "rate_hz = average_firing_partition * 1000 / dt_ms"
+            ),
             "spike_patterns_replayed_across_repeats": True,
             "spike_construction_in_update_phase": True,
             "random_generation_in_timing": False,
@@ -1006,13 +1128,18 @@ def main() -> None:
                 "phase envelopes, not pure kernel-active time"
             ),
             "kernel_active_measurement": (
-                "separate Kineto/CUPTI pass summing raw CUDA kernel activity; "
-                "cuSPARSE kernels are classified by demangled cusparse:: names"
+                "separate eager and CUDA Graph Kineto/CUPTI passes summing raw "
+                "CUDA kernel activity; cuSPARSE kernels are classified by "
+                "demangled cusparse:: names"
             ),
-            "three_way_execution_overhead": (
-                "max(0, uninstrumented eager wall - update kernel active - "
-                "cuSPARSE kernel active); includes critical-path launch/API, "
-                "framework, allocation, scheduling, and GPU idle time"
+            "three_way_launch_execution_overhead": (
+                "for each execution mode, max(0, wall time - update kernel "
+                "active - cuSPARSE propagation kernel active); includes "
+                "critical-path launch/API, framework, scheduling, and GPU idle"
+            ),
+            "component_consistency_check": (
+                "eager and CUDA Graph Update/Propagation raw kernel-active "
+                f"durations and kernel counts, rtol={args.component_consistency_rtol}"
             ),
             "eager_boundary": (
                 "max(0, eager wall - eager GPU); not cumulative host launch time"

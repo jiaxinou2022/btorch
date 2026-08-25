@@ -1,3 +1,12 @@
+> **2026-08-25 修订口径（优先于下文旧方案）**：模拟窗口固定为
+> `T=128`。横轴使用 controlled average firing partition 表示整体运行的
+> 稀疏程度，并通过 `rate_hz = partition * 1000 / dt_ms` 换算为 0–50 Hz。
+> 纵轴为完整 128 timestep 的端到端 runtime（ms）。每个 firing rate 画一对
+> 竖直堆叠柱：Eager 与 CUDA Graph；每根柱从下到上依次为 Launch & execution
+> overhead、Update、Propagation。Update/Propagation 必须分别从 eager 和 Graph
+> 的 CUPTI kernel activity 实测，kernel count 必须相同，均值相对差异默认不得
+> 超过 15%。Residual 包含 launch，但不是纯累计 launch API 时间。
+
 **做一个专门的传统 RSNN runtime characterization 脚本，只回答“时间花在哪里，以及随 firing rate 怎么变”**。暂时不做 fanout、逐 timestep 分布、NCU 等扩展。实现上以 **PyTorch neuron update + cuSPARSE sparse propagation** 为核心，不接 CUDA Graph，这样既与最终 `cuSPARSE + CUDA Graph` baseline 保持算法一致，又能展示未经 launch 优化的传统 timestep based execution。
 
 ## 一、实验目标

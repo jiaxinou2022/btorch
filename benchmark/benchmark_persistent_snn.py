@@ -141,8 +141,24 @@ def provider_available(provider: Provider, device: torch.device) -> tuple[bool, 
     return True, "ok"
 
 
-def make_input_sequence(case: BenchCase, device: torch.device) -> torch.Tensor:
-    """Create deterministic sparse external input currents."""
+def make_input_sequence(
+    case: BenchCase,
+    device: torch.device,
+    *,
+    seed: int = 0,
+) -> torch.Tensor:
+    """Create deterministic sparse external input currents.
+
+    Args:
+        case: RSNN benchmark parameters.
+        device: Device on which to construct the sequence.
+        seed: Workload seed. Seed zero preserves the original low-discrepancy
+            sequence; other seeds change both its phase and stride while
+            retaining the exact requested external-event count.
+
+    Returns:
+        Input currents with shape ``(time, batch, neuron)``.
+    """
 
     total = case.t_steps * case.batch_size * case.n_neuron
     n_active = max(0, min(total, int(round(total * case.event_rate))))
@@ -150,7 +166,14 @@ def make_input_sequence(case: BenchCase, device: torch.device) -> torch.Tensor:
     if n_active > 0:
         # A low-discrepancy deterministic stride avoids RNG noise between runs.
         stride = max(1, total // max(n_active, 1))
-        active = (torch.arange(n_active, device=device) * stride) % total
+        if seed:
+            stride += 2 * abs(seed) + 1
+            while math.gcd(stride, total) != 1:
+                stride += 1
+        offset = (seed * 104_729) % total
+        active = (
+            torch.arange(n_active, device=device) * stride + offset
+        ) % total
         flat[active.long()] = case.input_amplitude
     return flat.reshape(case.t_steps, case.batch_size, case.n_neuron)
 
