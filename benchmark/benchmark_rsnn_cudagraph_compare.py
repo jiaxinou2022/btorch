@@ -119,6 +119,10 @@ from benchmark.sota_rsnn_cudagraph import (  # noqa: E402
     SotaCUDAGraphProvider,
     SotaEagerProvider,
 )
+from benchmark.suitesparse_datasets import (  # noqa: E402
+    SUITESPARSE_DATASETS,
+    load_suitesparse_csr,
+)
 from btorch.backend.persistent.reorder import (  # noqa: E402
     ReorderConfig,
     prepare_reordered_inputs,
@@ -199,9 +203,16 @@ DEFAULT_WEIGHT_SCALES = {
     "multiarea_mam": 0.15,
     "mice_column_v1": 0.15,
     "uniform": 0.15,
+    **{name: 0.15 for name in SUITESPARSE_DATASETS},
 }
 LARGE_CONNECTOME_DATASETS = frozenset(
-    ("flybrain", "fly_hemibrain", "microns_mm3", "multiarea_mam")
+    (
+        "flybrain",
+        "fly_hemibrain",
+        "microns_mm3",
+        "multiarea_mam",
+        *SUITESPARSE_DATASETS,
+    )
 )
 SPIKE_MISMATCH_RATE_TOL = 1e-3
 STATE_RTOL = 2e-3
@@ -476,6 +487,11 @@ def resolve_dataset_defaults(
         "mice_v1_column": "mice_column_v1",
         "schmidt_multiarea": "multiarea_mam",
         "flywire_783": "flybrain",
+        "com_orkut": "orkut",
+        "hollywood-2009": "hollywood_2009",
+        "vas_stokes_4M": "vas_stokes_4m",
+        "uk-2002": "uk_2002",
+        "Queen_4147": "queen_4147",
     }
     canonical = aliases.get(dataset, dataset)
     if canonical not in DEFAULT_WEIGHT_SCALES:
@@ -753,6 +769,10 @@ def make_torch_csr_weight(matrix: CSR) -> torch.Tensor:
     a dataset contains duplicate edges.
     """
 
+    cached = matrix._cache.get("torch_csr_weight")
+    if cached is not None:
+        return cached
+
     source = precompute_csr_row(matrix)
     edge_index = torch.stack((matrix.indices.to(torch.long), source.to(torch.long)))
     coo = torch.sparse_coo_tensor(
@@ -762,7 +782,9 @@ def make_torch_csr_weight(matrix: CSR) -> torch.Tensor:
         device=matrix.data.device,
         dtype=matrix.data.dtype,
     ).coalesce()
-    return coo.to_sparse_csr()
+    weight = coo.to_sparse_csr()
+    matrix._cache["torch_csr_weight"] = weight
+    return weight
 
 
 def torch_dense_rsnn_forward(
@@ -1852,8 +1874,16 @@ def bench_case(
                 "graph_fanout_gini": graph_stats.fanout_gini,
                 "graph_p95_fanout": graph_stats.p95_fanout,
                 "graph_p99_fanout": graph_stats.p99_fanout,
+                "timestep_ms": case.dt,
+                "external_event_rate": case.event_rate,
                 "requested_activity": spike_stats.requested_activity,
                 "measured_activity": spike_stats.measured_activity,
+                "requested_firing_rate_hz": (
+                    spike_stats.requested_activity * 1000.0 / case.dt
+                ),
+                "measured_firing_rate_hz": (
+                    spike_stats.measured_activity * 1000.0 / case.dt
+                ),
                 "mean_active_neurons": spike_stats.mean_active_neurons,
                 "p95_active_neurons": spike_stats.p95_active_neurons,
                 "max_active_neurons": spike_stats.max_active_neurons,
@@ -2068,6 +2098,7 @@ def parse_args() -> argparse.Namespace:
             "uniform",
             "mice_column_v1",
             "mice_v1_column",
+            *SUITESPARSE_DATASETS,
         ),
         default="flybrain",
     )
@@ -2126,6 +2157,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calibration-min-amplitude", type=float, default=0.0)
     parser.add_argument("--calibration-max-amplitude", type=float, default=100.0)
     parser.add_argument("--calibration-iterations", type=int, default=12)
+    parser.add_argument(
+        "--calibrated-input-amplitude",
+        type=float,
+        default=None,
+        help=(
+            "Reuse an already calibrated input amplitude for one target; "
+            "this avoids repeating calibration in provider-isolated runs."
+        ),
+    )
     parser.add_argument("--calibration-relative-tolerance", type=float, default=0.1)
     parser.add_argument(
         "--weight-scale",
@@ -2272,6 +2312,13 @@ def parse_args() -> argparse.Namespace:
         parser.error("invalid calibration amplitude bounds")
     if args.calibration_iterations <= 0:
         parser.error("--calibration-iterations must be positive")
+    if args.calibrated_input_amplitude is not None:
+        if args.calibrated_input_amplitude < 0.0:
+            parser.error("--calibrated-input-amplitude must be non-negative")
+        if args.target_activity is None or len(args.target_activity) != 1:
+            parser.error(
+                "--calibrated-input-amplitude requires exactly one target"
+            )
     if args.calibration_relative_tolerance < 0.0:
         parser.error("--calibration-relative-tolerance must be non-negative")
     args.dataset, args.weight_scale = resolve_dataset_defaults(
@@ -2334,6 +2381,13 @@ def main() -> None:
             weight_scale=args.weight_scale,
             device=device,
         )
+    elif dataset in SUITESPARSE_DATASETS:
+        matrix = load_suitesparse_csr(
+            dataset,
+            args.connectome_root,
+            weight_scale=args.weight_scale,
+            device=device,
+        )
 
     graph_provider = TorchCUDAGraphProvider()
     direct_cusparse_provider = DirectCuSparseProvider()
@@ -2389,17 +2443,28 @@ def main() -> None:
             calibration_result = None
             calibrated_case = case
             if target_activity is not None:
-                calibration_result = calibrate_input_amplitude(
-                    case,
-                    case_matrix,
-                    device,
-                    target_activity,
-                    min_amplitude=args.calibration_min_amplitude,
-                    max_amplitude=args.calibration_max_amplitude,
-                    max_iterations=args.calibration_iterations,
-                    relative_tolerance=(args.calibration_relative_tolerance),
-                    input_seed=args.input_seed,
-                )
+                if args.calibrated_input_amplitude is None:
+                    calibration_result = calibrate_input_amplitude(
+                        case,
+                        case_matrix,
+                        device,
+                        target_activity,
+                        min_amplitude=args.calibration_min_amplitude,
+                        max_amplitude=args.calibration_max_amplitude,
+                        max_iterations=args.calibration_iterations,
+                        relative_tolerance=(args.calibration_relative_tolerance),
+                        input_seed=args.input_seed,
+                    )
+                else:
+                    calibration_result = CalibrationResult(
+                        input_amplitude=args.calibrated_input_amplitude,
+                        target_activity=target_activity,
+                        measured_activity=float("nan"),
+                        activity_error=float("nan"),
+                        calibration_status="reused_calibrated_amplitude",
+                        stable=True,
+                        iterations=0,
+                    )
                 calibrated_case = dataclass_replace(
                     case,
                     input_amplitude=calibration_result.input_amplitude,

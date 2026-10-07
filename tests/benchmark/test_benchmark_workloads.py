@@ -22,10 +22,26 @@ from benchmark.benchmark_rsnn_cudagraph_compare import (
     prepare_physical_case,
 )
 from benchmark.benchmark_workload_stats import (
+    _evenly_spaced_indices,
     stats_are_finite,
     summarize_spike_workload,
 )
 from btorch.sparse import CSR
+
+
+def test_large_evenly_spaced_indices_remain_in_bounds():
+    """Integer sampling must not round beyond large tensor boundaries."""
+
+    length = 316_548_962
+    indices = _evenly_spaced_indices(length, 4096)
+
+    assert indices.dtype == torch.int64
+    assert indices.shape == (4096,)
+    assert indices[0].item() == 0
+    assert indices[-1].item() == length - 1
+    assert torch.all(indices[1:] > indices[:-1])
+    assert indices.min().item() >= 0
+    assert indices.max().item() < length
 
 
 @pytest.mark.parametrize(

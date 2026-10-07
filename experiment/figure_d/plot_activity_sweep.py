@@ -34,6 +34,7 @@ DATASET_LABELS = {
 }
 BASELINE = "cusparse_direct_cudagraph"
 FIGURE_SIZE = (7.2, 5.4)
+EXPECTED_RATES_HZ = (0.0, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0)
 
 
 def parse_args() -> argparse.Namespace:
@@ -89,14 +90,24 @@ def load_and_summarize(paths: list[Path]) -> tuple[pd.DataFrame, pd.DataFrame]:
         raise ValueError("inputs must contain exactly the four planned datasets")
     if set(raw["provider"]) != expected:
         raise ValueError("raw CSVs must contain exactly the five figure providers")
-    keys = ["dataset", "input_seed", "requested_activity", "provider"]
+    required_rate_columns = {
+        "timestep_ms",
+        "requested_firing_rate_hz",
+        "measured_firing_rate_hz",
+    }
+    if not required_rate_columns.issubset(raw.columns):
+        raise ValueError("raw CSVs do not contain firing-rate fields in Hz")
+    rates = sorted(raw["requested_firing_rate_hz"].unique())
+    if not np.allclose(rates, EXPECTED_RATES_HZ):
+        raise ValueError("inputs do not contain the planned 0--50 Hz sweep")
+    keys = ["dataset", "input_seed", "requested_firing_rate_hz", "provider"]
     if raw.duplicated(keys).any():
         raise ValueError("duplicate provider rows within a workload")
     failed = raw[~raw["correctness_status"].str.startswith("passed")]
     if not failed.empty:
         raise ValueError(f"correctness or availability failures:\n{failed[keys]}")
 
-    workload = ["dataset", "input_seed", "requested_activity"]
+    workload = ["dataset", "input_seed", "requested_firing_rate_hz"]
     baseline = raw[raw["provider"] == BASELINE][workload + ["latency_ms"]].rename(
         columns={"latency_ms": "baseline_latency_ms"}
     )
@@ -104,18 +115,21 @@ def load_and_summarize(paths: list[Path]) -> tuple[pd.DataFrame, pd.DataFrame]:
     data["speedup"] = data["baseline_latency_ms"] / data["latency_ms"]
     methods = data[data["provider"].isin(PROVIDER_STYLE)].copy()
     summary = (
-        methods.groupby(["dataset", "requested_activity", "provider"], as_index=False)
+        methods.groupby(
+            ["dataset", "requested_firing_rate_hz", "provider"],
+            as_index=False,
+        )
         .agg(
-            measured_activity=("measured_activity", "median"),
-            measured_min=("measured_activity", "min"),
-            measured_max=("measured_activity", "max"),
+            measured_firing_rate_hz=("measured_firing_rate_hz", "median"),
+            measured_min_hz=("measured_firing_rate_hz", "min"),
+            measured_max_hz=("measured_firing_rate_hz", "max"),
             speedup=("speedup", "median"),
             speedup_min=("speedup", "min"),
             speedup_max=("speedup", "max"),
             latency_ms=("latency_ms", "median"),
             seeds=("input_seed", "nunique"),
         )
-        .sort_values(["dataset", "provider", "measured_activity"])
+        .sort_values(["dataset", "provider", "measured_firing_rate_hz"])
     )
     if not (summary["seeds"] == 3).all():
         raise ValueError("every plotted point must contain three workload seeds")
@@ -125,21 +139,23 @@ def load_and_summarize(paths: list[Path]) -> tuple[pd.DataFrame, pd.DataFrame]:
 def write_tables(raw: pd.DataFrame, summary: pd.DataFrame, output_dir: Path) -> None:
     """Write combined raw data plus tidy and reader-facing summaries."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    combined = Path("benchmark/results/activity_sweep/all_datasets_rtx5090_raw.csv")
+    combined = Path(
+        "benchmark/results/activity_sweep/all_datasets_rtx5090_hz_raw.csv"
+    )
     combined.parent.mkdir(parents=True, exist_ok=True)
     raw.to_csv(combined, index=False)
     summary.to_csv(output_dir / "activity_sweep_summary.csv", index=False)
     rows = []
     for (dataset, target), group in summary.groupby(
-        ["dataset", "requested_activity"], sort=False
+        ["dataset", "requested_firing_rate_hz"], sort=False
     ):
         row = {
             "Dataset": DATASET_LABELS[dataset],
-            "Target activity": f"{100 * target:g}%",
-            "Measured activity": (
-                f"{100 * group['measured_activity'].median():.2f}% "
-                f"[{100 * group['measured_min'].min():.2f}, "
-                f"{100 * group['measured_max'].max():.2f}]"
+            "Target firing rate": f"{target:g} Hz",
+            "Measured firing rate": (
+                f"{group['measured_firing_rate_hz'].median():.3g} Hz "
+                f"[{group['measured_min_hz'].min():.3g}, "
+                f"{group['measured_max_hz'].max():.3g}]"
             ),
         }
         for provider, (label, _, _, _) in PROVIDER_STYLE.items():
@@ -159,13 +175,14 @@ def write_tables(raw: pd.DataFrame, summary: pd.DataFrame, output_dir: Path) -> 
 def draw(summary: pd.DataFrame) -> plt.Figure:
     """Draw small multiples against measured neuronal activity."""
     fig, axes = plt.subplots(2, 2, figsize=FIGURE_SIZE, sharex=True, sharey=True)
+    y_upper = max(2.0, float(np.ceil(summary["speedup_max"].max() * 1.08)))
     for ax, dataset in zip(axes.flat, DATASET_ORDER, strict=True):
         panel = summary[summary["dataset"] == dataset]
         for provider, (_, color, marker, linestyle) in PROVIDER_STYLE.items():
             group = panel[panel["provider"] == provider].sort_values(
-                "measured_activity"
+                "measured_firing_rate_hz"
             )
-            x = 100 * group["measured_activity"].to_numpy()
+            x = group["measured_firing_rate_hz"].to_numpy()
             y = group["speedup"].to_numpy()
             lower = y - group["speedup_min"].to_numpy()
             upper = group["speedup_max"].to_numpy() - y
@@ -182,15 +199,15 @@ def draw(summary: pd.DataFrame) -> plt.Figure:
                 elinewidth=0.7,
             )
         ax.axhline(1.0, color="#D55E00", linestyle=":", linewidth=1.0)
-        ax.set_xscale("log")
-        ax.set_xticks([0.5, 1, 2, 5, 10, 20])
-        ax.set_xticklabels(["0.5", "1", "2", "5", "10", "20"])
-        ax.set_xlim(0.34, 23.0)
-        ax.set_ylim(0.5, 11.0)
+        ax.set_xscale("symlog", linthresh=0.1, linscale=0.7, base=10)
+        ax.set_xticks([0, 0.1, 0.5, 1, 5, 10, 50])
+        ax.set_xticklabels(["0", "0.1", "0.5", "1", "5", "10", "50"])
+        ax.set_xlim(0.0, 55.0)
+        ax.set_ylim(0.5, y_upper)
         ax.set_title(DATASET_TITLES[dataset], loc="left", y=0.98, pad=0, fontsize=7.2)
         ax.grid(axis="y", color="0.88", linewidth=0.5)
         ax.grid(axis="x", visible=False)
-    fig.supxlabel("Measured average firing rate (%)", y=0.035)
+    fig.supxlabel("Average firing rate (Hz)", y=0.035)
     fig.supylabel("Speedup over cuSPARSE + CUDA Graph", x=0.018)
     handles = [
         Line2D(

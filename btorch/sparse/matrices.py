@@ -71,11 +71,17 @@ def _validate_properties(
                 "max_fan_in does not match the number of edges for every col."
             )
 
-    edge_key = row * shape[1] + col
-    if properties.unique_edges and edge_key.numel() != torch.unique(edge_key).numel():
+    edge_key = None
+    if properties.unique_edges or properties.sorted_indices:
+        edge_key = row * shape[1] + col
+    if (
+        properties.unique_edges
+        and edge_key is not None
+        and edge_key.numel() != torch.unique(edge_key).numel()
+    ):
         raise ValueError("unique_edges=True requires unique row-col pairs.")
 
-    if properties.sorted_indices and row.numel() > 1:
+    if properties.sorted_indices and edge_key is not None and row.numel() > 1:
         if storage_order == "row":
             order_key = edge_key
         elif storage_order == "column":

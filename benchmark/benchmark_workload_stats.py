@@ -11,6 +11,27 @@ import torch
 from btorch.sparse import CSR
 
 
+def _evenly_spaced_indices(
+    length: int,
+    count: int,
+    *,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    """Return deterministic integer sample positions without float rounding."""
+
+    sample_count = min(max(count, 0), max(length, 0))
+    if sample_count == 0:
+        return torch.empty(0, dtype=torch.int64, device=device)
+    if sample_count == 1:
+        return torch.zeros(1, dtype=torch.int64, device=device)
+    positions = torch.arange(sample_count, dtype=torch.int64, device=device)
+    return torch.div(
+        positions * (length - 1),
+        sample_count - 1,
+        rounding_mode="floor",
+    )
+
+
 @dataclass(frozen=True)
 class GraphStats:
     """Summarize source-oriented CSR structure."""
@@ -83,7 +104,16 @@ def summarize_graph(
     mean = float(fanout.mean()) if fanout.size else 0.0
     std = float(fanout.std()) if fanout.size else 0.0
     nnz = int(matrix.indices.numel())
-    unique_posts = int(torch.unique(matrix.indices.detach().cpu()).numel())
+    if nnz > 10_000_000:
+        seen = torch.zeros(
+            matrix.shape[1],
+            dtype=torch.bool,
+            device=matrix.indices.device,
+        )
+        seen[matrix.indices] = True
+        unique_posts = int(seen.sum().item())
+    else:
+        unique_posts = int(torch.unique(matrix.indices).numel())
     return GraphStats(
         n=matrix.shape[0],
         nnz=nnz,
@@ -122,79 +152,73 @@ def summarize_spike_workload(
     if spikes_2d.shape[1] != matrix.shape[0]:
         raise ValueError("spike trace neuron count does not match graph")
 
-    active = spikes_2d.detach().to(device="cpu", dtype=torch.bool)
-    fanout = (matrix.indptr[1:] - matrix.indptr[:-1]).detach().cpu()
-    active_counts = active.sum(dim=1, dtype=torch.int64)
-    active_edges = active.to(torch.int64) @ fanout.to(torch.int64)
+    spikes_2d = spikes_2d.detach()
+    fanout = matrix.indptr[1:] - matrix.indptr[:-1]
+    active_counts = torch.count_nonzero(spikes_2d, dim=1).to(torch.int64)
+    active_edges = torch.stack(
+        [
+            fanout[spikes_2d[timestep] != 0].sum()
+            for timestep in range(spikes_2d.shape[0])
+        ]
+    )
     total_active_edges = int(active_edges.sum().item())
 
-    collision_ratios = torch.zeros(active.shape[0], dtype=torch.float64)
+    collision_ratios = torch.zeros(spikes_2d.shape[0], dtype=torch.float64)
     exact = (
         total_active_edges <= exact_collision_edge_limit
         and matrix.indices.numel() <= exact_collision_edge_limit
     )
     if exact:
-        source = torch.repeat_interleave(
-            torch.arange(matrix.shape[0]),
-            fanout,
-        )
-        posts = matrix.indices.detach().cpu()
-        for timestep in range(active.shape[0]):
-            timestep_posts = posts[active[timestep, source]]
-            edge_count = timestep_posts.numel()
-            if edge_count:
-                unique_count = torch.unique(timestep_posts).numel()
-                collision_ratios[timestep] = 1.0 - unique_count / edge_count
+        sampled = torch.arange(spikes_2d.shape[0])
         collision_method = "exact"
     else:
         # Deterministically sample timesteps. Active-edge counts remain exact;
         # only the collision distribution is estimated.
-        sample_count = min(16, active.shape[0])
-        sampled = torch.linspace(
-            0,
-            active.shape[0] - 1,
-            sample_count,
-        ).round().to(torch.int64)
-        indptr = matrix.indptr.detach().cpu()
-        posts = matrix.indices.detach().cpu()
-        sampled_ratios = []
-        for timestep in sampled.tolist():
-            active_sources = torch.nonzero(
-                active[timestep],
-                as_tuple=False,
-            ).flatten()
-            if active_sources.numel() > 2048:
-                offsets = torch.linspace(
-                    0,
-                    active_sources.numel() - 1,
-                    2048,
-                ).round().to(torch.int64)
-                active_sources = active_sources[offsets]
-            chunks = [
-                posts[indptr[source] : indptr[source + 1]]
-                for source in active_sources.tolist()
-            ]
-            timestep_posts = (
-                torch.cat(chunks)
-                if chunks
-                else torch.empty(0, dtype=posts.dtype)
-            )
-            edge_count = timestep_posts.numel()
-            ratio = (
-                1.0 - torch.unique(timestep_posts).numel() / edge_count
-                if edge_count
-                else 0.0
-            )
-            sampled_ratios.append(float(ratio))
-        collision_ratios.fill_(
-            float(np.mean(sampled_ratios)) if sampled_ratios else 0.0
-        )
+        sample_count = min(16, spikes_2d.shape[0])
+        sampled = _evenly_spaced_indices(spikes_2d.shape[0], sample_count)
         collision_method = (
             f"sampled_{sample_count}_timesteps_max_2048_sources"
         )
 
-    counts_np = active_counts.numpy()
-    edges_np = active_edges.numpy()
+    indptr = matrix.indptr
+    posts = matrix.indices
+    sampled_ratios = []
+    for timestep in sampled.tolist():
+        active_sources = torch.nonzero(
+            spikes_2d[timestep] != 0,
+            as_tuple=False,
+        ).flatten()
+        if not exact and active_sources.numel() > 2048:
+            offsets = _evenly_spaced_indices(
+                active_sources.numel(),
+                2048,
+                device=active_sources.device,
+            )
+            active_sources = active_sources[offsets]
+        starts = indptr[active_sources].cpu().tolist()
+        ends = indptr[active_sources + 1].cpu().tolist()
+        chunks = [posts[start:end] for start, end in zip(starts, ends)]
+        timestep_posts = (
+            torch.cat(chunks)
+            if chunks
+            else torch.empty(0, dtype=posts.dtype, device=posts.device)
+        )
+        edge_count = timestep_posts.numel()
+        ratio = (
+            1.0 - torch.unique(timestep_posts).numel() / edge_count
+            if edge_count
+            else 0.0
+        )
+        sampled_ratios.append(float(ratio))
+    if exact:
+        collision_ratios = torch.tensor(sampled_ratios, dtype=torch.float64)
+    else:
+        collision_ratios.fill_(
+            float(np.mean(sampled_ratios)) if sampled_ratios else 0.0
+        )
+
+    counts_np = active_counts.cpu().numpy()
+    edges_np = active_edges.cpu().numpy()
     collision_np = collision_ratios.numpy()
     mean_count = float(counts_np.mean()) if counts_np.size else 0.0
     count_std = float(counts_np.std()) if counts_np.size else 0.0

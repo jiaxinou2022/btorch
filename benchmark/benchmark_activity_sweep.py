@@ -1,6 +1,6 @@
-"""Run the paper activity sweep as isolated, resumable benchmark cases.
+"""Run the paper firing-rate sweep as isolated, resumable benchmark cases.
 
-Each target-activity and workload-seed pair runs in a fresh Python process.
+Each target firing rate and workload-seed pair runs in a fresh Python process.
 This prevents CUDA Graph and persistent-runner state from leaking between
 workloads while reusing :mod:`benchmark_rsnn_cudagraph_compare` unchanged for
 provider preparation, correctness checks, and timing.
@@ -18,8 +18,18 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DATASETS = ("flybrain", "microns_mm3", "multiarea_mam", "uniform")
-DEFAULT_TARGETS = (0.005, 0.01, 0.02, 0.05, 0.10, 0.20)
+DATASETS = (
+    "flybrain",
+    "microns_mm3",
+    "multiarea_mam",
+    "uniform",
+    "orkut",
+    "hollywood_2009",
+    "vas_stokes_4m",
+    "uk_2002",
+    "queen_4147",
+)
+DEFAULT_TARGET_RATES_HZ = (0.0, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0)
 DEFAULT_PROVIDERS = (
     "cusparse_direct_cudagraph",
     "tilespmspv_cudagraph",
@@ -33,24 +43,74 @@ DEFAULT_PROVIDERS = (
 DEFAULT_FLYBRAIN_WEIGHT_SCALE = 0.15 / 393.0562438964844
 
 
+def firing_rate_hz_to_activity(rate_hz: float, dt_ms: float) -> float:
+    """Convert average firing rate in Hz to spikes per neuron per timestep."""
+
+    if rate_hz < 0.0:
+        raise ValueError("firing rate must be non-negative")
+    if dt_ms <= 0.0:
+        raise ValueError("timestep must be positive")
+    return rate_hz * dt_ms / 1000.0
+
+
+def external_event_rate_for_target(
+    target_activity: float,
+    max_event_rate: float,
+) -> float:
+    """Choose a sparse external trace that resolves low target rates."""
+
+    if not 0.0 <= target_activity <= 1.0:
+        raise ValueError("target activity must be in [0, 1]")
+    if not 0.0 < max_event_rate <= 1.0:
+        raise ValueError("maximum external event rate must be in (0, 1]")
+    return min(max_event_rate, target_activity)
+
+
 def parse_args() -> argparse.Namespace:
     """Parse activity-sweep command-line arguments."""
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", choices=DATASETS, default="flybrain")
-    parser.add_argument("--targets", type=float, nargs="+", default=DEFAULT_TARGETS)
+    parser.add_argument(
+        "--target-rates-hz",
+        type=float,
+        nargs="+",
+        default=DEFAULT_TARGET_RATES_HZ,
+        help="Average neuronal firing rates in Hz (default: 0--50 Hz).",
+    )
     parser.add_argument("--seeds", type=int, nargs="+", default=(0, 1, 2))
     parser.add_argument("--t-steps", type=int, default=256)
+    parser.add_argument(
+        "--dt-ms",
+        type=float,
+        default=1.0,
+        help="Simulation timestep in milliseconds (default: 1.0).",
+    )
+    parser.add_argument(
+        "--max-external-event-rate",
+        type=float,
+        default=0.01,
+        help=(
+            "Maximum external event probability per timestep; lower target "
+            "rates use a proportionally sparser input trace."
+        ),
+    )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=20)
     parser.add_argument("--gpu", default="0")
+    parser.add_argument("--connectome-root", type=Path, default=None)
+    parser.add_argument(
+        "--isolate-providers",
+        action="store_true",
+        help="Run every provider in a fresh process to cap peak GPU memory.",
+    )
     parser.add_argument("--weight-scale", type=float, default=None)
     parser.add_argument("--n-neuron", type=int, default=131_072)
     parser.add_argument("--fanout", type=int, default=128)
     parser.add_argument("--multiarea-n-scaling", type=float, default=0.005)
     parser.add_argument("--multiarea-k-scaling", type=float, default=1.0)
     parser.add_argument("--calibration-max-amplitude", type=float, default=100.0)
-    parser.add_argument("--calibration-iterations", type=int, default=12)
+    parser.add_argument("--calibration-iterations", type=int, default=20)
     parser.add_argument(
         "--output",
         type=Path,
@@ -58,8 +118,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
-    if any(not 0.0 < value < 1.0 for value in args.targets):
-        parser.error("all targets must be in (0, 1)")
+    if any(not 0.0 <= value <= 50.0 for value in args.target_rates_hz):
+        parser.error("all target firing rates must be in [0, 50] Hz")
+    if args.dt_ms <= 0.0:
+        parser.error("--dt-ms must be positive")
+    if not 0.0 < args.max_external_event_rate <= 1.0:
+        parser.error("--max-external-event-rate must be in (0, 1]")
     if args.t_steps <= 0 or args.warmup < 0 or args.repeat <= 0:
         parser.error("invalid timing configuration")
     if args.n_neuron <= 0 or args.fanout <= 0:
@@ -77,23 +141,51 @@ def parse_args() -> argparse.Namespace:
     if args.output is None:
         args.output = Path(
             "benchmark/results/activity_sweep/"
-            f"{args.dataset}_rtx5090_raw.csv"
+            f"{args.dataset}_rtx5090_hz_raw.csv"
         )
     return args
 
 
 def valid_part(path: Path) -> bool:
-    """Return whether a part CSV contains every requested provider."""
+    """Return whether a part CSV contains every passing provider."""
 
     if not path.exists():
         return False
     with path.open(newline="") as file:
-        providers = {row["provider"] for row in csv.DictReader(file)}
-    return providers == set(DEFAULT_PROVIDERS)
+        rows = list(csv.DictReader(file))
+    providers = {row["provider"] for row in rows}
+    return providers == set(DEFAULT_PROVIDERS) and all(
+        row["correctness_status"].startswith("passed") for row in rows
+    )
 
 
-def run_case(args: argparse.Namespace, target: float, seed: int, part: Path) -> None:
+def valid_provider_part(path: Path, provider: str) -> bool:
+    """Return whether an isolated part contains its one requested provider."""
+
+    if not path.exists():
+        return False
+    with path.open(newline="") as file:
+        rows = list(csv.DictReader(file))
+    return (
+        len(rows) == 1
+        and rows[0]["provider"] == provider
+        and rows[0]["correctness_status"].startswith("passed")
+    )
+
+
+def run_case(
+    args: argparse.Namespace,
+    target_rate_hz: float,
+    seed: int,
+    part: Path,
+) -> None:
     """Run one isolated target and seed combination."""
+
+    target_activity = firing_rate_hz_to_activity(target_rate_hz, args.dt_ms)
+    external_event_rate = external_event_rate_for_target(
+        target_activity,
+        args.max_external_event_rate,
+    )
 
     command = [
         sys.executable,
@@ -102,8 +194,12 @@ def run_case(args: argparse.Namespace, target: float, seed: int, part: Path) -> 
         args.dataset,
         "--t-steps",
         str(args.t_steps),
+        "--dt",
+        str(args.dt_ms),
         "--target-activity",
-        str(target),
+        str(target_activity),
+        "--event-rate",
+        str(external_event_rate),
         "--input-seed",
         str(seed),
         "--weight-scale",
@@ -116,10 +212,6 @@ def run_case(args: argparse.Namespace, target: float, seed: int, part: Path) -> 
         str(args.calibration_max_amplitude),
         "--calibration-iterations",
         str(args.calibration_iterations),
-        "--providers",
-        *DEFAULT_PROVIDERS,
-        "--csv",
-        str(part),
     ]
     if args.dataset == "uniform":
         command.extend(
@@ -139,9 +231,78 @@ def run_case(args: argparse.Namespace, target: float, seed: int, part: Path) -> 
                 str(args.multiarea_k_scaling),
             ]
         )
+    elif args.connectome_root is not None:
+        command.extend(["--connectome-root", str(args.connectome_root)])
     environment = os.environ.copy()
     environment["CUDA_VISIBLE_DEVICES"] = args.gpu
-    subprocess.run(command, cwd=REPO_ROOT, env=environment, check=True)
+    if not args.isolate_providers:
+        subprocess.run(
+            [*command, "--providers", *DEFAULT_PROVIDERS, "--csv", str(part)],
+            cwd=REPO_ROOT,
+            env=environment,
+            check=True,
+        )
+        return
+
+    provider_parts = []
+    calibrated_amplitude = None
+    for provider in DEFAULT_PROVIDERS:
+        provider_part = part.with_name(f"{part.stem}_{provider}.csv")
+        provider_parts.append(provider_part)
+        if not args.force and valid_provider_part(provider_part, provider):
+            print(f"[resume] {provider_part}")
+            if calibrated_amplitude is None:
+                with provider_part.open(newline="") as file:
+                    calibrated_amplitude = float(
+                        next(csv.DictReader(file))["calibration_input_amplitude"]
+                    )
+            continue
+        provider_command = [*command]
+        if calibrated_amplitude is not None:
+            provider_command.extend(
+                ["--calibrated-input-amplitude", repr(calibrated_amplitude)]
+            )
+        provider_command.extend(
+            ["--providers", provider, "--csv", str(provider_part)]
+        )
+        subprocess.run(
+            provider_command,
+            cwd=REPO_ROOT,
+            env=environment,
+            check=True,
+        )
+        if not valid_provider_part(provider_part, provider):
+            raise RuntimeError(
+                f"provider did not produce one passing row: {provider_part}"
+            )
+        if calibrated_amplitude is None:
+            with provider_part.open(newline="") as file:
+                calibrated_amplitude = float(
+                    next(csv.DictReader(file))["calibration_input_amplitude"]
+                )
+    merge_provider_parts(provider_parts, part)
+
+
+def merge_provider_parts(parts: list[Path], output: Path) -> None:
+    """Merge provider-isolated rows for one deterministic workload."""
+
+    rows = []
+    fieldnames = None
+    for path in parts:
+        with path.open(newline="") as file:
+            reader = csv.DictReader(file)
+            current_fields = list(reader.fieldnames or ())
+            if fieldnames is None:
+                fieldnames = current_fields
+            elif current_fields != fieldnames:
+                raise RuntimeError(f"CSV schema mismatch in {path}")
+            rows.extend(reader)
+    if fieldnames is None:
+        raise RuntimeError("provider-isolated run produced no rows")
+    with output.open("w", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def merge_parts(parts: list[Path], output: Path) -> None:
@@ -188,18 +349,22 @@ def main() -> None:
     part_dir.mkdir(parents=True, exist_ok=True)
     parts = []
     for seed in args.seeds:
-        for target in args.targets:
-            target_label = f"{target:.6f}".rstrip("0").rstrip(".")
-            part = part_dir / f"target_{target_label}_seed_{seed}.csv"
+        for target_rate_hz in args.target_rates_hz:
+            target_label = f"{target_rate_hz:.6f}".rstrip("0").rstrip(".")
+            target_label = target_label or "0"
+            part = part_dir / f"target_{target_label}hz_seed_{seed}.csv"
             parts.append(part)
             if args.force or not valid_part(part):
-                run_case(args, target, seed, part)
+                run_case(args, target_rate_hz, seed, part)
             else:
                 print(f"[resume] {part}")
     merge_parts(parts, output)
     manifest = {
         "dataset": args.dataset,
-        "targets": list(args.targets),
+        "target_rates_hz": list(args.target_rates_hz),
+        "dt_ms": args.dt_ms,
+        "external_event_rate_policy": "min(max_rate, target_activity)",
+        "max_external_event_rate": args.max_external_event_rate,
         "seeds": list(args.seeds),
         "providers": list(DEFAULT_PROVIDERS),
         "t_steps": args.t_steps,
@@ -208,6 +373,10 @@ def main() -> None:
         "calibration_max_amplitude": args.calibration_max_amplitude,
         "calibration_iterations": args.calibration_iterations,
         "weight_scale": args.weight_scale,
+        "connectome_root": (
+            str(args.connectome_root) if args.connectome_root is not None else None
+        ),
+        "isolate_providers": args.isolate_providers,
         "weight_normalization": "mean_abs_weighted_fanout~=0.15",
         "n_neuron": args.n_neuron if args.dataset == "uniform" else None,
         "fanout": args.fanout if args.dataset == "uniform" else None,

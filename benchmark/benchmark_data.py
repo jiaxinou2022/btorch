@@ -14,6 +14,7 @@ import torch
 from benchmark.benchmark_workload_stats import (
     GraphStats,
     SpikeStats,
+    _evenly_spaced_indices,
     summarize_graph,
     summarize_spike_workload,
 )
@@ -388,13 +389,25 @@ def build_closed_loop_workload(
             sort_keys=True,
         ).encode()
     )
+    max_full_hash_elements = 10_000_000
     for tensor in (
         matrix.indptr,
         matrix.indices,
         matrix.effective_values(),
         input_trace,
     ):
-        array = tensor.detach().cpu().contiguous().numpy()
+        detached = tensor.detach().reshape(-1)
+        if detached.numel() > max_full_hash_elements:
+            offsets = _evenly_spaced_indices(
+                detached.numel(),
+                4096,
+                device=detached.device,
+            )
+            detached = detached[offsets]
+            hasher.update(
+                f"sampled:{tensor.shape}:{tensor.dtype}:{tensor.numel()}".encode()
+            )
+        array = detached.cpu().contiguous().numpy()
         hasher.update(memoryview(array))
     return BenchmarkWorkload(
         matrix=matrix,
